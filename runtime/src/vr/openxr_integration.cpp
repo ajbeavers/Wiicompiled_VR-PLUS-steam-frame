@@ -439,7 +439,15 @@ public:
         if (has_extension("XR_EXT_performance_settings")) {
             runtime_->LoadFunction("xrPerfSettingsSetPerformanceLevelEXT", &set_performance_level_);
         }
+#if defined(__ANDROID__)
+        // Lepton's SteamVR bridge has no XR_KHR_convert_timespec_time; DisplayTimeNanos falls back
+        // to reading XrTime as CLOCK_MONOTONIC (see MonotonicDisplayDelta).
+        interpolation_available_.store(true, std::memory_order_release);
+        clock_fallback_logged_ = false;
+        clock_offset_valid_ = false;
+#else
         interpolation_available_.store(convert_display_time_ != nullptr, std::memory_order_release);
+#endif
         if (!backend_->QueryGraphicsRequirements(*runtime_)) {
             SetError(backend_->LastError());
             ResetPreparedObjects();
@@ -486,7 +494,7 @@ public:
         WithdrawPublishedFrame();
         aurora_set_stereo_frame_provider(&OpenXRIntegration::ProvideStereoFrame, this);
         provider_registered_ = true;
-        if (convert_display_time_ != nullptr) {
+        if (convert_display_time_ != nullptr || interpolation_available_.load(std::memory_order_acquire)) {
             diagnostics::SetDisplayTimeConverter(
                 [this](int64_t xr_time) { return static_cast<int64_t>(DisplayTimeNanos(xr_time)); });
         }
@@ -566,9 +574,6 @@ public:
     }
 
     void SetFrameInterpolationFps(uint32_t target) noexcept {
-#ifdef __ANDROID__
-        target = 0;
-#endif
         frame_interpolation_fps_.store(NormalizeFrameInterpolationFps(target), std::memory_order_relaxed);
     }
 
@@ -1861,9 +1866,6 @@ private:
     }
 
     void SetInterpolationActive(bool active) noexcept {
-#ifdef __ANDROID__
-        active = false;
-#endif
         std::lock_guard lock(interpolation_mutex_);
         aurora_set_stereo_frame_interpolation(active && !interpolation_stopping_);
     }
@@ -1958,6 +1960,17 @@ private:
     // Converts the compositor's predicted display time onto the runtime's
     // steady clock, which is what Aurora's interpolation deadlines are paced by.
     uint64_t DisplayTimeNanos(XrTime display_time) noexcept {
+#if defined(__ANDROID__)
+        if (convert_display_time_ == nullptr) {
+            timespec now_spec{};
+            if (clock_gettime(CLOCK_MONOTONIC, &now_spec) != 0) return 0;
+            const int64_t monotonic_ns = static_cast<int64_t>(now_spec.tv_sec) * 1'000'000'000ll + now_spec.tv_nsec;
+            const auto steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const int64_t delta = MonotonicDisplayDelta(display_time, monotonic_ns);
+            return steady_ns + delta > 0 ? static_cast<uint64_t>(steady_ns + delta) : 0;
+        }
+#endif
         if (convert_display_time_ == nullptr) return 0;
         const auto now = std::chrono::steady_clock::now();
         const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
@@ -1982,6 +1995,29 @@ private:
 #endif
         return now_ns + delta > 0 ? static_cast<uint64_t>(now_ns + delta) : 0;
     }
+
+#if defined(__ANDROID__)
+    // SteamVR's XrTime is CLOCK_MONOTONIC in nanoseconds and Waydroid shares the host's clock, so a
+    // predicted display time normally lies a few frames ahead of now. If it does not, the runtime
+    // uses another epoch: anchor it to the first frame seen, assuming that frame shows ~2 frames out.
+    int64_t MonotonicDisplayDelta(XrTime display_time, int64_t monotonic_ns) noexcept {
+        const int64_t raw = static_cast<int64_t>(display_time) - monotonic_ns;
+        const bool same_clock = raw > -100'000'000ll && raw < 500'000'000ll;
+        if (!clock_fallback_logged_) {
+            clock_fallback_logged_ = true;
+            RT_LOG(RT_TAG_RUNTIME) << "OpenXR: no clock conversion; XrTime - CLOCK_MONOTONIC = "
+                                   << raw / 1000 << " us, "
+                                   << (same_clock ? "reading XrTime as CLOCK_MONOTONIC" : "anchoring to the first frame")
+                                   << std::endl;
+        }
+        if (same_clock) return raw;
+        if (!clock_offset_valid_) {
+            clock_offset_valid_ = true;
+            clock_offset_ = raw - 22'000'000ll;
+        }
+        return raw - clock_offset_;
+    }
+#endif
 
     void WaitForStopOrDelay(std::chrono::milliseconds delay) {
         std::unique_lock lock(stop_mutex_);
@@ -2027,7 +2063,23 @@ private:
     std::atomic<float> lean_back_degrees_{RuntimeConfigFile::VrLeanBackDegrees()};
     std::atomic_bool passthrough_{RuntimeConfigFile::VrPassthrough()};
     std::atomic_bool immersive_window_{RuntimeConfigFile::VrImmersiveWindow()};
+#if defined(__ANDROID__)
+    static uint32_t AndroidFrameInterpolationFps() noexcept {
+        // `setprop debug.wiicompiled.vr_interp 0|1|72|90|120` before launch overrides [vr]
+        // frame_interpolation_fps; both default to auto (render every display refresh).
+        char value[PROP_VALUE_MAX] = {};
+        if (__system_property_get("debug.wiicompiled.vr_interp", value) > 0) {
+            return NormalizeFrameInterpolationFps(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)));
+        }
+        return NormalizeFrameInterpolationFps(RuntimeConfigFile::Get().vrFrameInterpolationFps.value_or(1));
+    }
+    std::atomic_uint32_t frame_interpolation_fps_{AndroidFrameInterpolationFps()};
+    bool clock_fallback_logged_ = false;
+    bool clock_offset_valid_ = false;
+    int64_t clock_offset_ = 0;
+#else
     std::atomic_uint32_t frame_interpolation_fps_{RuntimeConfigFile::VrFrameInterpolationFps()};
+#endif
     std::atomic_bool interpolation_available_{false};
     std::mutex interpolation_mutex_;
     bool interpolation_stopping_ = true;
