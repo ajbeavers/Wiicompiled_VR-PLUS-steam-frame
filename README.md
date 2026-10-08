@@ -258,17 +258,19 @@ On the Frame this takes about 20 seconds once the toolchain is there, and produc
 `steam-frame/release/WiiCompiled-VR-SteamFrame-<git tag>.apk`. It needs `curl`, `tar`, `python3`
 and `openssl`, all on SteamOS already, and no root. What it does:
 
-1. Fetches an Android NDK into `~/.local/opt/android-build/` (Google ships no arm64 Linux NDK, so
-   on the Frame it uses [HomuHomu833's r30 build](https://github.com/HomuHomu833/android-ndk-custom);
-   on x86_64 it would use Google's r29, untried). If you have built
-   [Moonlight XR for the Frame](https://github.com/simplysanatori/moonlight-android-xr-steam-frame) the
-   NDK is already there.
+1. Fetches Android NDK r29 into `~/.local/opt/android-build/` (Google ships no arm64 Linux NDK, so
+   on the Frame it uses [HomuHomu833's r29 build](https://github.com/HomuHomu833/android-ndk-custom);
+   on x86_64 it would use Google's r29, untried). It has to be r29, the NDK the kit was built with:
+   the first release APK was compiled with r30, whose libc++ headers emit a helper
+   (`std::__hash_memory`) that r29's library lacks, and the headset's link failed on it. The build
+   now also refuses any object that imports a C++ symbol the kit's original does not.
 2. Compiles the two runtime unity groups that contain the patched files and Aurora's `common.cpp`
    with the same flags upstream's Android build uses. The third-party headers those three units need
    are vendored in [`steam-frame/build-deps/`](steam-frame/build-deps/) (see its `NOTICE.md`),
    because upstream fetches its dependencies with CMake on Windows and this build runs no CMake.
 3. Extracts the matching objects from the upstream APK's kit and checks that each new object exports
-   exactly the same symbols. If not, it stops: the sources and the APK are out of step.
+   exactly the same symbols and imports no C++ symbol the original did not. If not, it stops: the
+   sources and the APK are out of step, or the toolchain is wrong.
 4. `make-apk.py` rewrites the APK: the four kit files (`007_unity_runtime_4`, `001_unity_runtime_6`,
    `020_libaurora_gx.a` with its `common.cpp.o` swapped, and `include/vr/openxr_input.h`), the new
    kit fingerprint in `kit.json`, the patched `classes.dex`, zipalign-equivalent alignment, and an

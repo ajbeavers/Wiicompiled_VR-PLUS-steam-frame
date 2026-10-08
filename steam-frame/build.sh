@@ -35,15 +35,18 @@ if ! echo "$UPSTREAM_APK_SHA256  $APK" | sha256sum -c --quiet 2>/dev/null; then
     echo "warning: $APK is not the upstream v1.3.1 APK this build was made for; carrying on, the symbol check below decides"
 fi
 
-# 1. Toolchain. Google ships no arm64 Linux NDK; HomuHomu833's build of r30 fills in on the Frame.
+# 1. Toolchain: NDK r29, the one the kit itself was built with and the one the headset links with.
+#    A newer NDK's libc++ headers emit helpers (std::__hash_memory in r30) that r29's libc++ does
+#    not have, and the on-device link then fails. Google ships no arm64 Linux NDK; HomuHomu833's
+#    build of r29 fills in on the Frame.
 ARCH=$(uname -m)
 if [ -n "${WCF_NDK:-}" ]; then
     NDK=$WCF_NDK
 elif [ "$ARCH" = aarch64 ]; then
-    NDK=$TOOLS/ndk/android-ndk-r30
+    NDK=$TOOLS/ndk/android-ndk-r29
     if [ ! -d "$NDK/toolchains/llvm/prebuilt" ]; then
-        fetch https://github.com/HomuHomu833/android-ndk-custom/releases/download/r30/android-ndk-r30-aarch64-linux-gnu.tar.xz "$TOOLS/dl/ndk-r30-aarch64.tar.xz"
-        mkdir -p "$TOOLS/ndk" && tar xJf "$TOOLS/dl/ndk-r30-aarch64.tar.xz" -C "$TOOLS/ndk"
+        fetch https://github.com/HomuHomu833/android-ndk-custom/releases/download/r29/android-ndk-r29-aarch64-linux-gnu.tar.xz "$TOOLS/dl/ndk-r29-aarch64.tar.xz"
+        mkdir -p "$TOOLS/ndk" && tar xJf "$TOOLS/dl/ndk-r29-aarch64.tar.xz" -C "$TOOLS/ndk"
     fi
 elif [ "$ARCH" = x86_64 ]; then
     NDK=$TOOLS/ndk/android-ndk-r29
@@ -86,7 +89,7 @@ for entry in 007:runtime_4 001:runtime_6; do
     "$CXX" "${TARGET[@]}" "${RUNTIME_DEFS[@]}" "${RUNTIME_INC[@]}" "${COMMON[@]}" -include mkw_pch.h \
         -c "$OUT/obj/unity_${g}_cxx.cxx" -o "$OUT/kit/objects/${n}_unity_${g}_cxx.cxx.o" &
 done
-# fmt's format.h uses malloc without including <cstdlib> itself; NDK r30's libc++ no longer does it for it.
+# fmt's format.h uses malloc without including <cstdlib> itself; a newer libc++ no longer does it for it.
 "$CXX" "${TARGET[@]}" "${DEFS[@]}" "${AURORA_INC[@]}" "${COMMON[@]}" -include cstdlib \
     -c "$SRC/aurora-main/lib/gfx/common.cpp" -o "$OUT/obj/common.cpp.o" &
 wait
@@ -98,20 +101,26 @@ unzip -q -o "$APK" 'assets/game_kit/objects/007_unity_runtime_4_cxx.cxx.o' 'asse
     'assets/game_kit/libs/020_libaurora_gx.a' 'assets/game_kit/include/vr/openxr_input.h' -d "$OUT/upstream-kit"
 UK=$OUT/upstream-kit/assets/game_kit
 exported() { "$NM" --defined-only "$1" | awk '$2 ~ /[TDBR]/ {print $3}' | sort -u; }
+imported() { "$NM" -u "$1" | awk '{print $2}' | sort -u; }
 ok=1
-for o in 007_unity_runtime_4_cxx.cxx.o 001_unity_runtime_6_cxx.cxx.o; do
-    if diff <(exported "$UK/objects/$o") <(exported "$OUT/kit/objects/$o") >/dev/null; then
-        echo "$o: exports the kit's symbols"
+# Same exports as the kit's object, and no new C++ imports: a new mangled import means a different
+# libc++ than the kit's, which the on-device link cannot satisfy. New plain C imports (bionic) are fine.
+check() {  # label kit-object new-object
+    if diff <(exported "$2") <(exported "$3") >/dev/null; then
+        echo "$1: exports the kit's symbols"
     else
-        echo "$o: exported symbols DIFFER from the kit's (sources out of step with this APK?)"; ok=0
+        echo "$1: exported symbols DIFFER from the kit's (sources out of step with this APK?)"; ok=0
     fi
+    new_cxx=$(comm -13 <(imported "$2") <(imported "$3") | grep '^_Z' || true)
+    if [ -n "$new_cxx" ]; then
+        echo "$1: imports C++ symbols the kit's object does not (wrong NDK/libc++?):"; echo "$new_cxx" | head -5; ok=0
+    fi
+}
+for o in 007_unity_runtime_4_cxx.cxx.o 001_unity_runtime_6_cxx.cxx.o; do
+    check "$o" "$UK/objects/$o" "$OUT/kit/objects/$o"
 done
 t=$(mktemp -d); (cd "$t" && "$AR" x "$UK/libs/020_libaurora_gx.a" common.cpp.o)
-if diff <(exported "$t/common.cpp.o") <(exported "$OUT/obj/common.cpp.o") >/dev/null; then
-    echo "020_libaurora_gx.a(common.cpp.o): exports the kit's symbols"
-else
-    echo "020_libaurora_gx.a(common.cpp.o): exported symbols DIFFER from the kit's"; ok=0
-fi
+check "020_libaurora_gx.a(common.cpp.o)" "$t/common.cpp.o" "$OUT/obj/common.cpp.o"
 rm -rf "$t"
 [ $ok = 1 ] || { echo "not making an APK from objects that do not match the kit"; exit 1; }
 cp "$UK/libs/020_libaurora_gx.a" "$OUT/kit/libs/020_libaurora_gx.a"
