@@ -99,6 +99,17 @@ inline constexpr bool kWindowShapedEyesSupported = true;
 inline constexpr bool kWindowShapedEyesSupported = false;
 #endif
 
+// Whether menus are drawn into the eye images (projection layer) rather than shown on a quad layer.
+// On Android always: under Lepton, SteamVR turns a quad layer into a slow submission, so quality 0
+// only swaps Aurora's raymarched menu background for a plain one, which the GPU draws for free.
+inline bool OpenXRProjectedMenus() noexcept {
+#if defined(__ANDROID__)
+    return true;
+#else
+    return RuntimeConfigFile::Get().vrMenuShaderQuality>0 || OpenXRIntroductionActive();
+#endif
+}
+
 struct Quaternion {
     float x = 0.0f;
     float y = 0.0f;
@@ -879,7 +890,7 @@ private:
             }
             OpenXRPresentation presentation{};
             const bool immersive = policy.presentation == VRPresentationMode::ImmersiveRace;
-            presentation.mode = (immersive || RuntimeConfigFile::Get().vrMenuShaderQuality>0 || OpenXRIntroductionActive()) ? OpenXRFrameMode::ImmersiveProjection
+            presentation.mode = (immersive || OpenXRProjectedMenus()) ? OpenXRFrameMode::ImmersiveProjection
                                            : OpenXRFrameMode::VirtualScreen;
             presentation.quad_distance_meters = policy.config.hud_distance_meters;
             presentation.quad_width_meters = policy.config.hud_width_meters;
@@ -1353,7 +1364,7 @@ private:
     }
     void BuildMenuUi(const OpenXRBackendFrame& source, AuroraStereoFrame& destination) noexcept {
         XrPosef panel{};
-        if ((RuntimeConfigFile::Get().vrMenuShaderQuality==0 && !OpenXRIntroductionActive()) || !MenuScreenPose(source,panel)) {
+        if (!OpenXRProjectedMenus() || !MenuScreenPose(source,panel)) {
             OpenXRPublishHandWorkshopTracking({});return;
         }
         destination.ui.anchored=true;
@@ -1553,7 +1564,7 @@ private:
     // pose is captured once, from the first frame whose head pose is good enough
     // to place it, and released again by a recenter or an origin change.
     void UpdateVirtualScreenPose(OpenXRBackendFrame& frame) noexcept {
-        if (frame.presentation.mode != OpenXRFrameMode::VirtualScreen && RuntimeConfigFile::Get().vrMenuShaderQuality==0 && !OpenXRIntroductionActive()) {
+        if (frame.presentation.mode != OpenXRFrameMode::VirtualScreen && !OpenXRProjectedMenus()) {
             return;
         }
         constexpr XrViewStateFlags kPoseUsable =
@@ -1637,7 +1648,7 @@ private:
         if (frame.render_width[0] == 0 || frame.render_height[0] == 0 || !MenuScreenPose(frame, screen.pose)) {
             return screen;
         }
-        if (RuntimeConfigFile::Get().vrMenuShaderQuality>0 || OpenXRIntroductionActive()) {
+        if (OpenXRProjectedMenus()) {
             screen.half_width_meters=.5f*frame.presentation.quad_width_meters;
             screen.half_height_meters=screen.half_width_meters/snapshot_aspect;
             screen.valid=true;return screen;
