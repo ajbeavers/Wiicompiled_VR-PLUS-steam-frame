@@ -87,10 +87,12 @@ What the patches do, in the order they were needed:
    background, which costs nothing. (`openxr_integration.cpp`; `menu_shader_quality = 0` in the
    config.)
 
-5. **The item box.** In VR the item roulette slid up after use and stayed visible. Aurora's
-   virtual-screen HUD draws ignore the game's scissor rectangle; the port now skips a 2D draw that
-   lies entirely outside a scissor the game narrowed, which is what hides it on a TV.
-   (`aurora-main/lib/gfx/common.cpp`.) During the slide itself a sliver can still show.
+5. **The item box (attempted, does not work yet).** In VR the item roulette slides up after use
+   and stays visible. Aurora's virtual-screen HUD draws ignore the game's scissor rectangle, so the
+   port now skips a 2D draw that lies entirely outside a scissor the game narrowed, which is what
+   hides it on a TV. (`aurora-main/lib/gfx/common.cpp`.) In the headset the empty box still shows,
+   so either the box is not drawn the way that check assumes or the scissor is not what hides it.
+   The change is harmless and stays in until someone finds the real cause.
 
 6. **Settings that suit the Frame**, seeded into `Config.toml` on the first launch by the wrapper
    ([`steam-frame/Config.frame.toml`](steam-frame/Config.frame.toml)): interpolation on auto, menu
@@ -115,17 +117,26 @@ Confirmed on my Frame, in the headset:
 - Launching from the Steam library into the game, title screen to race, at 90 Hz.
 - Racing in the original camera; the first-person cockpit, briefly; the menus at full rate; the
   VR settings panel; the controller layout in the table below, including pause and back.
-- The item box fix is in the build I play and I have not seen the box stuck since; it had the
-  least testing of the five changes.
+- The release path itself: the APK from the Releases page installed with `install.sh`, the game
+  built on the headset against its kit (about 13 minutes on my Frame), and launched from the
+  library. That is what I play now. The first release (`v1.3.1-frame.1`) failed at the final link
+  on the headset because its objects were compiled with the wrong NDK; see "Building" below.
 
 Known problems and things I have not tested:
 
-- **The release APK has not yet been through a clean run.** What I play is the same four objects,
-  linked into `libmain.so` on the Frame by the AI's host-side build. The APK on the Releases page
-  was made by `build.sh` from those objects and passes the same archive, alignment and signature
-  checks as upstream's APK, but the full install, disc import and on-headset build with it is the
-  next thing I do, and this line changes when it has happened. If you get there first, an issue
-  with the build log would be welcome.
+- **The empty item box stays on screen** after the roulette slides up. The attempted fix (change 5)
+  does not do it. It is cosmetic, so I live with it.
+- **The controllers drawn in the menus are Quest Touch controllers**, not the Frame's. Upstream
+  draws SteamVR's own model of whatever controller you hold when SteamVR offers one and falls back
+  to its built-in Touch Plus models otherwise; inside Lepton the app gets no SteamVR render models,
+  so it always falls back. The buttons the tutorials point at are the Quest ones too; the table
+  below is what the Frame buttons actually do.
+- **Grips do not grab the wheel in first person.** That is on purpose: on this layout the grips
+  are hop and drift, and with upstream's hand steering on, squeezing a grip to drift also grabbed
+  the wheel and steering jumped to your hand. So `hand_steering = false`, and you steer with the
+  stick in every camera. If you would rather steer with your hands in the cockpit, set
+  `hand_steering = true` under `[vr]` in `Config.toml` (path under "Where things are" below) and
+  drift with the right bumper instead. I have not tried that combination on the Frame.
 - **Subtle slowdowns remain.** Races are a solid 90 on the counter, but there are brief hitches
   now and then that I notice and cannot pin to anything in the logs. Good enough that I play it;
   not perfect.
@@ -136,7 +147,6 @@ Known problems and things I have not tested:
   looked better and dropped frames all over the place (10 to 24 ms late, 30 to 50 ms stalls), so
   it went back to 1.0x and 1728x1728, which is what the installer sets. If you want sharper menus,
   make the menu screen bigger or closer in VR settings instead.
-- **Item roulette** can still show a sliver while sliding.
 - **Not tested:** Retro Rewind, online play, the diorama camera for more than a minute, USB
   wheels, multiplayer, passthrough (there is nothing to pass through to; the Frame shows SteamVR's
   void around the menus), hand tracking.
@@ -327,7 +337,12 @@ Over about a week in October 2026, in a series of Claude Code sessions on the Fr
   Lepton has no clock conversion extension and wrote the fallback, re-signed the APK, and the result
   was "very good". Then the controls, in code rather than only in the binding file because the
   game reads X and Y as the left hand's buttons. Then the menus, after the frame-timing diagnostics
-  showed exactly which draw was slow. Then the item box.
+  showed exactly which draw was slow. Then the item box, which did not work.
+- Publishing went wrong once too. The first release APK carried objects compiled with NDK r30,
+  whose C++ headers call a helper that the kit's NDK r29 runtime does not have, so the headset's
+  build got all the way to the last step and failed to link. The fix was to build with r29, plus a
+  check in `build.sh` that refuses any object importing a C++ symbol the kit's original does not.
+  The second release then built and ran on the headset from a clean start.
 - The last change before publishing was a mistake: raising the resolution for sharper menus,
   which I reported as a performance regression the next day and which was rolled back. The
   numbers in the "Resolution" note above are from that log.
