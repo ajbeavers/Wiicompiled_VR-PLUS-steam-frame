@@ -2742,6 +2742,15 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
                    draw.gx.interpolatedUniformRanges[invocation.interpolatedFrame].size != 0) {
           uniformOverride = &draw.gx.interpolatedUniformRanges[invocation.interpolatedFrame];
         }
+        // A virtual-screen draw gets the whole eye (below), so the game's scissor no longer clips
+        // it. An element lying wholly outside a scissor the game narrowed would not have shown on
+        // the flat frame either (Mario Kart's item roulette sliding up after use): skip it.
+        if (virtualScreenDraw && draw.gx.screenRect && recordedScissor != fullTargetScissor &&
+            draw.gx.screenRect->width > 0.f && draw.gx.screenRect->height > 0.f &&
+            sourceScissor.width > 0.f && sourceScissor.height > 0.f &&
+            !stereo_replay::subviews_overlap(*draw.gx.screenRect, sourceScissor)) {
+          break;
+        }
         // Draw against world depth and mark visible cockpit samples before HUD
         // depth replaces it. The screen pipelines reject those stencil samples.
         if (invocation.cockpitFrame != nullptr && overrideTarget) {
