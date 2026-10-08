@@ -11,7 +11,9 @@ your own SteamVR install, never redistributed.
 
 What is converted, per hand:
   - every visible component mesh (body, sticks, buttons, trigger, grips, bumper), triangulated, in
-    the OpenXR grip space the game draws controller models in (the model's `openxr_grip` component);
+    the OpenXR grip space the game draws controller models in (the model's `openxr_grip` component),
+    simplified toward 4000 triangles per hand (WCF_FRAME_MODEL_TRIANGLES; texture seams leave the
+    right hand at about 4800, Touch Plus has 4470);
   - the base colour texture with its ambient occlusion baked in, at 1024x1024;
   - the nine motions the game animates, as SteamVR's model describes them: thumbstick click,
     primary and secondary button (A and B on the right; the left Frame controller has none), trigger,
@@ -30,6 +32,7 @@ import sys
 
 RENDERMODELS = '/opt/steamvr/drivers/frame_controller/resources/rendermodels'
 TEXTURE_SIZE = 1024
+TRIANGLES = int(os.environ.get('WCF_FRAME_MODEL_TRIANGLES', '4000'))  # per hand; Touch Plus has 4470
 
 
 # --- small vector maths -------------------------------------------------------------------------
@@ -151,6 +154,143 @@ def motion_moves(motion, up_hint):
     return {}
 
 
+# --- simplification -----------------------------------------------------------------------------
+
+def simplify(tris, target):
+    """Quadric error half-edge collapse (Garland and Heckbert) down to about `target` triangles.
+
+    Only original vertices survive, so their texture coordinates and normals carry over. Vertices on
+    a texture seam (one position, several UVs), on an open edge or on a non-manifold edge never
+    move, which keeps the texture charts and the component's outline intact; the price is that a
+    heavily seamed mesh may stop above the target."""
+    import heapq
+    from collections import defaultdict
+
+    # Weld corners into shared positions; keep each face's own corner attributes.
+    ids, P, faces, attrs = {}, [], [], []
+    for tri in tris:
+        f = []
+        for pos, uv, n in tri:
+            key = (round(pos[0], 7), round(pos[1], 7), round(pos[2], 7))
+            if key not in ids:
+                ids[key] = len(P)
+                P.append(pos)
+            f.append(ids[key])
+        if len(set(f)) == 3:
+            faces.append(f)
+            attrs.append([(uv, n) for _, uv, n in tri])
+    if len(faces) <= target:
+        return tris
+
+    uv_sets = defaultdict(set)
+    edge_count = defaultdict(int)
+    vfaces = defaultdict(set)
+    for fi, f in enumerate(faces):
+        for k in range(3):
+            uv = attrs[fi][k][0]
+            uv_sets[f[k]].add((round(uv[0], 5), round(uv[1], 5)))
+            a, b = f[k], f[(k + 1) % 3]
+            edge_count[(min(a, b), max(a, b))] += 1
+            vfaces[f[k]].add(fi)
+    locked = {p for p, s in uv_sets.items() if len(s) > 1}
+    for (a, b), c in edge_count.items():
+        if c != 2:
+            locked.update((a, b))
+
+    def plane(f):
+        a, b, c = P[f[0]], P[f[1]], P[f[2]]
+        n = cross(sub(b, a), sub(c, a))
+        area = math.sqrt(dot(n, n))
+        if area == 0:
+            return None, 0.0
+        n = scale(n, 1 / area)
+        return n + [-dot(n, a)], area
+
+    Q = defaultdict(lambda: [0.0] * 10)
+    for f in faces:
+        p, w = plane(f)
+        if p is None:
+            continue
+        a, b, c, d = p
+        q = [a * a, a * b, a * c, a * d, b * b, b * c, b * d, c * c, c * d, d * d]
+        for v in f:
+            Q[v] = [x + w * y for x, y in zip(Q[v], q)]
+
+    def error(q, p):
+        x, y, z = p
+        return (q[0] * x * x + 2 * q[1] * x * y + 2 * q[2] * x * z + 2 * q[3] * x + q[4] * y * y
+                + 2 * q[5] * y * z + 2 * q[6] * y + q[7] * z * z + 2 * q[8] * z + q[9])
+
+    alive = [True] * len(faces)
+    live = len(faces)
+    version = defaultdict(int)
+    heap = []
+
+    def neighbours(v):
+        return {w for fi in vfaces[v] for w in faces[fi] if w != v}
+
+    def push(u, v):
+        if u in locked:
+            return
+        q = [x + y for x, y in zip(Q[u], Q[v])]
+        heapq.heappush(heap, (error(q, P[v]), u, v, version[u], version[v]))
+
+    for (a, b) in edge_count:
+        push(a, b)
+        push(b, a)
+
+    def face_normal(pts):
+        return cross(sub(pts[1], pts[0]), sub(pts[2], pts[0]))
+
+    while live > target and heap:
+        _, u, v, vu, vv = heapq.heappop(heap)
+        if version[u] != vu or version[v] != vv or u in locked or not vfaces[u] or not vfaces[v]:
+            continue
+        shared = vfaces[u] & vfaces[v]
+        if len(shared) != 2:
+            continue
+        # Link condition: the edge's two opposite vertices are the only common neighbours.
+        if len(neighbours(u) & neighbours(v)) != 2:
+            continue
+        # No flipped or collapsed triangles around u.
+        ok = True
+        for fi in vfaces[u] - shared:
+            before = [P[w] for w in faces[fi]]
+            after = [P[v] if w == u else P[w] for w in faces[fi]]
+            nb, na = face_normal(before), face_normal(after)
+            la, lb = math.sqrt(dot(na, na)), math.sqrt(dot(nb, nb))
+            if la < 1e-12 or lb < 1e-12 or dot(na, nb) / (la * lb) < 0.3:
+                ok = False
+                break
+        if not ok:
+            continue
+        # v's attributes in the chart the collapsed faces belong to.
+        sf = next(iter(shared))
+        v_attr = attrs[sf][faces[sf].index(v)]
+        for fi in shared:
+            alive[fi] = False
+            live -= 1
+            for w in faces[fi]:
+                vfaces[w].discard(fi)
+        for fi in list(vfaces[u]):
+            k = faces[fi].index(u)
+            faces[fi][k] = v
+            attrs[fi][k] = v_attr
+            vfaces[v].add(fi)
+        vfaces[u].clear()
+        Q[v] = [x + y for x, y in zip(Q[u], Q[v])]
+        version[v] += 1
+        ring = neighbours(v)
+        for w in ring:
+            version[w] += 1
+        for w in ring:
+            push(v, w)
+            push(w, v)
+
+    return [[(P[faces[fi][k]], attrs[fi][k][0], attrs[fi][k][1]) for k in range(3)]
+            for fi in range(len(faces)) if alive[fi]]
+
+
 def convert(hand, rendermodels, outdir):
     name = f'frame_controller_{hand}'
     directory = os.path.join(rendermodels, name)
@@ -186,6 +326,23 @@ def convert(hand, rendermodels, outdir):
     for slot, key in zip(range(5, 9), ('left', 'right', 'back', 'forward')):
         controls[slot] = (stick, stick_motion[key])
 
+    # The landmarks from the full meshes, then the meshes cut down to the triangle budget, shared
+    # between components by size with a floor so small buttons keep their shape. The game
+    # re-animates every vertex on the CPU each frame a menu is up: the full models (~31,000
+    # triangles for both hands) took the menus from 90 to 45-60 fps on the Frame; Touch Plus has
+    # ~8,900 for both.
+    marks = [stick, primary or 'dpad', secondary or 'button_view', 'trigger', 'button_grip']
+    anchors = []
+    for key in marks:
+        anchors += to_grip(centroid(key)) if key in meshes else [0.0, 0.0, 0.0]
+    # Largest first: the body's seams can stop it above its share, and the rest absorb that.
+    remaining, left_to_do = TRIANGLES, sum(len(t) for t in meshes.values())
+    for key in sorted(meshes, key=lambda k: -len(meshes[k])):
+        n = len(meshes[key])
+        meshes[key] = simplify(meshes[key], max(min(n, 60), round(n * remaining / left_to_do)))
+        remaining -= len(meshes[key])
+        left_to_do -= n
+
     records = []
     for key, tris in meshes.items():
         for tri in tris:
@@ -202,11 +359,6 @@ def convert(hand, rendermodels, outdir):
                 records.append(struct.pack('<35f', *base, shade, shade, shade, uv[0], 1.0 - uv[1], *deltas))
     if len(records) > 100000:
         sys.exit(f'{name}: {len(records)} vertices, more than the game accepts (100000)')
-
-    marks = [stick, primary or 'dpad', secondary or 'button_view', 'trigger', 'button_grip']
-    anchors = []
-    for key in marks:
-        anchors += to_grip(centroid(key)) if key in meshes else [0.0, 0.0, 0.0]
 
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, f'{hand}.wccontroller'), 'wb') as f:

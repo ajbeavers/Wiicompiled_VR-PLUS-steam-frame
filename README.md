@@ -113,6 +113,22 @@ What the patches do, in the order they were needed:
    drifts in every camera. (`openxr_input.cpp`; the binding no longer sends a grip click to
    drift.) With `hand_steering = false` the grips drift everywhere and you steer with the stick.
 
+9. **Frame controllers in the menus.** Upstream draws SteamVR's own model of the controller you
+   hold when SteamVR offers one and its built-in Quest Touch Plus models otherwise; inside Lepton
+   the app gets no SteamVR render models, so it always showed Quest controllers. SteamVR keeps the
+   Frame controller models on every Frame, and
+   [`steam-frame/frame-controller-models.py`](steam-frame/frame-controller-models.py) converts
+   them into the game's format, with the buttons, trigger, grip and stick animated. `install.sh`
+   runs it and the wrapper copies the result over the Touch files on each launch. The first
+   version used the full models, about seven times the Touch Plus vertex count; the game
+   re-animates every vertex on the CPU each frame a menu is up, so the menus fell to 45 to 60 fps
+   and the background flickered when the VR settings opened mid-race. The script now simplifies
+   each hand to about 4,000 triangles (roughly the Touch Plus size), keeping the outline, the
+   UV seams and the moving parts intact, and the menus are back at 90. `WCF_FRAME_MODELS=0` when
+   installing keeps the Quest controllers. The tutorials still point at Quest buttons; the
+   controls table below is what the Frame buttons actually do. After an APK update the Frame
+   models show from the second launch on, because the app unpacks its own resources again first.
+
 Everything else, the cameras, the hand IK, the HUD, Retro Rewind support, is upstream's work and is
 unchanged.
 
@@ -132,19 +148,6 @@ Known problems and things I have not tested:
 
 - **The empty item box stays on screen** after the roulette slides up. The attempted fix (change 5)
   does not do it. It is cosmetic, so I live with it.
-- **The controllers drawn in the menus are Quest Touch controllers**, not the Frame's. Upstream
-  draws SteamVR's own model of whatever controller you hold when SteamVR offers one and falls back
-  to its built-in Touch Plus models otherwise; inside Lepton the app gets no SteamVR render models,
-  so it always falls back. The buttons the tutorials point at are the Quest ones too; the table
-  below is what the Frame buttons actually do. I tried fixing this: SteamVR keeps the Frame
-  controller models on every Frame, and
-  [`steam-frame/frame-controller-models.py`](steam-frame/frame-controller-models.py) converts them
-  into the game's format, with the buttons, trigger, grip and stick animated. They looked right in
-  my hands, but they are about seven times the Touch Plus models' vertex count, the game
-  re-animates every vertex on the CPU each frame a menu is up, and the menus dropped to 45 to 60
-  fps, with the background flickering when the VR settings opened mid-race. So it is off. To try
-  it anyway, run the installer with `WCF_FRAME_MODELS=1`. A decimated version of the models would
-  probably fix the cost; that is a good pull request for someone.
 - **Steering with the grips in first person works, roughly.** Change 8 is newer than the rest and
   has had one session; grabbing the wheel works but upstream's grab range and steering response
   were tuned for Quest controllers and I have not adjusted them. Set `hand_steering = false` under
@@ -359,6 +362,10 @@ Over about a week in October 2026, in a series of Claude Code sessions on the Fr
 - The last change before publishing was a mistake: raising the resolution for sharper menus,
   which I reported as a performance regression the next day and which was rolled back. The
   numbers in the "Resolution" note above are from that log.
+- After publishing: the grips change (change 8), and the Frame controller models (change 9), which
+  were reverted once because the full models made the menus lag, and came back after the AI wrote
+  a mesh simplifier for them. I checked both in the headset; the frame-timing log of that run
+  shows 90 Hz throughout the menus.
 - This README was written by the AI from the session logs and its memory notes, at my request and
   in my voice, and I read it before publishing. If something in it is wrong, it is because I
   missed it; open an issue with the Lepton log and the game's `console.log` attached.
