@@ -793,9 +793,11 @@ void OpenXRInput::Sync(XrTime predicted_display_time, const OpenXRPointerScreen&
     const bool frame_back=frame_button(m_frame_back);
     std::array<bool,4> frame_dpad{};
     for(size_t i=0;i<frame_dpad.size();++i) frame_dpad[i]=frame_button(m_frame_dpad[i]);
-    if(frame_bound!=m_frame_layout) {
-        m_frame_layout=frame_bound;
-        Log(OpenXRLogLevel::Info,frame_bound ? "Steam Frame button layout active" : "Steam Frame button layout inactive");
+    // Latched for the session: SteamVR briefly reports the actions inactive (a controller dozing,
+    // focus changes), and the layout must not switch under the player mid-race.
+    if(frame_bound && !m_frame_layout) {
+        m_frame_layout=true;
+        Log(OpenXRLogLevel::Info,"Steam Frame button layout active");
     }
     // View: a tap is GameCube B (back), a 0.5 s hold opens the VR settings, and with the settings
     // open a press closes them. The tap is sent on release so that a hold never also goes back.
