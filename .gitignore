@@ -92,3 +92,4 @@ output.txt
 /steam-frame/out/
 /steam-frame/release/
 /steam-frame/signing/
+__pycache__/
