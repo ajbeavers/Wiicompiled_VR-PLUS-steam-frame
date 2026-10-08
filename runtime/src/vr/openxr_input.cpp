@@ -333,6 +333,23 @@ bool OpenXRInput::CreateActions() {
         info.countSubactionPaths=1;info.subactionPaths=m_hand_paths;
         if(!Check(xrCreateAction(m_action_set,&info,spec.action),spec.name)) return false;
     }
+    // Steam Frame actions carry no hand: SteamVR may bind them to either controller.
+    for (const Spec& spec : std::array<Spec,9>{{
+        {&m_frame_item,"frame_item","Use item",XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {&m_frame_look_back,"frame_look_back","Look back",XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {&m_frame_drift,"frame_drift","Drift / hop",XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {&m_frame_start,"frame_start","Start / pause",XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {&m_frame_back,"frame_back","Back (hold: VR settings)",XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {&m_frame_dpad[0],"frame_dpad_up","D-pad up / trick",XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {&m_frame_dpad[1],"frame_dpad_down","D-pad down",XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {&m_frame_dpad[2],"frame_dpad_left","D-pad left",XR_ACTION_TYPE_BOOLEAN_INPUT},
+        {&m_frame_dpad[3],"frame_dpad_right","D-pad right",XR_ACTION_TYPE_BOOLEAN_INPUT}}}) {
+        XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+        info.actionType=spec.type;
+        std::strncpy(info.actionName,spec.name,XR_MAX_ACTION_NAME_SIZE-1);
+        std::strncpy(info.localizedActionName,spec.localized,XR_MAX_LOCALIZED_ACTION_NAME_SIZE-1);
+        if(!Check(xrCreateAction(m_action_set,&info,spec.action),spec.name)) return false;
+    }
     return true;
 }
 
@@ -607,6 +624,10 @@ void OpenXRInput::Destroy() {
     m_thumbstick = m_thumbstick_click = m_trigger = m_squeeze = XR_NULL_HANDLE;
     m_button_primary = m_button_secondary = m_menu = m_haptic = XR_NULL_HANDLE;
     m_options_x = m_options_y = XR_NULL_HANDLE;
+    m_frame_item = m_frame_look_back = m_frame_drift = m_frame_start = m_frame_back = XR_NULL_HANDLE;
+    m_frame_dpad = {};
+    m_frame_layout = m_frame_back_held = m_frame_back_consumed = false;
+    m_frame_back_down = m_frame_back_pulse_until = 0;
     m_options_previous=0;
     m_aim_pose = m_grip_pose = XR_NULL_HANDLE;
     m_hand_paths[0] = m_hand_paths[1] = XR_NULL_PATH;
@@ -756,9 +777,48 @@ void OpenXRInput::Sync(XrTime predicted_display_time, const OpenXRPointerScreen&
             ? static_cast<float>(input_time - m_last_input_time) * 1.0e-9f
             : 0.0f;
     m_last_input_time = input_time;
+    // Steam Frame layout (see m_frame_item). An action counts as bound once SteamVR reports it active.
+    bool frame_bound=false;
+    const auto frame_button=[&](XrAction action) {
+        if(action==XR_NULL_HANDLE) return false;
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action=action;
+        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if(XR_FAILED(xrGetActionStateBoolean(m_runtime->Session(),&info,&state)) || state.isActive!=XR_TRUE) return false;
+        frame_bound=true;
+        return state.currentState==XR_TRUE;
+    };
+    const bool frame_item=frame_button(m_frame_item), frame_look_back=frame_button(m_frame_look_back);
+    const bool frame_drift=frame_button(m_frame_drift), frame_start=frame_button(m_frame_start);
+    const bool frame_back=frame_button(m_frame_back);
+    std::array<bool,4> frame_dpad{};
+    for(size_t i=0;i<frame_dpad.size();++i) frame_dpad[i]=frame_button(m_frame_dpad[i]);
+    if(frame_bound!=m_frame_layout) {
+        m_frame_layout=frame_bound;
+        Log(OpenXRLogLevel::Info,frame_bound ? "Steam Frame button layout active" : "Steam Frame button layout inactive");
+    }
+    // View: a tap is GameCube B (back), a 0.5 s hold opens the VR settings, and with the settings
+    // open a press closes them. The tap is sent on release so that a hold never also goes back.
+    constexpr XrDuration kFrameBackHoldNs=500'000'000, kFrameBackPulseNs=120'000'000;
+    const bool frame_back_pressed=frame_back && !m_frame_back_held;
+    if(frame_back_pressed) {
+        m_frame_back_down=input_time;
+        m_frame_back_consumed=OpenXRSettingsPanelOpen();
+    }
+    bool frame_back_panel=false;
+    if(frame_back && !m_frame_back_consumed && input_time-m_frame_back_down>=kFrameBackHoldNs) {
+        frame_back_panel=true;
+        m_frame_back_consumed=true;
+    }
+    if(!frame_back && m_frame_back_held && !m_frame_back_consumed) m_frame_back_pulse_until=input_time+kFrameBackPulseNs;
+    m_frame_back_held=frame_back;
+    const bool frame_back_pulse=input_time<m_frame_back_pulse_until;
+
     std::array<wii_remote::HandInputs, kHands> panel_hands = hands;
     panel_hands[0].primary |= boolean(m_options_x,0);
     panel_hands[0].secondary |= boolean(m_options_y,0);
+    if(frame_back_panel) panel_hands[0].primary=panel_hands[0].secondary=true;
+    if(frame_back_pressed && m_frame_back_consumed) panel_hands[0].menu=true;
     const auto physical=m_runtime->RuntimeInfo().runtime_name.find("SteamVR")!=std::string::npos ?
         OpenXRReadPhysicalOptionsButtons() : PhysicalOptionsButtons{};
     if(physical.valid) {
@@ -861,6 +921,21 @@ void OpenXRInput::Sync(XrTime predicted_display_time, const OpenXRPointerScreen&
         port.trick=pause.trick;
         if(pause.pause && !panel.withheld) OpenXRRequestTutorialPause();
     } else port.pause=hands[0].menu;
+    if(m_frame_layout) {
+        // A modern gamepad layout over the GameCube pad, the same in both views: A or the right
+        // trigger accelerates, the grips or right bumper drift (no cockpit A = drift swap), and
+        // Menu is Start. D-pad up goes through the tricks axis, not `trick`, which MapQuestInput
+        // reads with the item as the VR settings chord.
+        port.cockpit_controls=false;
+        port.item=(frame_item || port.item>.5f)?1.f:0.f;
+        port.look_back=frame_look_back;
+        port.drift=std::max(port.drift,frame_drift?1.f:0.f);
+        port.trick=false;
+        port.tricks_y=std::clamp(port.tricks_y+(frame_dpad[0]?1.f:0.f)-(frame_dpad[1]?1.f:0.f),-1.f,1.f);
+        port.tricks_x=std::clamp(port.tricks_x+(frame_dpad[3]?1.f:0.f)-(frame_dpad[2]?1.f:0.f),-1.f,1.f);
+        port.pause=frame_start;
+        port.brake=port.brake || frame_back_pulse;
+    }
     if(panel.withheld) {
         const auto rawX=port.raw_steering_x,rawY=port.raw_steering_y;
         port=QuestInput{.steamvr=port.steamvr,.active=true};port.raw_steering_x=rawX;port.raw_steering_y=rawY;

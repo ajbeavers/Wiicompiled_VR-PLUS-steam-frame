@@ -162,6 +162,20 @@ private:
     XrAction m_aim_pose = XR_NULL_HANDLE;
     XrAction m_grip_pose = XR_NULL_HANDLE;
     XrAction m_haptic = XR_NULL_HANDLE;
+    // Steam Frame layout: hand-independent buttons that the local SteamVR binding assigns
+    // (X / left bumper item, Y look back, grips / right bumper drift, Menu start, View back,
+    // D-pad as the GameCube D-pad). Unbound, and so inactive, on other controllers.
+    XrAction m_frame_item = XR_NULL_HANDLE;
+    XrAction m_frame_look_back = XR_NULL_HANDLE;
+    XrAction m_frame_drift = XR_NULL_HANDLE;
+    XrAction m_frame_start = XR_NULL_HANDLE;
+    XrAction m_frame_back = XR_NULL_HANDLE;
+    std::array<XrAction, 4> m_frame_dpad{}; // up, down, left, right
+    bool m_frame_layout = false;
+    bool m_frame_back_held = false;
+    bool m_frame_back_consumed = false;
+    XrTime m_frame_back_down = 0;
+    XrTime m_frame_back_pulse_until = 0;
     XrPath m_hand_paths[kHands]{};
     XrSpace m_aim_spaces[kHands]{};
     XrSpace m_grip_spaces[kHands]{};
