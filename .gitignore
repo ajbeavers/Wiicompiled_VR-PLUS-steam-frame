@@ -86,3 +86,9 @@ output.txt
 /android/.runs/
 # Local patched launcher build, reproducible from integrations/wheelwizard-vr.patch.
 /integrations/wheelwizard-work/
+
+# Steam Frame build (steam-frame/build.sh): toolchain downloads, objects, APKs and the signing key
+/steam-frame/dl/
+/steam-frame/out/
+/steam-frame/release/
+/steam-frame/signing/

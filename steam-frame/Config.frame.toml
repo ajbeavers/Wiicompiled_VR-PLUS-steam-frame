@@ -1,0 +1,20 @@
+# WiiCompiled Quest configuration. Edit with the launcher or the in-game panel. After an adb push, run chmod 664 on it or the app can no longer save settings.
+# Seeded by the Steam Frame launch wrapper on the first run; the in-game VR settings panel edits it in place.
+[paths]
+dvd_root = "/storage/emulated/0/Android/data/org.wiicompiled.quest/files/WiiCompiledOpenXRVR/DATA"
+retro_rewind_root = "/storage/emulated/0/Android/data/org.wiicompiled.quest/files/WiiCompiledOpenXRVR/RetroRewind6"
+
+[video]
+widescreen = true
+resolution_multiplier = 1.0
+
+[vr]
+enabled = true
+render_scale = 1.000000
+# 1 = render at the headset's refresh rate (90 Hz under SteamVR), interpolated from the game's 60 fps.
+frame_interpolation_fps = 1
+# Grips are drift on the Frame layout; with this on they grabbed the wheel in first person instead.
+hand_steering = false
+# 0 = plain dark background behind the menus; the raymarched one held the menus at 40 fps on the Frame.
+menu_shader_quality = 0
+hand_hud = false

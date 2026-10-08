@@ -1,0 +1,234 @@
+{
+   "action_manifest_version": 0,
+   "alias_info": {},
+   "app_key": "@APPKEY@",
+   "category": "openxr",
+   "controller_type": "frame_controller",
+   "description": "Left stick steer; RT or A accelerate; LT or B brake/reverse; X or LB item; Y look back; grips or RB drift/hop; D-pad = D-pad (up = trick); Menu = Start/pause; View tap = back, hold = VR settings; right stick click = first-person toggle",
+   "interaction_profile": "",
+   "name": "WiiCompiled VR - Steam Frame layout (local)",
+   "options": {},
+   "simulated_actions": [],
+   "bindings": {
+      "/actions/mkw_gameplay": {
+         "chords": [],
+         "skeleton": [],
+         "haptics": [
+            {
+               "output": "/actions/mkw_gameplay/out/haptic",
+               "path": "/user/hand/left/output/haptic"
+            },
+            {
+               "output": "/actions/mkw_gameplay/out/haptic",
+               "path": "/user/hand/right/output/haptic"
+            }
+         ],
+         "poses": [
+            {
+               "output": "/actions/mkw_gameplay/in/aim_pose",
+               "path": "/user/hand/left/pose/openxr_aim"
+            },
+            {
+               "output": "/actions/mkw_gameplay/in/aim_pose",
+               "path": "/user/hand/right/pose/openxr_aim"
+            },
+            {
+               "output": "/actions/mkw_gameplay/in/grip_pose",
+               "path": "/user/hand/left/pose/openxr_grip"
+            },
+            {
+               "output": "/actions/mkw_gameplay/in/grip_pose",
+               "path": "/user/hand/right/pose/openxr_grip"
+            }
+         ],
+         "sources": [
+            {
+               "path": "/user/hand/left/input/thumbstick",
+               "mode": "joystick",
+               "inputs": {
+                  "position": {
+                     "output": "/actions/mkw_gameplay/in/thumbstick"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/thumbstick",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/thumbstick_click"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/thumbstick",
+               "mode": "joystick",
+               "inputs": {
+                  "position": {
+                     "output": "/actions/mkw_gameplay/in/thumbstick"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/thumbstick",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/thumbstick_click"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/trigger",
+               "mode": "trigger",
+               "inputs": {
+                  "pull": {
+                     "output": "/actions/mkw_gameplay/in/trigger"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/trigger",
+               "mode": "trigger",
+               "inputs": {
+                  "pull": {
+                     "output": "/actions/mkw_gameplay/in/trigger"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/grip",
+               "mode": "trigger",
+               "inputs": {
+                  "pull": {
+                     "output": "/actions/mkw_gameplay/in/squeeze"
+                  },
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_drift"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/grip",
+               "mode": "trigger",
+               "inputs": {
+                  "pull": {
+                     "output": "/actions/mkw_gameplay/in/squeeze"
+                  },
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_drift"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/a",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/button_primary"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/b",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/button_secondary"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/x",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_item"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/y",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_look_back"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/bumper",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_item"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/bumper",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_drift"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/dpad_up",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_dpad_up"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/dpad_down",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_dpad_down"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/dpad_left",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_dpad_left"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/dpad_right",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_dpad_right"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/right/input/menu",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_start"
+                  }
+               }
+            },
+            {
+               "path": "/user/hand/left/input/view",
+               "mode": "button",
+               "inputs": {
+                  "click": {
+                     "output": "/actions/mkw_gameplay/in/frame_back"
+                  }
+               }
+            }
+         ]
+      }
+   }
+}
