@@ -25,6 +25,13 @@ touch "$DEST/app/lepton-show-flatscreen"   # lets Lepton show the 2D launcher wi
 cp "$HERE/wiicompiled-launch.sh" "$DEST/wiicompiled-launch.sh"; chmod +x "$DEST/wiicompiled-launch.sh"
 cp "$HERE/Config.frame.toml" "$DEST/Config.frame.toml"
 cp "$HERE/steam-cef.py" "$DEST/tools/steam-cef.py"; chmod +x "$DEST/tools/steam-cef.py"
+# Optional, off by default: the Frame's own controller models in the game's menus, converted from
+# this Frame's SteamVR install. They look right but are about seven times the Touch Plus models'
+# vertex count, which the game re-animates on the CPU every frame, and the menus drop to 45-60 fps.
+if [ "${WCF_FRAME_MODELS:-0}" = 1 ]; then
+    python3 "$HERE/frame-controller-models.py" "$DEST/frame_controller_models" \
+        || echo "warning: could not convert SteamVR's Frame controller models; the menus will show Quest controllers"
+fi
 CEF="python3 $DEST/tools/steam-cef.py"
 
 # The Steam shortcut, through Steam's own client API (no editing of shortcuts.vdf behind its back).

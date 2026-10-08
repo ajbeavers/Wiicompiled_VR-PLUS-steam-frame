@@ -7,7 +7,7 @@ moment the game starts; with the changes here it runs at 90 Hz with the Frame co
 like a normal gamepad, straight from the Steam library, no PC involved.
 
 The branch to use is `steam-frame`. Everything the fork adds lives in [`steam-frame/`](steam-frame/)
-plus five small commits to `runtime/` and `aurora-main/`. Upstream's own README is kept as
+plus six small commits to `runtime/` and `aurora-main/`. Upstream's own README is kept as
 [README.upstream.md](README.upstream.md); read it for what the port itself does, this file is only
 about the Frame.
 
@@ -96,8 +96,8 @@ What the patches do, in the order they were needed:
 
 6. **Settings that suit the Frame**, seeded into `Config.toml` on the first launch by the wrapper
    ([`steam-frame/Config.frame.toml`](steam-frame/Config.frame.toml)): interpolation on auto, menu
-   background quality 0, hand steering off (the grips are drift on this layout and kept grabbing the
-   wheel in first person), render scale 1.0 and resolution multiplier 1.0. In SteamVR the app gets
+   background quality 0, hand steering on (see change 8), render scale 1.0 and resolution
+   multiplier 1.0. In SteamVR the app gets
    `preferredRefreshRate 90`, `framesToThrottle 0` and `additionalFramesToPredict 0`; those went in
    together with the interpolation and I have not tested them one at a time.
 
@@ -106,6 +106,12 @@ What the patches do, in the order they were needed:
    APK's kit is installed (it compares the kit fingerprints), the wrapper waits for the launcher to
    come up and starts the game activity itself, so a launch from the Steam library goes straight to
    the title screen in about ten seconds.
+
+8. **Grips in the cockpit.** With upstream's hand steering on, a grip squeeze in first person both
+   grabbed the wheel and drifted, because the grips are drift on this layout. Now the grips drift
+   in the original and diorama cameras and only hold the wheel in first person; the right bumper
+   drifts in every camera. (`openxr_input.cpp`; the binding no longer sends a grip click to
+   drift.) With `hand_steering = false` the grips drift everywhere and you steer with the stick.
 
 Everything else, the cameras, the hand IK, the HUD, Retro Rewind support, is upstream's work and is
 unchanged.
@@ -130,13 +136,19 @@ Known problems and things I have not tested:
   draws SteamVR's own model of whatever controller you hold when SteamVR offers one and falls back
   to its built-in Touch Plus models otherwise; inside Lepton the app gets no SteamVR render models,
   so it always falls back. The buttons the tutorials point at are the Quest ones too; the table
-  below is what the Frame buttons actually do.
-- **Grips do not grab the wheel in first person.** That is on purpose: on this layout the grips
-  are hop and drift, and with upstream's hand steering on, squeezing a grip to drift also grabbed
-  the wheel and steering jumped to your hand. So `hand_steering = false`, and you steer with the
-  stick in every camera. If you would rather steer with your hands in the cockpit, set
-  `hand_steering = true` under `[vr]` in `Config.toml` (path under "Where things are" below) and
-  drift with the right bumper instead. I have not tried that combination on the Frame.
+  below is what the Frame buttons actually do. I tried fixing this: SteamVR keeps the Frame
+  controller models on every Frame, and
+  [`steam-frame/frame-controller-models.py`](steam-frame/frame-controller-models.py) converts them
+  into the game's format, with the buttons, trigger, grip and stick animated. They looked right in
+  my hands, but they are about seven times the Touch Plus models' vertex count, the game
+  re-animates every vertex on the CPU each frame a menu is up, and the menus dropped to 45 to 60
+  fps, with the background flickering when the VR settings opened mid-race. So it is off. To try
+  it anyway, run the installer with `WCF_FRAME_MODELS=1`. A decimated version of the models would
+  probably fix the cost; that is a good pull request for someone.
+- **Steering with the grips in first person works, roughly.** Change 8 is newer than the rest and
+  has had one session; grabbing the wheel works but upstream's grab range and steering response
+  were tuned for Quest controllers and I have not adjusted them. Set `hand_steering = false` under
+  `[vr]` in `Config.toml` (path under "Where things are" below) to steer with the stick instead.
 - **Subtle slowdowns remain.** Races are a solid 90 on the counter, but there are brief hitches
   now and then that I notice and cannot pin to anything in the logs. Good enough that I play it;
   not perfect.
@@ -169,7 +181,8 @@ The binding is installed per app by `install.sh`; the game picks the layout up b
 | Left trigger, or B | Brake, reverse / cancel |
 | X, or left bumper | Use or hold item |
 | Y | Look back |
-| Grips, or right bumper | Hop and drift |
+| Right bumper | Hop and drift |
+| Grips | Hop and drift; in first person, hold the wheel instead |
 | D-pad | D-pad (up is a trick) |
 | Right stick directions | Tricks and wheelies |
 | Right stick click | Cycle the three cameras |

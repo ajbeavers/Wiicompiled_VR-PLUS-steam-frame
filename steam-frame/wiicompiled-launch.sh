@@ -26,6 +26,15 @@ if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
         cp "$HERE/Config.frame.toml" "$CFG/Config.toml" && chmod 664 "$CFG/Config.toml"
         echo "$(date +%T) seeded $CFG/Config.toml with the Frame settings" >> "$LOG"
     fi
+    # Steam Frame controller models (made by install.sh from SteamVR's own) in place of the Touch Plus
+    # ones. The app unpacks its resources again after an APK update, so after an update the Frame
+    # models show from the second launch on.
+    RES=$STEAM_COMPAT_DATA_PATH/internal/$PKG/files/runtime_resources/quest_touch_plus
+    if [ -d "$RES" ] && [ -f "$HERE/frame_controller_models/right.wccontroller" ]; then
+        for f in left.wccontroller left.rgba right.wccontroller right.rgba; do
+            cmp -s "$HERE/frame_controller_models/$f" "$RES/$f" || cp "$HERE/frame_controller_models/$f" "$RES/$f"
+        done
+    fi
     MANIFEST=$STEAM_COMPAT_DATA_PATH/internal/$PKG/files/game/base/game.json
     APK=$(ls "$HERE"/app/*.apk 2>/dev/null | head -1)
     if [ ! -f "$MANIFEST" ]; then
