@@ -100,9 +100,10 @@ What the patches do, in the order they were needed:
    together with the interpolation and I have not tested them one at a time.
 
 7. **A launch wrapper**, because the app's 2D launcher never shows up in the headset on the Frame
-   (SteamVR does not pick up Lepton's flat window for this app). Once a game is built, the wrapper
-   waits for the launcher to come up and starts the game activity itself, so a launch from the Steam
-   library goes straight to the title screen in about ten seconds.
+   (SteamVR does not pick up Lepton's flat window for this app). Once a game built against this
+   APK's kit is installed (it compares the kit fingerprints), the wrapper waits for the launcher to
+   come up and starts the game activity itself, so a launch from the Steam library goes straight to
+   the title screen in about ten seconds.
 
 Everything else, the cameras, the hand IK, the HUD, Retro Rewind support, is upstream's work and is
 unchanged.
@@ -240,9 +241,11 @@ from another machine with developer mode on. Nothing needs root and nothing is i
    saved to `Config.toml`.
 
 If you already had upstream's APK set up on the Frame under the same library entry name, step 2
-repoints that entry, and Lepton clears the old app's data on the next launch because the APK
-changed; the extracted disc files survive in `external/`, the built game does not, so you repeat
-the `BuildGame` command (not the extraction).
+repoints that entry. On the next launch Lepton reinstalls the app because the APK changed; the
+extracted disc files and the previously built game both survive, but that game was built against
+upstream's kit and the app will not run it (the launcher calls it stale, and the wrapper sees the
+fingerprint mismatch and leaves the launcher up). Run the `BuildGame` command from step 5; the
+extraction is not needed again.
 
 ## Building the APK yourself
 
