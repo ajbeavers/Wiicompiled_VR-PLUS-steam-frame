@@ -4,7 +4,7 @@
    "app_key": "@APPKEY@",
    "category": "openxr",
    "controller_type": "frame_controller",
-   "description": "Left stick steer; RT or A accelerate; LT or B brake/reverse; X or LB item; Y look back; grips or RB drift/hop; D-pad = D-pad (up = trick); Menu = Start/pause; View tap = back, hold = VR settings; right stick click = first-person toggle",
+   "description": "Left stick steer; RT or A accelerate; LT or B brake/reverse; X or LB item; Y look back; RB drift/hop, grips too except in first person with hand steering (grips hold the wheel there); D-pad = D-pad (up = trick); Menu = Start/pause; View tap = back, hold = VR settings; right stick click = camera",
    "interaction_profile": "",
    "name": "WiiCompiled VR - Steam Frame layout (local)",
    "options": {},
@@ -102,9 +102,6 @@
                "inputs": {
                   "pull": {
                      "output": "/actions/mkw_gameplay/in/squeeze"
-                  },
-                  "click": {
-                     "output": "/actions/mkw_gameplay/in/frame_drift"
                   }
                }
             },
@@ -114,9 +111,6 @@
                "inputs": {
                   "pull": {
                      "output": "/actions/mkw_gameplay/in/squeeze"
-                  },
-                  "click": {
-                     "output": "/actions/mkw_gameplay/in/frame_drift"
                   }
                }
             },

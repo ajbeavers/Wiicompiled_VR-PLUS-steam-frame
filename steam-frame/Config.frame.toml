@@ -13,8 +13,8 @@ enabled = true
 render_scale = 1.000000
 # 1 = render at the headset's refresh rate (90 Hz under SteamVR), interpolated from the game's 60 fps.
 frame_interpolation_fps = 1
-# Grips are drift on the Frame layout; with this on they grabbed the wheel in first person instead.
-hand_steering = false
+# Grips hold the wheel in the first-person cockpit (the right bumper drifts there); elsewhere they drift.
+hand_steering = true
 # 0 = plain dark background behind the menus; the raymarched one held the menus at 40 fps on the Frame.
 menu_shader_quality = 0
 hand_hud = false

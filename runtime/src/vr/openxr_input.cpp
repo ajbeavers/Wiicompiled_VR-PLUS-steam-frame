@@ -925,13 +925,16 @@ void OpenXRInput::Sync(XrTime predicted_display_time, const OpenXRPointerScreen&
     } else port.pause=hands[0].menu;
     if(m_frame_layout) {
         // A modern gamepad layout over the GameCube pad, the same in both views: A or the right
-        // trigger accelerates, the grips or right bumper drift (no cockpit A = drift swap), and
-        // Menu is Start. D-pad up goes through the tricks axis, not `trick`, which MapQuestInput
-        // reads with the item as the VR settings chord.
+        // trigger accelerates, the right bumper drifts (no cockpit A = drift swap), and Menu is
+        // Start. D-pad up goes through the tricks axis, not `trick`, which MapQuestInput reads with
+        // the item as the VR settings chord. Either grip also drifts, except in the cockpit with
+        // hand steering on, where the grips only hold the wheel.
+        const bool grips_hold_wheel=port.cockpit_controls && RuntimeConfigFile::VrHandSteering();
         port.cockpit_controls=false;
         port.item=(frame_item || port.item>.5f)?1.f:0.f;
         port.look_back=frame_look_back;
-        port.drift=std::max(port.drift,frame_drift?1.f:0.f);
+        port.drift=std::max(grips_hold_wheel ? 0.f : std::max(ui.buttons[0].squeeze,ui.buttons[1].squeeze),
+                            frame_drift?1.f:0.f);
         port.trick=false;
         port.tricks_y=std::clamp(port.tricks_y+(frame_dpad[0]?1.f:0.f)-(frame_dpad[1]?1.f:0.f),-1.f,1.f);
         port.tricks_x=std::clamp(port.tricks_x+(frame_dpad[3]?1.f:0.f)-(frame_dpad[2]?1.f:0.f),-1.f,1.f);
