@@ -9,7 +9,7 @@
 # checked against its published SHA-256. Output: steam-frame/release/WiiCompiled-VR-SteamFrame-<tag>.apk
 #
 # What it does:
-#   1. an Android NDK into ~/.local/opt/android-build (shared with the Moonlight XR Frame build);
+#   1. an Android NDK into ~/.local/opt/android-build (WCF_TOOLS changes the folder);
 #   2. compiles the two runtime unity groups that hold the Frame-patched sources (openxr_input.cpp,
 #      openxr_integration.cpp, and the rest of each group) and Aurora's gfx/common.cpp, with the
 #      same flags the kit's own objects were built with;
