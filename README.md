@@ -1,241 +1,160 @@
 # Mario Kart Wii VR on the Steam Frame
 
 This is a fork of [heurazy/Wiicompiled_VR-PLUS](https://github.com/heurazy/Wiicompiled_VR-PLUS),
-the Mario Kart Wii VR port, that runs standalone on Valve's **Steam Frame** through Lepton (the
-Frame's Android compatibility tool). Upstream's Quest APK installs on the Frame but crashes the
-moment the game starts; with the changes here it runs at 90 Hz with the Frame controllers laid out
-like a normal gamepad, straight from the Steam library, no PC involved.
+the Mario Kart Wii VR port. It runs standalone on Valve's Steam Frame through Lepton, the Frame's
+Android compatibility tool. No PC is involved.
 
-The branch to use is `steam-frame`. Everything the fork adds lives in [`steam-frame/`](steam-frame/)
-plus six small commits to `runtime/` and `aurora-main/`. Upstream's own README is kept as
-[README.upstream.md](README.upstream.md); read it for what the port itself does, this file is only
-about the Frame.
+Upstream's Quest APK installs on the Frame, but the game crashes as soon as it starts. With the
+changes here it starts from the Steam library, runs at 90 Hz, and uses a gamepad-style layout on
+the Frame controllers.
 
-**Status, October 2026:** working on my Steam Frame (SteamOS 0.4.5, Lepton 2.8.11, SteamVR), in
-the original and first-person cameras, single player. See [What works and what doesn't](#what-works-and-what-doesnt)
-before you spend an afternoon on it.
+The branch is `steam-frame`. The fork's files are in [`steam-frame/`](steam-frame/), plus six
+commits to `runtime/` and `aurora-main/`. Upstream's README is kept as
+[README.upstream.md](README.upstream.md). Read it for what the port itself does. This file only
+covers the Frame.
 
-## The honest part: an AI wrote this
+**Status, October 2026.** Release `v1.3.1-frame.3` works on my Steam Frame with SteamOS 0.4.5,
+Lepton 2.8.14 and SteamVR. Tested: single player, the original and first-person cameras, the
+menus and the VR settings panel. Read [Known problems](#known-problems) before you start.
 
-I did not write the code in this fork, and I did not write this README either. Both were produced
-by Anthropic's Claude (the models called **Claude Opus 5.5** and **Claude Fable 5.1**), running
-through Claude Code on the Steam Frame itself over SSH. What I did was decide what to try, launch
-every build in the headset, play it, and report back what I saw: "it's a flickering mess", "the
-menus are a slideshow", "the item box stays on screen", "that resolution change made it stutter,
-roll it back". The AI read the logs, read the code, made the change, and we went round again.
-Everything in the status and testing sections below comes from those rounds on real hardware, not
-from reasoning about the code.
+**AI use.** The code and the docs in this fork were written with Claude Code (Anthropic's Claude
+Opus 5.5 and Claude Fable 5.1), running on the Frame. I chose what to try, tested every build in
+the headset and reported what I saw. Nobody from the upstream project has reviewed this fork.
+Read the diffs before you trust them.
 
-So: this is AI-generated code, by someone who could not have written it by hand, published because
-it works and because I think it proves something worth proving, that a Wii game can run natively in
-VR on a Steam Frame at 90 Hz without streaming. Treat it accordingly. Read the diffs before you trust
-them. Nobody from the upstream project has reviewed any of it, and I asked the AI to say so plainly
-rather than dress it up. The [How this was made](#how-this-was-made) section at the end has the
-longer version, including the things it got wrong along the way.
+## Contents
 
-If you want a project that is honest about the same thing in a much funnier way, read the README of
-[baijiSteamVR](https://github.com/thejerf/baijiSteamVR); it is where I took the idea of just saying
-it out loud.
+- [What the fork changes](#what-the-fork-changes)
+- [Requirements](#requirements)
+- [Install](#install)
+- [First run: import the disc and build the game](#first-run-import-the-disc-and-build-the-game)
+- [Updating](#updating)
+- [Controls](#controls)
+- [Settings](#settings)
+- [Known problems](#known-problems)
+- [Troubleshooting](#troubleshooting)
+- [Logs and reporting a problem](#logs-and-reporting-a-problem)
+- [Building the APK yourself](#building-the-apk-yourself)
+- [Where things are](#where-things-are)
+- [How this was made](#how-this-was-made)
+- [Licence and credits](#licence-and-credits)
 
-## What is different from upstream
+## What the fork changes
 
-Upstream ships three things: a Windows build, a Quest APK, and the design where **your game is
-compiled on your own device from your own disc**: the APK carries a "game kit" (precompiled runtime
-objects, headers, a toolchain) and the headset translates and links `libmain.so` from your disc
-against that kit. No Nintendo code is ever in the APK or in this repository, and that stays true
-here.
+Upstream's design stays the same. The APK carries a "game kit": precompiled runtime objects,
+headers and a toolchain. The headset translates your own disc and links `libmain.so` against that
+kit. No Nintendo code is in the APK or in this repository.
 
-This fork changes the kit, not the design. The Steam Frame APK is upstream's v1.3.1 Quest APK with
-four kit files swapped for ones compiled from the patched sources, one patched `classes.dex`, and a
-new kit fingerprint. When the headset builds your game it links it against the Frame objects, so you
-get the Frame version from the same disc import and build that upstream documents.
+The Steam Frame APK is upstream's v1.3.1 Quest APK with four kit files replaced by ones compiled
+from this branch, one patched `classes.dex`, and a new kit fingerprint. When the headset builds
+your game, it links it against the Frame objects.
 
-What the patches do, in the order they were needed:
+1. **The app starts.** Upstream's app registers a clipboard listener at startup. Lepton's Android
+   has no clipboard service, so the app crashed with a `NullPointerException`. That call is
+   replaced with no-ops in `classes.dex` ([`steam-frame/dexpatch.py`](steam-frame/dexpatch.py)).
 
-1. **It starts.** Upstream's app registers a clipboard listener when SDL comes up. Lepton's Android
-   image has no clipboard service, the lookup returns null, and the game process dies with a
-   `NullPointerException` before it draws anything. The ten bytes of that call are replaced with
-   nops in `classes.dex` ([`steam-frame/dexpatch.py`](steam-frame/dexpatch.py)). That is the whole
-   reason the stock APK "doesn't work" on the Frame.
+2. **90 Hz.** Upstream turns VR frame interpolation off on Android. On the Frame that showed as
+   judder and ghosting when turning the head. Interpolation is on again, so the eyes render at the
+   headset's refresh rate with a fresh head pose each frame while the game runs at 60 fps.
+   SteamVR's OpenXR in Lepton lacks `XR_KHR_convert_timespec_time`, so there is a
+   `CLOCK_MONOTONIC` fallback. (`runtime/src/vr/openxr_integration.cpp`)
 
-2. **90 Hz.** Upstream deliberately disables VR frame interpolation on Android (its README says so:
-   it "makes the standalone presentation unstable" on Quest). On the Frame that leaves the game
-   presenting its 60 fps simulation into a 90 Hz headset, which looked like judder and ghosting
-   whenever I turned my head. The Android runtime overrides that forced it off are removed, so
-   Aurora's stereo replay renders the eyes at the headset's refresh rate with a fresh head pose each
-   frame, from the game's 60 fps. SteamVR's OpenXR inside Lepton has no
-   `XR_KHR_convert_timespec_time`, which the pacing needs, so there is a `CLOCK_MONOTONIC` fallback
-   that anchors on the first frame. (`runtime/src/vr/openxr_integration.cpp`;
-   `setprop debug.wiicompiled.vr_interp 0|1|72|90|120` overrides it per launch.) Races hold 90 fps
-   on the counter, with frames submitted well inside the budget. Not perfectly smooth, see below.
+3. **Frame controller layout.** The game's OpenXR actions were written for Quest Touch
+   controllers. On the Frame, SteamVR mapped A to three actions and left B, X and Y unused. The
+   runtime now also has hand-independent actions (`frame_item`, `frame_drift`,
+   `frame_look_back`, `frame_start`, `frame_back` and four D-pad actions).
+   [`steam-frame/bindings_frame_controller.json`](steam-frame/bindings_frame_controller.json)
+   binds the Frame buttons to them. When SteamVR reports them bound, the game uses the layout in
+   [Controls](#controls) for the rest of the session. (`runtime/src/vr/openxr_input.cpp`)
 
-3. **Frame controllers.** The game's actions are hand-specific OpenXR actions written for Quest Touch
-   and SteamVR had auto-mapped them onto the Frame controllers so that A did three things and B, X
-   and Y did nothing. The runtime now also creates hand-independent actions (`frame_item`,
-   `frame_drift`, `frame_look_back`, `frame_start`, `frame_back`, a D-pad), a SteamVR binding file
-   assigns the Frame's buttons to them, and when SteamVR reports them bound the game switches to a
-   gamepad-style layout, the same in every camera (no cockpit "A becomes drift" swap). The layout
-   latches for the session, because SteamVR briefly reports the actions inactive when a controller
-   dozes and you do not want the controls changing mid-race. (`runtime/src/vr/openxr_input.cpp`,
-   [`steam-frame/bindings_frame_controller.json`](steam-frame/bindings_frame_controller.json).)
+4. **Menus at 90 Hz.** Upstream's animated menu background held the menus at 37 to 45 fps. On
+   Android the menus are now always drawn into the eye images, and menu background quality 0
+   gives a plain dark background. (`openxr_integration.cpp`, `menu_shader_quality = 0`)
 
-4. **Menus at 90 instead of 40.** Races were fine but the menus, which upstream draws on a spatial
-   panel with an animated "dielectric" raymarched background, ran at 37 to 45 fps with each frame
-   taking 15 to 24 ms to submit. Turning the background quality to 0 upstream would have moved the
-   menus to a quad layer, which under Lepton's SteamVR bridge is a slow submission of its own. On
-   Android the menus are now always drawn into the eye images, and quality 0 means a plain dark
-   background, which costs nothing. (`openxr_integration.cpp`; `menu_shader_quality = 0` in the
-   config.)
+5. **Item box (attempted, does not work yet).** The port now skips 2D HUD draws that lie wholly
+   outside the game's scissor rectangle. The empty item box still shows in the headset. The
+   change is harmless and stays in. (`aurora-main/lib/gfx/common.cpp`)
 
-5. **The item box (attempted, does not work yet).** In VR the item roulette slides up after use
-   and stays visible. Aurora's virtual-screen HUD draws ignore the game's scissor rectangle, so the
-   port now skips a 2D draw that lies entirely outside a scissor the game narrowed, which is what
-   hides it on a TV. (`aurora-main/lib/gfx/common.cpp`.) In the headset the empty box still shows,
-   so either the box is not drawn the way that check assumes or the scissor is not what hides it.
-   The change is harmless and stays in until someone finds the real cause.
+6. **Frame settings.** The launch wrapper seeds `Config.toml` from
+   [`steam-frame/Config.frame.toml`](steam-frame/Config.frame.toml) on the first launch, and
+   `install.sh` sets per-app SteamVR values. See [Settings](#settings).
 
-6. **Settings that suit the Frame**, seeded into `Config.toml` on the first launch by the wrapper
-   ([`steam-frame/Config.frame.toml`](steam-frame/Config.frame.toml)): interpolation on auto, menu
-   background quality 0, hand steering on (see change 8), render scale 1.0 and resolution
-   multiplier 1.0. In SteamVR the app gets
-   `preferredRefreshRate 90`, `framesToThrottle 0` and `additionalFramesToPredict 0`; those went in
-   together with the interpolation and I have not tested them one at a time.
+7. **Launch wrapper.** The app's 2D launcher never shows in the headset on the Frame.
+   [`steam-frame/wiicompiled-launch.sh`](steam-frame/wiicompiled-launch.sh) waits for the
+   launcher and starts the game activity itself, once a game built for this APK's kit is
+   installed. A launch from the library reaches the title screen in about ten seconds.
 
-7. **A launch wrapper**, because the app's 2D launcher never shows up in the headset on the Frame
-   (SteamVR does not pick up Lepton's flat window for this app). Once a game built against this
-   APK's kit is installed (it compares the kit fingerprints), the wrapper waits for the launcher to
-   come up and starts the game activity itself, so a launch from the Steam library goes straight to
-   the title screen in about ten seconds.
+8. **Grips in the cockpit.** In the first-person cockpit the grips hold the steering wheel. In
+   the other cameras they drift. The right bumper drifts in every camera.
 
-8. **Grips in the cockpit.** With upstream's hand steering on, a grip squeeze in first person both
-   grabbed the wheel and drifted, because the grips are drift on this layout. Now the grips drift
-   in the original and diorama cameras and only hold the wheel in first person; the right bumper
-   drifts in every camera. (`openxr_input.cpp`; the binding no longer sends a grip click to
-   drift.) With `hand_steering = false` the grips drift everywhere and you steer with the stick.
+9. **Frame controller models.** Inside Lepton the app gets no SteamVR render models, so upstream
+   showed Quest controllers in the menus.
+   [`steam-frame/frame-controller-models.py`](steam-frame/frame-controller-models.py) converts the
+   Frame controller models from your own SteamVR install into the game's format and simplifies
+   them to about 4,000 triangles per hand. `install.sh` runs it, and the launch wrapper copies the
+   result over the Quest files on each launch. Valve's models are never included in the repository
+   or the APK.
 
-9. **Frame controllers in the menus.** Upstream draws SteamVR's own model of the controller you
-   hold when SteamVR offers one and its built-in Quest Touch Plus models otherwise; inside Lepton
-   the app gets no SteamVR render models, so it always showed Quest controllers. SteamVR keeps the
-   Frame controller models on every Frame, and
-   [`steam-frame/frame-controller-models.py`](steam-frame/frame-controller-models.py) converts
-   them into the game's format, with the buttons, trigger, grip and stick animated. `install.sh`
-   runs it and the wrapper copies the result over the Touch files on each launch. The first
-   version used the full models, about seven times the Touch Plus vertex count; the game
-   re-animates every vertex on the CPU each frame a menu is up, so the menus fell to 45 to 60 fps
-   and the background flickered when the VR settings opened mid-race. The script now simplifies
-   each hand to about 4,000 triangles (roughly the Touch Plus size), keeping the outline, the
-   UV seams and the moving parts intact, and the menus are back at 90. `WCF_FRAME_MODELS=0` when
-   installing keeps the Quest controllers. The tutorials still point at Quest buttons; the
-   controls table below is what the Frame buttons actually do. After an APK update the Frame
-   models show from the second launch on, because the app unpacks its own resources again first.
+The cameras, hand IK, HUD and Retro Rewind support are upstream's work and are unchanged.
 
-Everything else, the cameras, the hand IK, the HUD, Retro Rewind support, is upstream's work and is
-unchanged.
+## Requirements
 
-## What works and what doesn't
+- A Steam Frame.
+- **Lepton**, installed from Steam (Library > Tools).
+- Your own clean PAL Mario Kart Wii disc image, game ID `RMCP01`. ISO works. Upstream's importer
+  also lists RVZ, WBFS and other formats. Other regions and modified images are rejected.
+- About 5 GB free.
+- A terminal on the Frame: Konsole in desktop mode, or SSH from another computer.
+- Steam running while you install. No root and no `pacman` are needed.
 
-Confirmed on my Frame, in the headset:
+## Install
 
-- Launching from the Steam library into the game, title screen to race, at 90 Hz.
-- Racing in the original camera; the first-person cockpit, briefly; the menus at full rate; the
-  VR settings panel; the controller layout in the table below, including pause and back.
-- The release path itself: the APK from the Releases page installed with `install.sh`, the game
-  built on the headset against its kit (about 13 minutes on my Frame), and launched from the
-  library. That is what I play now. The first release (`v1.3.1-frame.1`) failed at the final link
-  on the headset because its objects were compiled with the wrong NDK; see "Building" below.
-
-Known problems and things I have not tested:
-
-- **The empty item box stays on screen** after the roulette slides up. The attempted fix (change 5)
-  does not do it. It is cosmetic, so I live with it.
-- **Steering with the grips in first person works, roughly.** Change 8 is newer than the rest and
-  has had one session; grabbing the wheel works but upstream's grab range and steering response
-  were tuned for Quest controllers and I have not adjusted them. Set `hand_steering = false` under
-  `[vr]` in `Config.toml` (path under "Where things are" below) to steer with the stick instead.
-- **Subtle slowdowns remain.** Races are a solid 90 on the counter, but there are brief hitches
-  now and then that I notice and cannot pin to anything in the logs. Good enough that I play it;
-  not perfect.
-- **The 2D launcher is invisible** in the headset, so the one-time disc import and build are done
-  from a terminal with two commands (below). Upstream's "Select disc image" button needs a document
-  picker Lepton does not have anyway.
-- **Resolution.** I tried 1.5x game resolution with 2160x2160 eyes for sharper menu text. It
-  looked better and dropped frames all over the place (10 to 24 ms late, 30 to 50 ms stalls), so
-  it went back to 1.0x and 1728x1728, which is what the installer sets. If you want sharper menus,
-  make the menu screen bigger or closer in VR settings instead.
-- **Not tested:** Retro Rewind, online play, the diorama camera for more than a minute, USB
-  wheels, multiplayer, passthrough (there is nothing to pass through to; the Frame shows SteamVR's
-  void around the menus), hand tracking.
-- **Not for Quest.** The kit objects are compiled for Android arm64 and would run on a Quest, but
-  the interpolation change is exactly what upstream turned off there because it misbehaved on
-  Quest, and the controller layout only activates when SteamVR binds the Frame actions. Use
-  upstream's APK on a Quest.
-- **Updates.** This is built on upstream v1.3.1. A newer upstream APK has a different kit, and
-  `build.sh` refuses to make an APK when the objects it compiled do not export the same symbols as
-  the ones in the APK; the patches will need porting when upstream moves.
-
-## Controls
-
-The binding is installed per app by `install.sh`; the game picks the layout up by itself.
-
-| Steam Frame | In the game |
-| --- | --- |
-| Left stick | Steer, navigate menus |
-| Right trigger, or A | Accelerate / confirm |
-| Left trigger, or B | Brake, reverse / cancel |
-| X, or left bumper | Use or hold item |
-| Y | Look back |
-| Right bumper | Hop and drift |
-| Grips | Hop and drift; in first person, hold the wheel instead |
-| D-pad | D-pad (up is a trick) |
-| Right stick directions | Tricks and wheelies |
-| Right stick click | Cycle the three cameras |
-| Menu (right) | Start / pause |
-| View (left), tap | Back |
-| View (left), hold half a second | VR settings panel (press again to close) |
-
-The left View tap is sent on release so that a hold never also goes back. Steam Input and SteamVR's
-binding UI are the right place to change any of this: the file is a normal SteamVR binding and shows
-up under Manage Controller Bindings for the app.
-
-## Setting it up on a Steam Frame
-
-You need: a Steam Frame; **Lepton** installed from Steam (Library > Tools); your own clean PAL
-`RMCP01` Mario Kart Wii disc image (I used an ISO; upstream's launcher also accepts RVZ, WBFS and
-the others it lists); about 5 GB free; and a terminal on the Frame: Konsole in desktop mode, or SSH
-from another machine with developer mode on. Nothing needs root and nothing is installed with pacman.
-
-1. Get the repository and the APK:
+1. Get the repository:
 
    ```sh
    git clone -b steam-frame https://github.com/simplysanatori/Wiicompiled_VR-PLUS-steam-frame.git
    cd Wiicompiled_VR-PLUS-steam-frame
    ```
 
-   Download `WiiCompiled-VR-SteamFrame-*.apk` from the
-   [Releases](https://github.com/simplysanatori/Wiicompiled_VR-PLUS-steam-frame/releases) page, or build
-   it yourself (next section). The APK contains no game data, exactly like upstream's.
+2. Download `WiiCompiled-VR-SteamFrame-*.apk` from the
+   [Releases](https://github.com/simplysanatori/Wiicompiled_VR-PLUS-steam-frame/releases) page.
+   Use `v1.3.1-frame.2` or newer. Each release lists the APK's SHA-256 in `SHA256SUMS.txt`:
 
-2. Install it, with Steam running:
+   ```sh
+   sha256sum ~/Downloads/WiiCompiled-VR-SteamFrame-*.apk
+   ```
+
+   You can also build the APK yourself ([Building the APK yourself](#building-the-apk-yourself)).
+   The APK contains no game data.
+
+3. Run the installer with Steam running. Use the `install.sh` from the same release tag or newer:
 
    ```sh
    steam-frame/install.sh ~/Downloads/WiiCompiled-VR-SteamFrame-*.apk
    ```
 
-   This copies the APK and the launch wrapper to `~/Games/WiiCompiledVR-SteamFrame/`, adds a
-   **Mario Kart Wii VR** entry to the Steam library set to the Lepton compatibility tool (through
-   Steam's own client API, so no editing of `shortcuts.vdf` behind Steam's back), and writes the
-   controller binding and the 90 Hz settings into SteamVR for that entry. It prints the entry's
-   appid; you need it for the next step. Running it again later updates the same entry.
+   The installer:
 
-3. Put the disc image in `~/Documents/` on the Frame (Lepton shows that folder to the app as
-   `/sdcard/Documents`).
+   - copies the APK, the launch wrapper and the seed config to `~/Games/WiiCompiledVR-SteamFrame/`;
+   - converts the Frame controller models from SteamVR;
+   - adds a **Mario Kart Wii VR** entry to the Steam library, set to the Lepton compatibility
+     tool, through Steam's client API;
+   - writes the controller binding and the 90 Hz settings into SteamVR for that entry;
+   - prints the entry's appid. You need it for the first run.
 
-4. Put the headset on and launch **Mario Kart Wii VR** from the library. The first launch takes a
-   minute while Lepton installs the APK. You will see SteamVR's empty space and nothing else: the
+   Running it again updates the same entry.
+
+## First run: import the disc and build the game
+
+1. Put the disc image in `~/Documents/` on the Frame. Lepton shows that folder to the app as
+   `/sdcard/Documents`.
+
+2. Put the headset on and launch **Mario Kart Wii VR** from the library. The first launch takes
+   about a minute while Lepton installs the APK. You will only see SteamVR's empty space. The
    app's launcher is running but cannot be seen. Leave it running.
 
-5. From the terminal, start the disc import, then the build. `<appid>` is the number from step 2
-   and `MarioKart.iso` is your file's name:
+3. In the terminal, import the disc. Replace `<appid>` with the number from `install.sh` and
+   `MarioKart.iso` with your file name:
 
    ```sh
    LEPTON=~/.local/share/Steam/steamapps/common/Lepton/lepton
@@ -243,35 +162,184 @@ from another machine with developer mode on. Nothing needs root and nothing is i
        -d file:///sdcard/Documents/MarioKart.iso --es task ExtractDisc
    ```
 
-   This checks the disc (it must be the clean PAL game; anything else is rejected) and extracts
-   it into the app's data folder, a few minutes. Then:
+   This checks the disc and extracts it into the app's data folder. It takes a few minutes.
+
+4. Build the game:
 
    ```sh
    $LEPTON exec steamlaunch-<appid> am start-foreground-service -n org.wiicompiled.quest/.launcher.GameSetupService \
        --es task BuildGame
    ```
 
-   The headset now translates and compiles the game against the Frame kit. It took about a
-   quarter of an hour on my Frame (upstream quotes half an hour on a Quest 3). Progress goes to
-   `~/.local/share/Steam/steamapps/compatdata/<appid>/external/Android/data/org.wiicompiled.quest/files/WiiCompiledOpenXRVR/Logs/build_*.log`,
-   and the extraction and build both log through `adb`:
+   The headset translates and compiles the game against the Frame kit. This took about 13
+   minutes on my Frame. Progress goes to
+   `~/.local/share/Steam/steamapps/compatdata/<appid>/external/Android/data/org.wiicompiled.quest/files/WiiCompiledOpenXRVR/Logs/build_*.log`.
+   You can also follow it over adb:
 
    ```sh
    /usr/lib/android-sdk/platform-tools/adb connect localhost:5555
    /usr/lib/android-sdk/platform-tools/adb -s localhost:5555 logcat | grep -iE 'GameSetup|DiscExtract|GameBuild|WiiCompiled'
    ```
 
-6. When the build log ends with the game installed, quit the app (Steam button > exit) and launch
-   it again. From now on every launch goes straight into the game. The first time, the game asks
-   you to pick a camera with the pointer; that choice and everything in the VR settings panel are
-   saved to `Config.toml`.
+5. When the build log says the game is installed, quit the app (Steam button, then exit) and
+   launch it again. From now on every launch goes straight into the game. On the first start the
+   game asks you to pick a camera with the pointer. Your choices are saved to `Config.toml`.
 
-If you already had upstream's APK set up on the Frame under the same library entry name, step 2
-repoints that entry. On the next launch Lepton reinstalls the app because the APK changed; the
-extracted disc files and the previously built game both survive, but that game was built against
-upstream's kit and the app will not run it (the launcher calls it stale, and the wrapper sees the
-fingerprint mismatch and leaves the launcher up). Run the `BuildGame` command from step 5; the
-extraction is not needed again.
+## Updating
+
+- **From an older Frame release.** Run the newer `install.sh` with the new APK. It updates the
+  same library entry. Lepton reinstalls the app on the next launch. A new release usually has a
+  new kit fingerprint, so run the `BuildGame` command from the first run again. The disc import,
+  saves and settings are kept. After an update the Frame controller models show from the second
+  launch, because the app unpacks its own files again first.
+- **From upstream's Quest APK on the Frame.** If your library entry has the same name, `install.sh`
+  points it at the Frame APK. The extracted disc stays, but the old game was built against
+  upstream's kit and will not run. Run `BuildGame` again. The disc import is not needed.
+- **Newer upstream versions.** This fork is built on upstream v1.3.1. A newer upstream APK has a
+  different kit, and the patches need porting first. `build.sh` stops if the kits do not match.
+
+## Controls
+
+`install.sh` installs the binding for the library entry. The game switches to this layout by
+itself when SteamVR reports the Frame actions as bound. The layout is the same in every camera.
+
+The Frame's left controller has the D-pad and View button. The right controller has A, B, X, Y
+and the Menu button.
+
+| Frame controller | Racing | Game menus |
+| --- | --- | --- |
+| Left stick | Steer | Move |
+| Right trigger | Accelerate | Confirm |
+| A | Accelerate | Confirm |
+| B | Brake and reverse | Back |
+| Left trigger | Brake and reverse (works with accelerate held) | Back |
+| X | Use item (hold to drag it behind) | |
+| Left bumper | Use item | |
+| Y | Look back | |
+| Right bumper | Hop and drift | |
+| Grips (either) | Hop and drift. In the first-person cockpit: hold the wheel | |
+| D-pad | GameCube D-pad. Up does a trick, or a wheelie on a bike | D-pad |
+| Right stick | Same as the D-pad (push up for a trick) | |
+| Right stick click | Next camera: original, first person, diorama | |
+| Menu | Pause (Start) | Start |
+| View, tap | Back | Back |
+| View, hold 0.5 s | Open the VR settings panel | Open the VR settings panel |
+
+Notes:
+
+- The View tap is sent when you let go, so a hold never also goes back.
+- The right stick click does not change the camera during the race intro. It can be turned off
+  with `first_person_toggle_click = false` under `[vr]` in `Config.toml`.
+- **Cockpit wheel.** In the first-person camera, reach for the wheel and squeeze a grip to hold
+  it, then turn it to steer. Let go to steer with the stick again. With `hand_steering = false`
+  under `[vr]`, the grips drift in every camera and you always steer with the stick.
+- **VR settings panel.** Hold View for half a second to open it. Point with a controller. The hand
+  whose trigger you pulled last does the pointing. A trigger or A selects, either stick scrolls,
+  and a press of View closes the panel. While the panel is open the game gets no input.
+- **Controller models.** The menus show Frame controllers when `install.sh` converted them. The
+  tutorials still name Quest buttons. Use the table above.
+- To change the layout, use SteamVR's binding UI. The binding is a normal SteamVR binding and shows
+  up under Manage Controller Bindings for the entry.
+
+## Settings
+
+The launch wrapper copies these values into `Config.toml` on the first launch only. The VR
+settings panel edits the same file. Upstream's README lists all settings under "VR settings".
+
+| `Config.toml` | Seed value | What it does |
+| --- | --- | --- |
+| `[vr] frame_interpolation_fps` | `1` | Render at the headset's refresh rate (90 Hz), interpolated from the game's 60 fps. |
+| `[vr] hand_steering` | `true` | Grips hold the wheel in the first-person cockpit. |
+| `[vr] menu_shader_quality` | `0` | Plain dark menu background. Higher values cost frame rate on the Frame. |
+| `[vr] render_scale` | `1.0` | Eye render scale. |
+| `[video] resolution_multiplier` | `1.0` | Game resolution. 1.5 dropped frames on the Frame. |
+| `[vr] hand_hud` | `false` | Upstream's hand HUD, off. |
+| `[diagnostics] openxr_logging` | not set (off) | Logs frame timing once a second to `console.log`. Leave it off for play. It caused small hitches. |
+
+`install.sh` also sets these SteamVR values for the entry: `preferredRefreshRate 90`,
+`framesToThrottle 0` and `additionalFramesToPredict 0`. They are in the `steam.app.<appid>`
+section of `~/.config/openvr/config/steamvr.vrsettings`.
+
+Environment variables for the scripts:
+
+| Variable | Script | Effect |
+| --- | --- | --- |
+| `WCF_FRAME_MODELS=0` | `install.sh` | Keep the Quest controller models. |
+| `WCF_FRAME_MODEL_TRIANGLES` | `frame-controller-models.py` | Triangle target per hand (default 4000). |
+| `WCF_SHORTCUT_NAME` | `install.sh` | Library entry name (default `Mario Kart Wii VR`). |
+| `WCF_STAY_IN_LAUNCHER=1` | `wiicompiled-launch.sh` | Leave the invisible launcher up. Put it before the wrapper in the entry's launch options. |
+| `WCF_TOOLS` | `build.sh` | Toolchain folder (default `~/.local/opt/android-build`). |
+| `WCF_SIGNING` | `build.sh` | Signing key folder (default `steam-frame/signing`). |
+| `WCF_LOG_DIR` | `collect-logs.sh` | Where the log archive goes (default your home folder). |
+
+Two Android properties help when testing. Set them over adb before the game starts:
+`setprop debug.wiicompiled.vr_interp 0|1|72|90|120` overrides the interpolation setting for one
+launch, and `setprop debug.wiicompiled.fpslog 1` logs the game's frame rate.
+
+## Known problems
+
+- **The empty item box stays on screen** after the roulette slides up. Change 5 does not fix it.
+- **Grip steering in the cockpit is rough.** Grabbing and steering work, but upstream tuned the
+  grab range and steering response for Quest controllers. They have not been adjusted. Set
+  `hand_steering = false` to steer with the stick.
+- **Small hitches.** Races hold 90 fps on the counter, with brief hitches now and then. The logs
+  do not show a cause yet.
+- **The 2D launcher is invisible** in the headset, so the disc import and build use the terminal
+  commands above. Upstream's "Select disc image" button needs a file picker Lepton does not have.
+- **`v1.3.1-frame.1` does not work.** Its game build fails at the final link on the headset. Use
+  `v1.3.1-frame.2` or newer.
+- **Not tested:** Retro Rewind, online play, the diorama camera for more than a minute, USB wheels,
+  multiplayer, passthrough, hand tracking, Lepton 3.x.
+- **Not for Quest.** Use upstream's APK on a Quest. The interpolation change is what upstream
+  turned off on Quest, and the Frame layout only works with the SteamVR binding.
+
+## Troubleshooting
+
+- **`install.sh` says Steam's debugging port is not reachable.** Steam must be running. The script
+  talks to Steam on `127.0.0.1:8080`, which SteamOS enables by default.
+- **The launch shows only SteamVR's empty space.** No game is built yet, or the built game is for
+  another kit. `/tmp/wiicompiled-launch.log` says which. Run the `BuildGame` command.
+- **The disc is rejected.** The importer accepts only a clean PAL `RMCP01` image.
+- **The game build fails at the last step with `undefined symbol: std::__ndk1::__hash_memory`.**
+  You have the `v1.3.1-frame.1` APK. Install `v1.3.1-frame.2` or newer and build again.
+- **The buttons act like a Quest layout** (A does several things, X and Y do nothing). The SteamVR
+  binding is not applied. Run `install.sh` again, then check Manage Controller Bindings for the
+  entry. The game's `console.log` has the line `Steam Frame button layout active` when the Frame
+  layout is on.
+- **The menus show Quest controllers.** Launch once more after an update. If they still show,
+  run `install.sh` again and look for a warning about the controller models.
+- **The menus or races stutter.** Check `Config.toml` for `menu_shader_quality = 0`,
+  `resolution_multiplier = 1.0` and `openxr_logging` off. Higher resolution settings dropped
+  frames on the Frame.
+- **Settings are not saved after you copied `Config.toml` in by hand.** Run
+  `chmod 664 Config.toml` on it. The app cannot write it otherwise.
+- **Anything else.** Collect the logs (next section) and look at `console.log` and `lepton.log`.
+
+## Logs and reporting a problem
+
+| Log | Where |
+| --- | --- |
+| Launch wrapper | `/tmp/wiicompiled-launch.log` |
+| Lepton | `~/.local/share/Steam/logs/lepton-steamlaunch-<appid>.log` |
+| Game, one folder per run | `.../WiiCompiledOpenXRVR/Logs/<run>/console.log` |
+| Disc import and build | `.../WiiCompiledOpenXRVR/Logs/build_*.log` |
+
+`...` is `~/.local/share/Steam/steamapps/compatdata/<appid>/external/Android/data/org.wiicompiled.quest/files`.
+
+To report a problem:
+
+1. Run `steam-frame/collect-logs.sh` (or `steam-frame/collect-logs.sh <appid>`). It writes
+   `~/wiicompiled-frame-logs-<date>.tar.gz` with the logs above, your `Config.toml` and a short
+   summary (SteamOS, Lepton, APK and kit versions). It masks IP and MAC addresses, UUIDs, host
+   names, Wi-Fi names, serial numbers, Steam IDs, email addresses, tokens and certificate blocks.
+   Lepton's log includes the Frame's kernel log, which lists hardware serial numbers. Read the
+   files before you post them. The masking can miss things.
+2. Open an issue on this repository. Give the release tag, what you did, what happened and what
+   you expected, and attach the archive.
+3. If the problem also happens with upstream's APK on a Quest, report it upstream instead.
+
+Pull requests are welcome. Say what you tested and on which headset. Upstream's
+[CONTRIBUTING.md](CONTRIBUTING.md) rules apply. Never attach game files or disc images.
 
 ## Building the APK yourself
 
@@ -280,109 +348,80 @@ steam-frame/build.sh                  # downloads upstream's v1.3.1 APK and chec
 steam-frame/build.sh path/to/WiiCompiled-VR-Quest3-v1.3.1.apk
 ```
 
-On the Frame this takes about 20 seconds once the toolchain is there, and produces
-`steam-frame/release/WiiCompiled-VR-SteamFrame-<git tag>.apk`. It needs `curl`, `tar`, `python3`
-and `openssl`, all on SteamOS already, and no root. What it does:
+The output is `steam-frame/release/WiiCompiled-VR-SteamFrame-<git tag>.apk`. On the Frame this
+takes about 20 seconds once the toolchain is downloaded. It needs `curl`, `tar`, `python3` and
+`openssl`, which SteamOS has. It needs no root.
 
-1. Fetches Android NDK r29 into `~/.local/opt/android-build/` (Google ships no arm64 Linux NDK, so
-   on the Frame it uses [HomuHomu833's r29 build](https://github.com/HomuHomu833/android-ndk-custom);
-   on x86_64 it would use Google's r29, untried). It has to be r29, the NDK the kit was built with:
-   the first release APK was compiled with r30, whose libc++ headers emit a helper
-   (`std::__hash_memory`) that r29's library lacks, and the headset's link failed on it. The build
-   now also refuses any object that imports a C++ symbol the kit's original does not.
-2. Compiles the two runtime unity groups that contain the patched files and Aurora's `common.cpp`
-   with the same flags upstream's Android build uses. The third-party headers those three units need
-   are vendored in [`steam-frame/build-deps/`](steam-frame/build-deps/) (see its `NOTICE.md`),
-   because upstream fetches its dependencies with CMake on Windows and this build runs no CMake.
-3. Extracts the matching objects from the upstream APK's kit and checks that each new object exports
-   exactly the same symbols and imports no C++ symbol the original did not. If not, it stops: the
-   sources and the APK are out of step, or the toolchain is wrong.
-4. `make-apk.py` rewrites the APK: the four kit files (`007_unity_runtime_4`, `001_unity_runtime_6`,
-   `020_libaurora_gx.a` with its `common.cpp.o` swapped, and `include/vr/openxr_input.h`), the new
-   kit fingerprint in `kit.json`, the patched `classes.dex`, zipalign-equivalent alignment, and an
-   APK Signature Scheme v2 signature made with `openssl`. No Java, apksigner or zipalign. The signing
-   key is generated in `steam-frame/signing/` on first use; keep it, an APK signed with another key
-   will not install over the previous one. `make-apk.py verify file.apk` checks any APK's signature.
+1. It downloads Android NDK r29 into `~/.local/opt/android-build/`. Google ships no arm64 Linux
+   NDK, so on the Frame it uses [HomuHomu833's r29 build](https://github.com/HomuHomu833/android-ndk-custom).
+   On x86_64 it uses Google's r29, which is untested. The NDK must be r29, the version the kit
+   was built with. Objects built with r30 fail the final link on the headset.
+2. It compiles the two runtime unity groups that hold the patched files, and Aurora's
+   `common.cpp`, with upstream's Android flags. The third-party headers they need are in
+   [`steam-frame/build-deps/`](steam-frame/build-deps/) (see its `NOTICE.md`).
+3. It compares each new object with the original in the upstream kit. The exported symbols must
+   match, and the new object may not import a C++ symbol the original does not. Otherwise it stops.
+4. [`make-apk.py`](steam-frame/make-apk.py) writes the APK: the four kit files, the new kit
+   fingerprint in `kit.json`, the patched `classes.dex`, zip alignment and an APK Signature
+   Scheme v2 signature made with `openssl`. No Java, apksigner or zipalign is needed.
 
-The game itself (`libmain.so`) is never built here. It needs upstream's translator and your disc,
-and the headset does that part. For what it is worth, during development the AI also linked
-`libmain.so` on the Frame directly against the patched objects, using a translation produced by
-upstream's .NET translator on the Frame; that is how the changes were iterated on in minutes. Those
-tools and that translation output are not in this repository (the translator is upstream's, the
-translation is Nintendo's code), so the on-device build is the path for everyone else.
+The signing key is created in `steam-frame/signing/` on first use. Keep it. An APK signed with
+another key will not install over the previous one. `steam-frame/signing/` is ignored by git, so
+the key never ends up in the repository. `make-apk.py verify file.apk` checks an APK's signature.
 
-## Where things are, for digging
+The game itself (`libmain.so`) is never built here. The headset builds it from your disc.
 
-- Steam library entry: a non-Steam shortcut whose executable is the APK and whose compatibility
-  tool is `lepton`; `lepton-show-flatscreen` next to the APK would show the 2D window if SteamVR
-  ever picked it up. Launch options run `~/Games/WiiCompiledVR-SteamFrame/wiicompiled-launch.sh`.
-- The app's data: `~/.local/share/Steam/steamapps/compatdata/<appid>/`. `external/Android/data/org.wiicompiled.quest/files/WiiCompiledOpenXRVR/`
-  has `Config.toml`, `DATA` (the extracted disc), saves and `Logs/` (one folder per run with the
-  game's `console.log`, plus the build logs). `internal/org.wiicompiled.quest/files/game/base/` has
-  the built `libmain.so` and its `game.json`.
-- Lepton's log for the launch: `~/.local/share/Steam/logs/lepton-steamlaunch-<appid>.log`; the
-  wrapper's: `/tmp/wiicompiled-launch.log`.
-- SteamVR's per-app settings are the `steam.app.<appid>` section of
-  `~/.config/openvr/config/steamvr.vrsettings`; `/opt/steamvr/bin/linuxarm64/vrcmd --set-settings-int steam.app.<appid>.preferredRefreshRate 90`
-  is how the installer writes them while SteamVR runs.
-- `[diagnostics] openxr_logging = true` in `Config.toml` makes the game log frame timing to its
-  `console.log` (late frames, stalls); `setprop debug.wiicompiled.fpslog 1` over adb before the game
-  starts logs the frame rate. Both were how the menu and resolution problems above were found.
-- Lepton's Android reaches the host's `~/Documents`, `~/Downloads` and `~/Videos` as
-  `/sdcard/Documents`, `/sdcard/Download` and `/sdcard/Movies`. `lepton exec steamlaunch-<appid> <command>`
-  runs a command inside the running container; `adb connect localhost:5555` reaches it too.
+## Where things are
+
+- **Library entry:** a non-Steam shortcut whose executable is the APK and whose compatibility tool
+  is `lepton`. Its launch options run `~/Games/WiiCompiledVR-SteamFrame/wiicompiled-launch.sh`.
+  The empty file `lepton-show-flatscreen` next to the APK lets Lepton show the 2D window.
+- **App data:** `~/.local/share/Steam/steamapps/compatdata/<appid>/`.
+  `external/Android/data/org.wiicompiled.quest/files/WiiCompiledOpenXRVR/` holds `Config.toml`,
+  `DATA` (the extracted disc), saves and `Logs/`.
+  `internal/org.wiicompiled.quest/files/game/base/` holds the built `libmain.so` and `game.json`.
+- **SteamVR settings:** the `steam.app.<appid>` section of
+  `~/.config/openvr/config/steamvr.vrsettings`. While SteamVR runs, the installer writes them with
+  `/opt/steamvr/bin/linuxarm64/vrcmd --set-settings-int`.
+- **Shared folders:** Lepton's Android sees `~/Documents`, `~/Downloads` and `~/Videos` as
+  `/sdcard/Documents`, `/sdcard/Download` and `/sdcard/Movies`.
+- **Shell access:** `lepton exec steamlaunch-<appid> <command>` runs a command in the running
+  container. `adb connect localhost:5555` reaches it too.
 
 ## How this was made
 
-Over about a week in October 2026, in a series of Claude Code sessions on the Frame. The rough order:
+The work took about a week in October 2026, in Claude Code sessions on the Frame. I tested each
+build in the headset and described what I saw. The AI read the logs and the code and made the
+changes.
 
-- The first attempt, a few days earlier, got upstream's v1.3 Quest APK installed through Lepton,
-  found the clipboard crash in a logcat dump and patched it, drove the invisible launcher over adb
-  to import the disc, and got the game running. It was, in my words at the time, "a flickering
-  mess with shaky head tracking, vomit inducing". The AI tried a long list of SteamVR settings
-  (refresh rates, motion smoothing on and off, resolution overrides); one of those left the image
-  warped in a corner, and the actual cause of a lot of it turned out to be that the in-game panel
-  had quietly written foveation, adaptive resolution and passthrough into `Config.toml`.
-- I then asked whether the PC version through Proton would be better. The AI cross-compiled
-  upstream's Windows build on the Frame and ran it under Proton for ARM64 in VR: it worked and
-  flickered because x86 emulation could not keep up (27 ms frames). It then wrote a native Linux
-  ARM64 OpenXR port, which also worked and which I did not want either. Both were deleted at my
-  request once the Android build was good; this fork is the Android path only.
-- The real fix was reading upstream's runtime and finding that frame interpolation was compiled
-  out on Android. The AI rebuilt the two runtime objects with that enabled, found that SteamVR under
-  Lepton has no clock conversion extension and wrote the fallback, re-signed the APK, and the result
-  was "very good". Then the controls, in code rather than only in the binding file because the
-  game reads X and Y as the left hand's buttons. Then the menus, after the frame-timing diagnostics
-  showed exactly which draw was slow. Then the item box, which did not work.
-- Publishing went wrong once too. The first release APK carried objects compiled with NDK r30,
-  whose C++ headers call a helper that the kit's NDK r29 runtime does not have, so the headset's
-  build got all the way to the last step and failed to link. The fix was to build with r29, plus a
-  check in `build.sh` that refuses any object importing a C++ symbol the kit's original does not.
-  The second release then built and ran on the headset from a clean start.
-- The last change before publishing was a mistake: raising the resolution for sharper menus,
-  which I reported as a performance regression the next day and which was rolled back. The
-  numbers in the "Resolution" note above are from that log.
-- After publishing: the grips change (change 8), and the Frame controller models (change 9), which
-  were reverted once because the full models made the menus lag, and came back after the AI wrote
-  a mesh simplifier for them. I checked both in the headset; the frame-timing log of that run
-  shows 90 Hz throughout the menus.
-- This README was written by the AI from the session logs and its memory notes, at my request and
-  in my voice, and I read it before publishing. If something in it is wrong, it is because I
-  missed it; open an issue with the Lepton log and the game's `console.log` attached.
-
-I will look at issues and pull requests, but I am one person with one headset and no ability to
-fix emulation-level problems; the useful contribution here, as the Baiji README puts it better
-than I can, is **testing**. If you make a change, say what you tested it on and how.
+- The first attempt used upstream's v1.3 Quest APK. The clipboard crash showed in logcat and was
+  patched. The game ran, but it flickered and the head tracking was shaky.
+- Upstream's Windows build under Proton and a native Linux ARM64 build were also tried. The Proton
+  build was too slow under x86 emulation. Both were dropped. This fork is the Android path only.
+- Turning interpolation back on, with the clock fallback, fixed most of the flicker and judder.
+  The controller layout, the menu change and the item box attempt followed.
+- The first release was built with NDK r30 and failed to link on the headset. `build.sh` now uses
+  r29 and checks the C++ imports of each object.
+- A higher resolution for sharper menus caused dropped frames and was rolled back.
+- After the first releases came the grips change and the Frame controller models. The full
+  models slowed the menus to 45 to 60 fps. With the mesh simplifier the menus hold 90 Hz.
 
 ## Licence and credits
 
-GPL-3.0, as upstream (`LICENSE`). The fork's own additions are under the same licence. Third-party
-headers vendored for the build are listed with their licences in
-[`steam-frame/build-deps/NOTICE.md`](steam-frame/build-deps/NOTICE.md).
+GPL-3.0, as upstream ([LICENSE](LICENSE)). The fork's additions use the same licence.
+Third-party headers used for the build are listed with their licences in
+[`steam-frame/build-deps/NOTICE.md`](steam-frame/build-deps/NOTICE.md). The rest of the
+third-party code is listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
-The port is [heurazy's Wiicompiled VR PLUS](https://github.com/heurazy/Wiicompiled_VR-PLUS), itself
-built on [iChris4's Wiicompiled VR](https://github.com/iChris4/Wiicompiled_VR) and the WiiCompiled
-static recompilation project, on [Aurora](https://github.com/encounter/aurora), Dawn, SDL3 and
-OpenXR; the credits in [README.upstream.md](README.upstream.md) are theirs and they did the hard
-part. Lepton is Valve's. Mario Kart Wii is Nintendo's; nothing of theirs is in this repository or
-in the APK, and you need your own disc.
+- The VR port is [heurazy's Wiicompiled VR PLUS](https://github.com/heurazy/Wiicompiled_VR-PLUS),
+  built on [iChris4's Wiicompiled VR](https://github.com/iChris4/Wiicompiled_VR) and the
+  WiiCompiled static recompilation project. It uses
+  [Aurora](https://github.com/encounter/aurora), Dawn, SDL3 and OpenXR. The full credits are in
+  [README.upstream.md](README.upstream.md).
+- The Android NDK build for arm64 Linux is
+  [HomuHomu833's](https://github.com/HomuHomu833/android-ndk-custom).
+- Lepton, SteamVR and the Frame controller models are Valve's. The models are read from your own
+  SteamVR install and are not redistributed.
+- Mario Kart Wii is Nintendo's. Nothing of Nintendo's is in this repository or in the APK. You
+  need your own disc.
+- Steam Frame port by simplysanatori, written with Claude Code as described above.
