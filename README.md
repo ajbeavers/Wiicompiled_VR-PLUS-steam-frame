@@ -425,3 +425,7 @@ third-party code is listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 - Mario Kart Wii is Nintendo's. Nothing of Nintendo's is in this repository or in the APK. You
   need your own disc.
 - Steam Frame port by simplysanatori, written with Claude Code as described above.
+
+## Support
+
+If you would like more Steam Frame ports, you can [buy me a coffee](https://ko-fi.com/sana748653). It pays for the Claude API credits these ports are built with, spent as carefully as I can. The credit for the games themselves belongs to the upstream projects named above.
