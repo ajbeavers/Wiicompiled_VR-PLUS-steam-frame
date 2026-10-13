@@ -4,6 +4,7 @@
 #include "gfx/common.hpp"
 #include "gfx/efb_ram_copy.hpp"
 #include "gfx/foveation.hpp"
+#include "gfx/hitch_stats.hpp"
 #include "gfx/stereo_replay.hpp"
 #include "gx/fifo.hpp"
 #include "gx/shader_info.hpp"
@@ -2744,10 +2745,59 @@ bool begin_frame() noexcept {
   return prepared;
 }
 
+// One "hitch:" line per game frame slower than kHitchFrameNs (end_frame to end_frame), with what the
+// process did meanwhile (gfx/hitch_stats.hpp; frame/perf/hitches.py reads it). mono is CLOCK_MONOTONIC
+// seconds (steady_clock on Linux), so external samplers can be lined up with it.
+struct HitchTracker {
+  static constexpr uint64_t kHitchFrameNs = 20'000'000;
+  uint64_t lastEndNs = 0;
+  uint64_t workerWaitNs = 0;
+  uint64_t pipelineWait = 0, pipelineSync = 0, pipelineSyncCount = 0, texConvert = 0, texConvertBytes = 0,
+           texUploadBytes = 0;
+  uint32_t createdPipelines = 0;
+  uint32_t lines = 0;
+  uint64_t lineWindowStart = 0;
+
+  void on_end_frame(uint64_t now) noexcept {
+    using namespace gfx::hitch;
+    const uint64_t pw = g_pipelineWaitNs.load(std::memory_order_relaxed);
+    const uint64_t ps = g_pipelineSyncNs.load(std::memory_order_relaxed);
+    const uint64_t pc = g_pipelineSyncCount.load(std::memory_order_relaxed);
+    const uint64_t tc = g_texConvertNs.load(std::memory_order_relaxed);
+    const uint64_t tb = g_texConvertBytes.load(std::memory_order_relaxed);
+    const uint64_t tu = g_texUploadBytes.load(std::memory_order_relaxed);
+    const uint32_t cp = gfx::g_stats.createdPipelines;
+    if (lastEndNs != 0 && now - lastEndNs > kHitchFrameNs) {
+      if (now - lineWindowStart > 1'000'000'000) {
+        lineWindowStart = now;
+        lines = 0;
+      }
+      if (++lines <= 30) {
+        Log.info("hitch: mono={:.3f} frame_ms={:.1f} worker_wait_ms={:.1f} pipelines_new={} pipeline_wait_ms={:.1f} "
+                 "pipeline_inline={} pipeline_inline_ms={:.1f} tex_convert_ms={:.1f} tex_convert_kb={} tex_upload_kb={}",
+                 now / 1e9, (now - lastEndNs) / 1e6, workerWaitNs / 1e6, cp - createdPipelines, (pw - pipelineWait) / 1e6,
+                 pc - pipelineSyncCount, (ps - pipelineSync) / 1e6, (tc - texConvert) / 1e6, (tb - texConvertBytes) / 1024,
+                 (tu - texUploadBytes) / 1024);
+      }
+    }
+    lastEndNs = now;
+    workerWaitNs = 0;
+    pipelineWait = pw;
+    pipelineSync = ps;
+    pipelineSyncCount = pc;
+    texConvert = tc;
+    texConvertBytes = tb;
+    texUploadBytes = tu;
+    createdPipelines = cp;
+  }
+};
+HitchTracker g_hitchTracker; // game thread only
+
 void end_frame(uint64_t contentTag, imgui::HostFramePtr hostImGuiFrame) noexcept {
 #ifdef AURORA_ENABLE_GX
   webgpu::fail_if_device_lost();
 #endif
+  g_hitchTracker.on_end_frame(gfx::hitch::now_ns());
   // Claim the anchor published for this frame. Clearing it here is what makes a
   // producer that stops publishing fall back to the recorded camera.
   StereoSceneAnchor sceneAnchor = g_pendingSceneAnchor;
@@ -2762,7 +2812,9 @@ void end_frame(uint64_t contentTag, imgui::HostFramePtr hostImGuiFrame) noexcept
   ensure_frame_worker_started();
   // DONE: this seals another frame, which means reusing the worker's encoder
   // state and its SealedFrame. The previous cycle must be completely finished.
+  const uint64_t workerWaitStart = gfx::hitch::now_ns();
   wait_for_frame_worker_private(FrameWorkerPhase::Done);
+  g_hitchTracker.workerWaitNs += gfx::hitch::now_ns() - workerWaitStart;
 
   // Seal all current GX work on the CPU while the renderer is known ready.
   // Later FIFO writes belong exclusively to the next frame.

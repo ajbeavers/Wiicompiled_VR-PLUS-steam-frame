@@ -1029,11 +1029,14 @@ private:
             const bool render_first = !aurora_get_stereo_frame_interpolation();
             if (last_pacing_mode != static_cast<int>(render_first)) {
                 last_pacing_mode = static_cast<int>(render_first);
-                RT_LOG(RT_TAG_RUNTIME) << "OpenXR " << kGraphicsBackendName << " pacing: "
-                    << (render_first ? std::string("render-first")
-                                     : std::string("per-refresh eye sets (VR interpolation), ") +
-                                           PacingModeName(pacing_mode_) + " (frame_pacing " + pacing_mode_source_ + ")")
-                    << std::endl;
+                // One write: std::cerr is unbuffered, and another thread's log output landed inside
+                // this line when it was written piece by piece ("pacing: 0per-refresh").
+                const std::string banner = std::string("OpenXR ") + kGraphicsBackendName + " pacing: " +
+                    (render_first ? std::string("render-first")
+                                  : std::string("per-refresh eye sets (VR interpolation), ") +
+                                        PacingModeName(pacing_mode_) + " (frame_pacing " + pacing_mode_source_ + ")") +
+                    "\n";
+                RT_LOG(RT_TAG_RUNTIME) << banner << std::flush;
                 pacing::SetMode(PacingModeName(pacing_mode_));
             }
             // A set still in flight is shown (or dropped) by the set loop before switching.

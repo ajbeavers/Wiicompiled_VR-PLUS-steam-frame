@@ -9,6 +9,7 @@
 #include "../webgpu/gpu.hpp"
 #include "../gx/pipeline.hpp"
 #include "pipeline_cache.hpp"
+#include "hitch_stats.hpp"
 #include "stereo_replay.hpp"
 #include "anchored_interpolation.hpp"
 #include "cockpit.hpp"
@@ -1339,12 +1340,22 @@ static StereoDisplaySource stereo_display_source(const std::vector<RenderPass>& 
   return out;
 }
 
+// Logs each distinct region once (the last few remembered): the race alternates between two regions
+// (the display copy and the full-EFB fallback) frame by frame, which logged 30 lines a second.
 static void log_stereo_display_source_region(ClipRect region, bool foundDisplayCopy) noexcept {
-  static ClipRect lastLogged{};
-  static bool logged = false;
-  if (region.width > 0 && region.height > 0 && (!logged || region != lastLogged)) {
-    logged = true;
-    lastLogged = region;
+  static std::array<std::pair<ClipRect, bool>, 8> seen{};
+  static size_t seenCount = 0;
+  if (region.width <= 0 || region.height <= 0) {
+    return;
+  }
+  const size_t known = std::min(seenCount, seen.size());
+  for (size_t i = 0; i < known; ++i) {
+    if (seen[i].first == region && seen[i].second == foundDisplayCopy) {
+      return;
+    }
+  }
+  seen[seenCount++ % seen.size()] = {region, foundDisplayCopy};
+  {
     Log.info("Immersive display-copy source region: {}x{} at ({}, {}){}", region.width, region.height, region.x,
              region.y, foundDisplayCopy ? "" : " (full-EFB fallback)");
   }
@@ -1738,6 +1749,7 @@ static bool end_batch_impl(const wgpu::CommandEncoder& cmd, bool advanceFrame,
   g_stats.lastStorageSize = writeBuffer(g_storage, g_storageBuffer, StorageBufferSize, "Storage");
   if constexpr (UseTextureBuffer) {
     g_stats.lastTextureUploadSize = g_textureUpload.size();
+    hitch::g_texUploadBytes.fetch_add(g_textureUpload.size(), std::memory_order_relaxed);
     {
       // Perform texture copies
       for (const auto& item : g_textureUploads) {

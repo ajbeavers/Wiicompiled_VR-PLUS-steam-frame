@@ -1,4 +1,5 @@
 #include "texture_convert.hpp"
+#include "hitch_stats.hpp"
 
 #include "../internal.hpp"
 #include "../gx/gx_fmt.hpp"
@@ -554,7 +555,25 @@ static ByteBuffer BuildRGBA8FromCMPR(uint32_t width, uint32_t height, uint32_t m
   return buf;
 }
 
+// convert_texture_palette calls convert_texture: only the outermost call is counted.
+static thread_local int t_convertDepth = 0;
+struct ConvertTimer {
+  uint64_t start = 0;
+  explicit ConvertTimer(size_t bytes) noexcept {
+    if (t_convertDepth++ == 0) {
+      hitch::g_texConvertBytes.fetch_add(bytes, std::memory_order_relaxed);
+      start = hitch::now_ns();
+    }
+  }
+  ~ConvertTimer() {
+    if (--t_convertDepth == 0) {
+      hitch::g_texConvertNs.fetch_add(hitch::now_ns() - start, std::memory_order_relaxed);
+    }
+  }
+};
+
 ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
+  const ConvertTimer hitchTimer(data.size());
   const uint32_t maxMips = max_texture_mip_count(width, height);
   const uint32_t safeMips = std::clamp(mips, 1u, maxMips);
   if (safeMips != mips) {
@@ -679,6 +698,7 @@ GXTexFmt tlut_texture_format(GXTlutFmt format) noexcept {
 ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint32_t height, uint32_t mips,
                                          ArrayRef<uint8_t> textureData, GXTlutFmt tlutFormat, uint16_t tlutEntries,
                                          ArrayRef<uint8_t> tlutData) {
+  const ConvertTimer hitchTimer(textureData.size());
   const auto indices = convert_texture(textureFormat, width, height, mips, textureData);
   if (indices.data.empty()) {
     return {};
