@@ -1085,7 +1085,11 @@ private:
     // never released early: the cycle repeats the retained layer with its own poses (late), and
     // the set is shown by a later cycle. Only real misses (more than 12 of the last 240 sets
     // late) drop the loop to a set every second refresh; it returns after 10 s once 6 or fewer
-    // of the last 600 were late. Both changes are logged.
+    // of the last 600 were late and either the GPU time per set (p90) is under 60 % of a refresh
+    // or the retry wait has passed: lateness at half rate says nothing about full rate, and a
+    // load that cannot hold it (2160 per eye at 120 Hz) otherwise cycled 10 s half rate, 3 s at
+    // 40 % late. The wait doubles (10 to 160 s) after a return that dropped again within 10 s.
+    // Both changes are logged.
     enum class CycleResult { Continue, Break, Fatal };
     enum class PacingMode { Inline, Pipelined };
     enum class HalfRatePolicy { Auto, Never, Always };
@@ -1099,6 +1103,9 @@ private:
         bool odd_tick = false;
         std::chrono::steady_clock::time_point half_since{};
         std::deque<uint8_t> results;  // 1: the set was late (not finished by its deadline)
+        std::deque<float> half_gpu_ms;  // GPU ms of the sets shown at half rate (last 240)
+        std::chrono::seconds retry_wait{10};
+        std::chrono::steady_clock::time_point full_since{};
         XrTime last_display_time = 0;
         std::chrono::steady_clock::time_point first_set{};
     };
@@ -1182,7 +1189,7 @@ private:
         while (st.results.size() > 600) st.results.pop_front();
     }
 
-    void UpdateHalfRate() {
+    void UpdateHalfRate(XrDuration period) {
         auto& st = set_pacing_;
         const auto late_in_last = [&](size_t count) {
             const size_t n = std::min(count, st.results.size());
@@ -1202,19 +1209,34 @@ private:
             const size_t late = late_in_last(240);
             if (window >= 240 && late > 12) {
                 st.half_rate = true;
+                // A return that did not hold: wait longer before the next try.
+                const bool redrop = st.full_since != std::chrono::steady_clock::time_point{} &&
+                                    now - st.full_since < std::chrono::seconds(10);
+                st.retry_wait = redrop ? std::min(st.retry_wait * 2, std::chrono::seconds(160)) : std::chrono::seconds(10);
                 st.half_since = now;
                 st.results.clear();
+                st.half_gpu_ms.clear();
                 RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last " << window
-                                       << " eye sets late; rendering every second refresh" << std::endl;
+                                       << " eye sets late; rendering every second refresh (next try at full rate after "
+                                       << st.retry_wait.count() << " s, sooner if the GPU time per set allows)" << std::endl;
                 pacing::SetMode(std::string(PacingModeName(pacing_mode_)) + "/2");
             }
         } else if (now - st.half_since >= std::chrono::seconds(10) && st.results.size() >= 600) {
             const size_t late = late_in_last(600);
-            if (late <= 6) {
+            double gpu_p90 = -1.0;
+            if (st.half_gpu_ms.size() >= 120) {
+                std::vector<float> v(st.half_gpu_ms.begin(), st.half_gpu_ms.end());
+                const size_t k = v.size() * 9 / 10;
+                std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+                gpu_p90 = v[k];
+            }
+            const bool gpu_fits = gpu_p90 >= 0.0 && gpu_p90 <= 0.6 * static_cast<double>(period) / 1e6;
+            if (late <= 6 && (gpu_fits || now - st.half_since >= st.retry_wait)) {
                 st.half_rate = false;
+                st.full_since = now;
                 st.results.clear();
-                RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last 600 eye sets late; rendering every refresh again"
-                                       << std::endl;
+                RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last 600 eye sets late, GPU p90 " << gpu_p90
+                                       << " ms per set; rendering every refresh again" << std::endl;
                 pacing::SetMode(PacingModeName(pacing_mode_));
             }
         }
@@ -1332,6 +1354,14 @@ private:
                 WithdrawPublishedFrame();
                 // On time: by its refresh (half rate: by the one after).
                 if (st.timeouts < (st.half_rate ? 2u : 1u)) NoteSetResult(false);
+                if (st.half_rate) {
+                    int64_t consumed = 0, submitted = 0, complete = 0;
+                    pacing::LastSetTimes(consumed, submitted, complete);
+                    if (complete > submitted && submitted != 0) {
+                        st.half_gpu_ms.push_back(static_cast<float>(static_cast<double>(complete - submitted) / 1e6));
+                        while (st.half_gpu_ms.size() > 240) st.half_gpu_ms.pop_front();
+                    }
+                }
                 pacing::OnRendered();
                 diagnostics::OnSubmission(true);
                 ++timing_submissions_;
@@ -1390,7 +1420,7 @@ private:
             const CycleResult started = StartSet(presentation, policy, immersive, set_time, cycle);
             if (started != CycleResult::Continue) return started;
         }
-        UpdateHalfRate();
+        UpdateHalfRate(period);
         pacing::Flush();
         return CycleResult::Continue;
     }
