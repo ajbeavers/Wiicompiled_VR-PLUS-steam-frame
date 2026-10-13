@@ -1421,7 +1421,8 @@ static void write_screen_clip(std::span<uint8_t> uniform, uint32_t clipOffset, c
     return env == nullptr || env[0] != '0';
   }();
   clip = clip && clipEnabled;
-  std::array<float, 16> block{1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, -1e30f, -1e30f, 1e30f, 1e30f};
+  std::array<float, 16> block{1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, gx::ScreenClipMarker,
+                              -1e30f, -1e30f, 1e30f, 1e30f};
   const auto mask = clip ? stereo_replay::window_mask(eye.projection, view, screen) : stereo_replay::WindowMask{};
   const float width = static_cast<float>(eye.target.size.width);
   const float height = static_cast<float>(eye.target.size.height);
@@ -1432,7 +1433,6 @@ static void write_screen_clip(std::span<uint8_t> uniform, uint32_t clipOffset, c
       block[at + 0] = 2.f * r.x / width;
       block[at + 1] = -2.f * r.y / height;
       block[at + 2] = r.z - r.x + r.y;
-      block[at + 3] = 0.f;
     };
     row(mask.u, 0);
     row(mask.v, 4);

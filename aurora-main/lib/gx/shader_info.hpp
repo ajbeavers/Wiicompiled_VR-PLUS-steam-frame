@@ -21,8 +21,8 @@ struct UniformReplayLayout {
   float worldHudDepth = 0.0f;
   float worldHudAnchorX = 0.0f;
   float worldHudAnchorY = 0.0f;
-  // ShaderInfo::uniformSize (the mapped range is padded to the offset alignment): where a virtual-screen
-  // variant's clip block starts (gx::screen_clip_offset).
+  // ShaderInfo::structSize (the WGSL struct's end, before the range is padded to the offset alignment):
+  // where a virtual-screen variant's clip block starts (gx::screen_clip_offset).
   uint32_t uniformSize = 0;
 };
 

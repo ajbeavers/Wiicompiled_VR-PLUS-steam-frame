@@ -503,6 +503,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   }
   info.uniformSize += info.sampledTexCoords.count() * sizeof(Vec4<float>);
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
+  info.structSize = info.uniformSize;
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -769,7 +770,7 @@ UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGrou
       .perspective = perspective,
       .indexedMatrices = info.indexAttr.test(GX_VA_PNMTXIDX),
       .nativeEfbEffect = !perspective && samplesRecentEfbCopy && (samplesReducedEfbCopy || blends),
-      .uniformSize = info.uniformSize,
+      .uniformSize = info.structSize,
   };
 
   if (!perspective || !frame_interpolation_active()) {

@@ -1694,7 +1694,7 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "    return out;";
   }
 
-  if (config.exactScreenDepth && screen_clip_offset(info.uniformSize) != 0) {
+  if (config.exactScreenDepth && screen_clip_offset(info.structSize) != 0) {
     // A reprojected 2D draw uses the whole eye viewport and scissor, so the frame edge and the game's
     // scissor no longer clip it (Mario Kart's item box sliding up out of the frame stayed visible
     // above the screen). The clip block (gx.hpp, written per eye by gfx/common.cpp) maps the pixel
@@ -1710,8 +1710,8 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "\n    let screen_clip_h = vec3f(dot(ubuf.screen_clip_u.xyz, screen_clip_p), "
         "dot(ubuf.screen_clip_v.xyz, screen_clip_p), dot(ubuf.screen_clip_w.xyz, screen_clip_p));"
         "\n    let screen_clip_uv = screen_clip_h.xy / max(screen_clip_h.z, 1e-20);"
-        "\n    if (screen_clip_h.z <= 0.0 || any(screen_clip_uv < ubuf.screen_clip_rect.xy) || "
-        "any(screen_clip_uv > ubuf.screen_clip_rect.zw)) { discard; }";
+        "\n    if (ubuf.screen_clip_w.w == 31337.0 && (screen_clip_h.z <= 0.0 || "
+        "any(screen_clip_uv < ubuf.screen_clip_rect.xy) || any(screen_clip_uv > ubuf.screen_clip_rect.zw))) { discard; }";
   }
 
   const auto shaderSource = fmt::format(R"""(

@@ -73,7 +73,13 @@ constexpr u32 MaxUniformSize = 3840;
 // Virtual-screen (exactScreenDepth) variants read a clip block after the draw's own uniform: three rows
 // mapping an eye pixel to homogeneous frame NDC on the 2D layer's screen, and the rectangle (the draw's
 // recorded scissor within the frame) its fragments must fall in. 0: the uniform has no room.
+// Takes ShaderInfo::structSize, the WGSL struct's end, NOT uniformSize: that one is padded to the
+// 64-byte offset alignment, and a block written there was read by the shader 16 to 48 bytes too
+// early (padding), which discarded nearly every HUD draw on the Frame (second headset session).
+// ScreenClipMarker in the w row's unused fourth component tells the shader the block is real; without
+// it the shader does not clip (a layout slip then shows the HUD unclipped instead of hiding it).
 constexpr u32 ScreenClipBytes = 64;
+constexpr float ScreenClipMarker = 31337.0f;
 constexpr u32 screen_clip_offset(u32 uniformSize) noexcept {
   const u32 offset = (uniformSize + 15u) & ~15u;
   return offset + ScreenClipBytes <= MaxUniformSize ? offset : 0u;
@@ -765,6 +771,9 @@ struct ShaderInfo {
   std::bitset<MaxIndTexMtxs> usedIndTexMtxs;
   UniformMatrixLayout matrixLayout;
   u32 uniformSize = 0;
+  // The WGSL Uniform struct's own size, before uniformSize is padded to the dynamic-offset
+  // alignment: where a virtual-screen variant's clip block fields start (screen_clip_offset).
+  u32 structSize = 0;
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
   u8 lineMode : 2 = 0;
