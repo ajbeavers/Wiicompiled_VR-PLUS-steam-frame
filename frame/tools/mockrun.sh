@@ -1,0 +1,106 @@
+#!/bin/bash
+# Runs the game against the mock OpenXR runtime (xrmock), headless: no window, no sound.
+#
+#   frame/tools/mockrun.sh [--flat] [--seconds N] [--game DIR] [--exe PATH]
+#
+# Needs Xvfb (a virtual X server; nothing is shown anywhere). --flat runs without the mock: VR off, desktop renderer (title screen check).
+# Environment: MOCK_XR_* settings of xrmock (MOCK_XR_SECONDS, MOCK_XR_HZ, MOCK_XR_TRACE, ...),
+# KF_BUILD (build dir, default <repo>/build-linux), KF_MOCKRUN_HOME (scratch user dir, default
+# ~/.cache/kf-mockrun). The game reads its user state from $XDG_DATA_HOME/WiiCompiled (Config.toml,
+# NAND, Cache), which this script points at the scratch dir and seeds with a Config.toml naming the
+# extracted game (~/Games/KartFrame/data/game or --game).
+#
+# Safety: XR_RUNTIME_JSON must name an existing, non-empty mock runtime, else the script aborts. An
+# empty XR_RUNTIME_JSON once fell through to the real SteamVR in the headset.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$HERE/../.." && pwd)
+FLAT=0; SECONDS_RUN=60; GAME=$HOME/Games/KartFrame/data/game
+EXE=${KF_BUILD:-$REPO/build-linux}/kartframe
+while [ $# -gt 0 ]; do
+  case $1 in
+    --flat) FLAT=1 ;;
+    --seconds) SECONDS_RUN=$2; shift ;;
+    --game) GAME=$2; shift ;;
+    --exe) EXE=$2; shift ;;
+    *) echo "unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+die() { echo "mockrun: $*" >&2; exit 1; }
+[ -x "$EXE" ] || die "no game binary at $EXE"
+[ -f "$GAME/.complete" ] || die "no extracted game ($GAME/.complete is missing)"
+DATA=$GAME; [ -f "$GAME/sys/fst.bin" ] || DATA=$GAME/DATA
+[ -f "$DATA/sys/fst.bin" ] && [ -d "$DATA/files" ] || die "$GAME is not an extracted DATA directory (sys/fst.bin, files/)"
+
+# Never next to a running game or the owner's session.
+if pgrep -af 'SteamLaunch|kartframe|lepton|waydroid' | grep -v "pgrep\|mockrun" >/dev/null; then
+  pgrep -af 'SteamLaunch|kartframe|lepton|waydroid' | grep -v "pgrep\|mockrun" >&2
+  die "a game is running; wait for it"
+fi
+
+OUT=${KF_MOCKRUN_HOME:-$HOME/.cache/kf-mockrun}
+mkdir -p "$OUT/data/WiiCompiled" "$OUT/logs"
+cat > "$OUT/data/WiiCompiled/Config.toml" <<TOML
+[paths]
+dvd_root = "$DATA"
+
+[video]
+widescreen = true
+display_mode = "windowed"
+
+[vr]
+mirror_view = "none"
+enabled = $([ $FLAT = 1 ] && echo false || echo true)
+required = $([ $FLAT = 1 ] && echo false || echo true)
+TOML
+LOG=$OUT/logs/$(date +%Y%m%d-%H%M%S)-$([ $FLAT = 1 ] && echo flat || echo mock).log
+
+# Headless: nothing on the owner's displays, nothing audible. The game gets a private virtual X server
+# (Xvfb on a display it picks itself) for its window; Dawn needs a window surface to choose the
+# adapter, and KARTFRAME_HEADLESS=1 (aurora) never configures or presents that swapchain.
+unset WAYLAND_DISPLAY
+XVFB_DISPLAY_FILE=$OUT/xvfb.display; : > "$XVFB_DISPLAY_FILE"
+Xvfb -displayfd 3 -screen 0 1280x720x24 -nolisten tcp 3>"$XVFB_DISPLAY_FILE" >"$OUT/logs/xvfb.log" 2>&1 &
+XVFB_PID=$!
+trap 'kill $XVFB_PID 2>/dev/null' EXIT
+for _ in $(seq 50); do [ -s "$XVFB_DISPLAY_FILE" ] && break; sleep 0.2; done
+[ -s "$XVFB_DISPLAY_FILE" ] || die "Xvfb did not start (see $OUT/logs/xvfb.log)"
+export DISPLAY=:$(head -1 "$XVFB_DISPLAY_FILE")
+export SDL_VIDEO_DRIVER=x11 SDL_AUDIO_DRIVER=dummy KARTFRAME_HEADLESS=1
+export XDG_DATA_HOME=$OUT/data
+
+if [ $FLAT = 0 ]; then
+  MOCK_DIR=${KF_XRMOCK_DIR:-$HOME/.cache/kf-xrmock}
+  [ -s "$MOCK_DIR/libxrmock.so" ] || bash "$HERE/xrmock/build.sh" "$MOCK_DIR" >/dev/null
+  export XR_RUNTIME_JSON=$MOCK_DIR/runtime.json
+  [ -n "${XR_RUNTIME_JSON}" ] && [ -s "$XR_RUNTIME_JSON" ] || die "XR_RUNTIME_JSON is empty or missing: $XR_RUNTIME_JSON"
+  LIBPATH=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["library_path"])' "$XR_RUNTIME_JSON")
+  [ -s "$LIBPATH" ] || die "mock runtime library missing or empty: $LIBPATH"
+  export MOCK_XR_SECONDS=${MOCK_XR_SECONDS:-$SECONDS_RUN}
+  export MOCK_XR_TRACE=${MOCK_XR_TRACE:-$OUT/logs/$(basename "$LOG" .log).trace}
+else
+  unset XR_RUNTIME_JSON
+fi
+echo "mockrun: $EXE ($([ $FLAT = 1 ] && echo flat || echo "mock runtime $XR_RUNTIME_JSON")), ${SECONDS_RUN}s, log $LOG"
+set +e
+# The game has no run time of its own: the mock ends the XR session after MOCK_XR_SECONDS and the
+# game would carry on in desktop mode, so it is stopped (SIGTERM, then SIGKILL) shortly after.
+STOP=$SECONDS_RUN; [ $FLAT = 0 ] && STOP=$((SECONDS_RUN + 8))
+"$EXE" > "$LOG" 2>&1 &
+PID=$!
+( sleep "$STOP"; kill -TERM $PID 2>/dev/null; sleep 15; kill -KILL $PID 2>/dev/null ) &
+WATCH=$!
+wait $PID; RC=$?
+kill $WATCH 2>/dev/null
+echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
+grep -a 'xrmock: summary' "$LOG" || true
+echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
+FATAL=$(grep -a -c 'fatal dialog\|Signal 11' "$LOG")
+echo "mockrun: fatal lines: $FATAL"
+[ "$FATAL" = 0 ] || exit 1
+if [ $FLAT = 0 ]; then
+  grep -aq 'session state -> FOCUSED' "$LOG" || { echo "mockrun: FAIL, the session never reached FOCUSED" >&2; exit 1; }
+  grep -aq 'xrmock: summary: 0 errors' "$LOG" || { echo "mockrun: FAIL, mock errors (see the trace)" >&2; exit 1; }
+fi
+echo "mockrun: ok"

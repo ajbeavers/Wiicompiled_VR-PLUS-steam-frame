@@ -2,7 +2,7 @@
 
 #pragma once
 
-#if defined(MKW_ENABLE_OPENXR) && defined(_WIN32)
+#if defined(MKW_ENABLE_OPENXR) && (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
 
 #include "vr/openxr_backend.h"
 #include "vr/openxr_runtime.h"

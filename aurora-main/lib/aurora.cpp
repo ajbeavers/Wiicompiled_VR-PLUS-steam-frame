@@ -1286,6 +1286,10 @@ std::optional<AcquiredSurfaceTexture> acquire_surface_texture() noexcept {
     return std::nullopt;
   }
 
+  if (webgpu::headless()) {
+    auto texture = webgpu::headless_surface_texture();
+    return AcquiredSurfaceTexture{.texture = texture, .view = texture.CreateView()};
+  }
   wgpu::SurfaceTexture surfaceTexture;
   g_surface.GetCurrentTexture(&surfaceTexture);
   switch (surfaceTexture.status) {
@@ -1491,7 +1495,15 @@ bool present_presentation_job(const PresentationJob& job) {
           wgpu::Status presentStatus;
           {
             std::lock_guard submitLock(g_queueSubmitMutex);
-            presentStatus = g_surface.Present();
+            if (webgpu::headless()) {
+              static uint64_t headlessPresents = 0;
+              if (++headlessPresents % 300 == 0) {
+                Log.info("headless: {} frames presented to the offscreen target", headlessPresents);
+              }
+              presentStatus = wgpu::Status::Success;
+            } else {
+              presentStatus = g_surface.Present();
+            }
           }
           presentDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() - presentStarted);
           if (presentStatus == wgpu::Status::Success) {

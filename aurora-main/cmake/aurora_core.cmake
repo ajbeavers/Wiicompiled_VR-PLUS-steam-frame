@@ -39,6 +39,10 @@ if (AURORA_ENABLE_GX)
     # of producing unresolved interop references.
     if (CMAKE_SYSTEM_NAME STREQUAL Windows)
         target_sources(aurora_core PRIVATE lib/webgpu/d3d12_interop.cpp lib/webgpu/vulkan_win32_interop.cpp)
+    elseif (CMAKE_SYSTEM_NAME STREQUAL Linux)
+        # Desktop Linux OpenXR uses the same shared-device Vulkan bridge as Windows,
+        # with the patched Dawn linked statically instead of loaded from a DLL.
+        target_sources(aurora_core PRIVATE lib/webgpu/vulkan_win32_interop.cpp)
     endif ()
     # Android/Vulkan counterpart: the AHardwareBuffer stereo bridge. The file
     # compiles to C ABI stubs on every other platform so the runtime's OpenXR

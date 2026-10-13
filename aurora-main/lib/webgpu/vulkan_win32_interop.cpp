@@ -4,8 +4,22 @@
 #include "../stereo.hpp"
 #include "../stereo_overlay.hpp"
 #include "gpu.hpp"
-#if defined(_WIN32) && defined(WEBGPU_DAWN) && defined(DAWN_ENABLE_BACKEND_VULKAN)
+#if (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))) && defined(WEBGPU_DAWN) && defined(DAWN_ENABLE_BACKEND_VULKAN)
+#if defined(_WIN32)
 #include <windows.h>
+#else
+// The patched Dawn is linked statically on Linux; its Aurora Vulkan ABI is resolved at link time.
+extern "C" {
+uint32_t AuroraDawnVulkanVersion();
+int AuroraDawnVulkanConfigure(const AuroraDawnVulkanHooks* hooks);
+int AuroraDawnVulkanGetHandles(void* handle, AuroraDawnVulkanHandles* out);
+void* AuroraDawnVulkanWrap(void* handle, const void* desc, uint64_t image);
+int AuroraDawnVulkanRelease(void* handle, void* const* textures, uint32_t count);
+void* AuroraDawnVulkanLock(void* handle);
+void AuroraDawnVulkanUnlock(void* guard);
+int AuroraDawnVulkanDrain(void* handle);
+}
+#endif
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -23,6 +37,7 @@ struct Api {
   AuroraDawnVulkanUnlockFn unlock = nullptr;
   AuroraDawnVulkanDrainFn drain = nullptr;
   bool Load() {
+#if defined(_WIN32)
     HMODULE module = GetModuleHandleW(L"webgpu_dawn.dll");
     if (!module) return false;
     auto version = reinterpret_cast<AuroraDawnVulkanVersionFn>(GetProcAddress(module, "AuroraDawnVulkanVersion"));
@@ -37,6 +52,17 @@ struct Api {
     LOAD(drain, AuroraDawnVulkanDrainFn, "AuroraDawnVulkanDrain");
 #undef LOAD
     return true;
+#else
+    if (AuroraDawnVulkanVersion() != AURORA_DAWN_VULKAN_ABI) return false;
+    configure = &AuroraDawnVulkanConfigure;
+    handles = &AuroraDawnVulkanGetHandles;
+    wrap = &AuroraDawnVulkanWrap;
+    release = &AuroraDawnVulkanRelease;
+    lock = &AuroraDawnVulkanLock;
+    unlock = &AuroraDawnVulkanUnlock;
+    drain = &AuroraDawnVulkanDrain;
+    return true;
+#endif
   }
 } api;
 int64_t VkFormat(wgpu::TextureFormat format) {

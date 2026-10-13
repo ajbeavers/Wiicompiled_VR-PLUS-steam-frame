@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#if defined(MKW_ENABLE_OPENXR) && defined(_WIN32)
+#if defined(MKW_ENABLE_OPENXR) && (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
 
 // OpenXR's Vulkan structures are selected when openxr_platform.h is parsed.
 #define XR_USE_GRAPHICS_API_VULKAN

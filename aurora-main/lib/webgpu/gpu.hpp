@@ -65,6 +65,11 @@ extern bool g_bcTexturesSupported;
 extern bool g_timestampQueriesSupported;
 
 bool initialize(AuroraBackend backend);
+// KARTFRAME_HEADLESS=1: development runs without a presentable swapchain. The window and surface
+// still exist (the adapter is chosen against it) but the swapchain is never configured; the desktop
+// view renders into an offscreen texture that is never shown.
+bool headless() noexcept;
+wgpu::Texture headless_surface_texture();
 void shutdown();
 // Device-loss callbacks may run on a Dawn-managed thread and only publish loss state; frame
 // threads call this at ordered boundaries to turn it into the one user-visible fatal error.

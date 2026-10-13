@@ -48,6 +48,15 @@
 #define XR_USE_TIMESPEC
 #include <openxr/openxr_platform.h>
 #define MKW_OPENXR_GRAPHICS_BACKEND 1
+#elif defined(__linux__)
+// Desktop Linux: the PC shared-device Vulkan bridge, driven by the native SteamVR OpenXR runtime.
+#define MKW_OPENXR_LINUX_DESKTOP 1
+#include "vr/openxr_vulkan_win32.h"
+#include <time.h>
+#include <unistd.h>
+#define XR_USE_TIMESPEC
+#include <openxr/openxr_platform.h>
+#define MKW_OPENXR_GRAPHICS_BACKEND 1
 #else
 #define MKW_OPENXR_GRAPHICS_BACKEND 0
 #endif
@@ -84,6 +93,9 @@ void ConfigurePolicy(bool enabled) noexcept {
 #if defined(_WIN32)
 using GraphicsBackend = OpenXRWindowsBackend;
 
+#elif defined(MKW_OPENXR_LINUX_DESKTOP)
+using GraphicsBackend = OpenXRWindowsVulkanBackend;
+inline constexpr const char* kGraphicsBackendName = "Vulkan";
 #else
 using GraphicsBackend = OpenXRVulkanBackend;
 inline constexpr const char* kGraphicsBackendName = "Vulkan";
@@ -410,6 +422,11 @@ public:
 #if defined(_WIN32)
         config.required_extensions = {kRequiredAuroraBackend == BACKEND_VULKAN ? "XR_KHR_vulkan_enable2" : "XR_KHR_D3D12_enable"};
         config.optional_extensions = {"XR_KHR_win32_convert_performance_counter_time",
+                                      "XR_FB_display_refresh_rate", "XR_EXT_performance_settings"};
+        AddHandMeshExtensions(config);
+#elif defined(MKW_OPENXR_LINUX_DESKTOP)
+        config.required_extensions = {"XR_KHR_vulkan_enable2"};
+        config.optional_extensions = {"XR_KHR_convert_timespec_time",
                                       "XR_FB_display_refresh_rate", "XR_EXT_performance_settings"};
         AddHandMeshExtensions(config);
 #else
@@ -1584,7 +1601,7 @@ private:
                 startup_origin_checked_=true;
                 const auto& q=frame.xr_frame.views[0].pose.orientation;
                 bool initializeSeat=StartupReferenceInverted({q.x,q.y,q.z,q.w});
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(MKW_OPENXR_LINUX_DESKTOP)
                 // PC runtimes may start with the previous standing-space origin.
                 initializeSeat=true;
 #endif
