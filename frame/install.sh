@@ -101,7 +101,7 @@ for f in collect-logs.sh uninstall.sh; do cp "$HERE/$f" "$APP/tools/$f" 2> /dev/
 
 # The Frame's own controller models, converted from this Frame's SteamVR (lane C's script, if present).
 if [ "$MODELS" = 1 ] && [ -f "$HERE/frame-controller-models.py" ]; then
-    python3 "$HERE/frame-controller-models.py" "$KARTFRAME_HOME/UserData/controller_models/frame" ||
+    python3 "$HERE/frame-controller-models.py" "$KFHOME/UserData/controller_models/frame" ||
         echo "warning: could not convert SteamVR's Frame controller models"
 fi
 
