@@ -18,17 +18,202 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace mkw::vr {
 namespace {
+
+// When the GPU finished each eye set. SteamVR shows a swapchain image the moment it is
+// released, finished or not, so the pacing thread releases a set only after this says so.
+// The frame worker, right after Aurora's queue.Submit and the bridge's release barrier,
+// makes an empty submission on Dawn's queue (under Dawn's device lock) that signals the
+// next value of a timeline semaphore; a watcher thread waits for the values in order and
+// records each set's submit-to-completion time. Without timeline semaphores the release
+// drains the queue instead (correct, slower; logged). KARTFRAME_NO_GPU_WAIT=1 skips the
+// wait: the negative test for the mock's MOCK_XR_BUSY_MS check.
+class GpuCompletion {
+public:
+    using Clock = std::chrono::steady_clock;
+    enum class Mode { None, Timeline, Drain };
+
+    ~GpuCompletion() { Stop(); }
+
+    // Pacing thread, at bind time. get_proc may be null (headless tests): then nothing
+    // is waited for and completion is the CPU token alone.
+    Mode Start(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, VkDevice device, uint32_t family,
+               uint32_t index, bool timeline) {
+        Stop();
+        const char* skip = std::getenv("KARTFRAME_NO_GPU_WAIT");
+        skip_wait_ = skip && *skip && *skip != '0';
+        if (!get_proc || !instance || !device) return mode_ = Mode::None;
+        const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(get_proc(instance, "vkGetDeviceProcAddr"));
+        if (!gdpa) return mode_ = Mode::None;
+#define KF_DEV(name) name##_ = reinterpret_cast<PFN_##name>(gdpa(device, #name))
+        KF_DEV(vkGetDeviceQueue);
+        KF_DEV(vkQueueSubmit);
+        KF_DEV(vkQueueWaitIdle);
+        KF_DEV(vkCreateSemaphore);
+        KF_DEV(vkDestroySemaphore);
+        KF_DEV(vkWaitSemaphores);
+#undef KF_DEV
+        if (!vkGetDeviceQueue_ || !vkQueueSubmit_ || !vkQueueWaitIdle_) return mode_ = Mode::None;
+        device_ = device;
+        vkGetDeviceQueue_(device, family, index, &queue_);
+        if (!queue_) return mode_ = Mode::None;
+        if (timeline && vkCreateSemaphore_ && vkDestroySemaphore_ && vkWaitSemaphores_) {
+            VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+            type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            type.initialValue = 0;
+            VkSemaphoreCreateInfo create{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+            if (vkCreateSemaphore_(device, &create, nullptr, &semaphore_) == VK_SUCCESS) {
+                {
+                    std::lock_guard lock(mutex_);
+                    stop_ = false;
+                    signaled_ = completed_ = 0;
+                    failed_ = false;
+                }
+                watcher_ = std::thread([this] { Watch(); });
+                return mode_ = Mode::Timeline;
+            }
+            semaphore_ = VK_NULL_HANDLE;
+        }
+        return mode_ = Mode::Drain;
+    }
+
+    void Stop() {
+        if (watcher_.joinable()) {
+            {
+                std::lock_guard lock(mutex_);
+                stop_ = true;
+            }
+            cv_.notify_all();
+            watcher_.join();
+        }
+        if (semaphore_ && vkDestroySemaphore_) vkDestroySemaphore_(device_, semaphore_, nullptr);
+        semaphore_ = VK_NULL_HANDLE;
+        mode_ = Mode::None;
+    }
+
+    Mode CurrentMode() const { return mode_; }
+    bool SkipsWait() const { return skip_wait_; }
+
+    // Frame worker, inside the bridge's submitted callback (Aurora's queue-submit mutex
+    // held, Dawn's device lock not). Returns the value to wait for: 0 when there is
+    // nothing to wait for (no GPU sync, or the drain mode), UINT64_MAX on failure.
+    uint64_t Signal(int64_t submit_ns) {
+        if (mode_ != Mode::Timeline) return 0;
+        uint64_t value;
+        {
+            std::lock_guard lock(mutex_);
+            if (failed_) return std::numeric_limits<uint64_t>::max();
+            value = signaled_ + 1;
+            submit_ns_[value % kRing] = submit_ns;
+        }
+        VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        timeline.signalSemaphoreValueCount = 1;
+        timeline.pSignalSemaphoreValues = &value;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &semaphore_;
+        VkResult result;
+        {
+            void* guard = aurora_vulkan_win32_lock_queue();
+            result = vkQueueSubmit_(queue_, 1, &submit, VK_NULL_HANDLE);
+            aurora_vulkan_win32_unlock_queue(guard);
+        }
+        std::lock_guard lock(mutex_);
+        if (result != VK_SUCCESS) {
+            failed_ = true;
+            cv_.notify_all();
+            return std::numeric_limits<uint64_t>::max();
+        }
+        signaled_ = value;
+        cv_.notify_all();
+        return value;
+    }
+
+    // Pacing thread: true once the set that signalled `value` finished on the GPU.
+    bool WaitUntil(uint64_t value, Clock::time_point deadline) {
+        if (skip_wait_ || value == 0) {
+            if (mode_ == Mode::Drain && !skip_wait_) {
+                void* guard = aurora_vulkan_win32_lock_queue();
+                const bool idle = vkQueueWaitIdle_(queue_) == VK_SUCCESS;
+                aurora_vulkan_win32_unlock_queue(guard);
+                return idle;
+            }
+            return true;
+        }
+        if (value == std::numeric_limits<uint64_t>::max()) return false;
+        std::unique_lock lock(mutex_);
+        return cv_.wait_until(lock, deadline, [&] { return completed_ >= value || failed_ || stop_; }) &&
+               completed_ >= value;
+    }
+
+    bool Failed() {
+        std::lock_guard lock(mutex_);
+        return failed_;
+    }
+
+private:
+    static constexpr uint64_t kRing = 64;
+
+    void Watch() {
+        uint64_t next = 1;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex_);
+                cv_.wait(lock, [&] { return stop_ || failed_ || signaled_ >= next; });
+                if (stop_ || failed_) return;
+            }
+            VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wait.semaphoreCount = 1;
+            wait.pSemaphores = &semaphore_;
+            wait.pValues = &next;
+            const VkResult result = vkWaitSemaphores_(device_, &wait, 50'000'000ull);
+            if (result == VK_TIMEOUT) continue;
+            const int64_t now = diagnostics::detail::NowNs();
+            std::lock_guard lock(mutex_);
+            if (result != VK_SUCCESS) {
+                failed_ = true;
+                cv_.notify_all();
+                return;
+            }
+            pacing::OnSetGpu(static_cast<double>(now - submit_ns_[next % kRing]) / 1.0e6);
+            completed_ = next++;
+            cv_.notify_all();
+        }
+    }
+
+    Mode mode_ = Mode::None;
+    bool skip_wait_ = false;
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkQueue queue_ = VK_NULL_HANDLE;
+    VkSemaphore semaphore_ = VK_NULL_HANDLE;
+    PFN_vkGetDeviceQueue vkGetDeviceQueue_ = nullptr;
+    PFN_vkQueueSubmit vkQueueSubmit_ = nullptr;
+    PFN_vkQueueWaitIdle vkQueueWaitIdle_ = nullptr;
+    PFN_vkCreateSemaphore vkCreateSemaphore_ = nullptr;
+    PFN_vkDestroySemaphore vkDestroySemaphore_ = nullptr;
+    PFN_vkWaitSemaphores vkWaitSemaphores_ = nullptr;
+    std::thread watcher_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    uint64_t signaled_ = 0;
+    uint64_t completed_ = 0;
+    bool failed_ = false;
+    bool stop_ = false;
+    std::array<int64_t, kRing> submit_ns_{};
+};
 
 bool SameVkCopyFamily(VkFormat a, VkFormat b) {
     return a == b || ((a == VK_FORMAT_R8G8B8A8_UNORM || a == VK_FORMAT_R8G8B8A8_SRGB) &&
@@ -109,6 +294,8 @@ public:
         if (XR_SUCCEEDED(xr) && result == VK_SUCCESS) {
             owner.vk_instance_ = *reinterpret_cast<VkInstance*>(out);
             owner.instance_api_version_ = app.apiVersion;
+            owner.vk_get_proc_ = get_proc;
+            owner.LogInstanceLayers(get_proc, vk_info);
         }
         return XR_SUCCEEDED(xr) ? result : VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -161,9 +348,52 @@ public:
         create.vulkanAllocator = static_cast<const VkAllocationCallbacks*>(allocator);
         VkResult result = VK_ERROR_INITIALIZATION_FAILED;
         const XrResult xr = owner.create_device_(owner.runtime_->Instance(), &create, reinterpret_cast<VkDevice*>(out), &result);
-        if (XR_SUCCEEDED(xr) && result == VK_SUCCESS) owner.timeline_semaphores_ = timeline.timelineSemaphore == VK_TRUE;
+        if (XR_SUCCEEDED(xr) && result == VK_SUCCESS) {
+            owner.timeline_semaphores_ = timeline.timelineSemaphore == VK_TRUE;
+            owner.LogDeviceLayers(get_proc, vk_physical);
+        }
         return XR_SUCCEEDED(xr) ? result : VK_ERROR_INITIALIZATION_FAILED;
     }
+    // The Vulkan layer chain, logged once at startup: Valve's FDM injection (an implicit
+    // layer of SteamVR's) and the validation layer change what reaches the driver.
+    // DISABLE_VULKAN_FDM_INJECTION_LAYER=1 is the A/B switch for the former.
+    void LogInstanceLayers(PFN_vkGetInstanceProcAddr get_proc, const VkInstanceCreateInfo& info) const {
+        if (!get_proc) return;
+        std::ostringstream line;
+        line << "Vulkan instance: API " << VK_API_VERSION_MAJOR(instance_api_version_) << '.'
+             << VK_API_VERSION_MINOR(instance_api_version_) << ", layers asked for by Dawn:";
+        for (uint32_t i = 0; i < info.enabledLayerCount; ++i) line << ' ' << info.ppEnabledLayerNames[i];
+        if (info.enabledLayerCount == 0) line << " none";
+        const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
+            get_proc(nullptr, "vkEnumerateInstanceLayerProperties"));
+        uint32_t count = 0;
+        if (enumerate && enumerate(&count, nullptr) == VK_SUCCESS) {
+            std::vector<VkLayerProperties> layers(count);
+            if (enumerate(&count, layers.data()) == VK_SUCCESS) {
+                line << "; loader offers " << count << ':';
+                for (uint32_t i = 0; i < count; ++i) line << ' ' << layers[i].layerName;
+            }
+        }
+        const char* fdm = std::getenv("DISABLE_VULKAN_FDM_INJECTION_LAYER");
+        line << "; DISABLE_VULKAN_FDM_INJECTION_LAYER=" << (fdm ? fdm : "(unset)");
+        Log(OpenXRLogLevel::Info, line.str());
+    }
+    void LogDeviceLayers(PFN_vkGetInstanceProcAddr get_proc, VkPhysicalDevice physical) const {
+        if (!get_proc || !vk_instance_) return;
+        // The loader reports the instance's active layer chain here.
+        const auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceLayerProperties>(
+            get_proc(vk_instance_, "vkEnumerateDeviceLayerProperties"));
+        uint32_t count = 0;
+        if (!enumerate || enumerate(physical, &count, nullptr) != VK_SUCCESS) return;
+        std::vector<VkLayerProperties> layers(count);
+        if (enumerate(physical, &count, layers.data()) != VK_SUCCESS) return;
+        std::ostringstream line;
+        line << "Vulkan layer chain (active, " << count << "):";
+        for (uint32_t i = 0; i < count; ++i) line << ' ' << layers[i].layerName;
+        if (count == 0) line << " none";
+        Log(OpenXRLogLevel::Info, line.str());
+    }
+
     bool QueryGraphicsRequirements(OpenXRRuntime& runtime) {
         ClearError();
         if (!runtime.IsInitialized() || runtime.HasSession()) return Fail("Vulkan requirements need an initialized XR instance without a session");
@@ -230,12 +460,23 @@ public:
             abandon_session();
             return Fail("OpenXR session became loss-pending while creating Vulkan swapchains");
         }
+        const auto gpu_mode = gpu_.Start(vk_get_proc_, static_cast<VkInstance>(handles.instance),
+                                         static_cast<VkDevice>(handles.device), handles.queueFamily,
+                                         handles.queueIndex, timeline_semaphores_);
         if (!aurora_vulkan_win32_enable(&Impl::OnAuroraSubmitted, this)) {
+            gpu_.Stop();
             abandon_session();
             return Fail("Aurora could not enable its zero-readback Vulkan stereo bridge");
         }
         bridge_enabled_ = true;
         bound_ = true;
+        Log(gpu_mode == GpuCompletion::Mode::Drain ? OpenXRLogLevel::Warning : OpenXRLogLevel::Info,
+            gpu_.SkipsWait() ? "OpenXR Vulkan GPU completion: NOT waited for before a release (KARTFRAME_NO_GPU_WAIT)"
+            : gpu_mode == GpuCompletion::Mode::Timeline
+                ? "OpenXR Vulkan GPU completion: timeline semaphore after each eye set; images are released only once it signals"
+            : gpu_mode == GpuCompletion::Mode::Drain
+                ? "OpenXR Vulkan GPU completion: no timeline semaphores; each release drains the queue first"
+                : "OpenXR Vulkan GPU completion: not available (no Vulkan entry points); releases follow Aurora's submission");
         std::ostringstream message;
         message << "OpenXR Vulkan swapchains ready: VkFormat " << static_cast<int64_t>(swapchain_format_)
                 << " (Aurora " << static_cast<int64_t>(aurora_format_) << "), eyes "
@@ -322,9 +563,10 @@ public:
         const diagnostics::Stopwatch acquire_timer;
         for (uint32_t eye = 0; eye < target_count; ++eye) {
             auto& swapchain = eye_swapchains_[eye];
-            if (!AcquireSwapchain(swapchain)) {
+            // A canceled set leaves its images acquired and waited (nothing wrote them); reuse them.
+            if (!(swapchain.acquired && swapchain.waited) && !AcquireSwapchain(swapchain)) {
                 ReleaseAcquiredSwapchains();
-                EndActiveFrameWithoutLayers(frame.xr_frame);
+                EndActiveFrameWithoutLayers(active_frame_);
                 return OpenXRWindowsVulkanBeginStatus::Error;
             }
             targets[eye] = {
@@ -339,9 +581,9 @@ public:
         const bool panel = frame.presentation.panel.requested && EnsurePanelSwapchains();
         frame.presentation.panel.requested = panel;
         if (panel) {
-            if (!AcquireSwapchain(panel_swapchain_)) {
+            if (!(panel_swapchain_.acquired && panel_swapchain_.waited) && !AcquireSwapchain(panel_swapchain_)) {
                 ReleaseAcquiredSwapchains();
-                EndActiveFrameWithoutLayers(frame.xr_frame);
+                EndActiveFrameWithoutLayers(active_frame_);
                 return OpenXRWindowsVulkanBeginStatus::Error;
             }
             panel_target = {
@@ -371,7 +613,7 @@ public:
             }
             ReleaseAcquiredSwapchains();
             Fail("Aurora rejected the acquired OpenXR Vulkan swapchain target");
-            EndActiveFrameWithoutLayers(frame.xr_frame);
+            EndActiveFrameWithoutLayers(active_frame_);
             return OpenXRWindowsVulkanBeginStatus::Error;
         }
         frame.expects_gpu_submission = true;
@@ -513,6 +755,136 @@ public:
         return OpenXRBeginStatus::Ready;
     }
 
+    // ---- Per-refresh eye sets (VR interpolation: inline and pipelined pacing) ----
+    //
+    // A set is one acquired image per eye (plus the panel's), located for one display
+    // time and rendered by Aurora into the pending swapchain pair. Compositor cycles run
+    // independently: BeginCycle opens one; EndCycleWithSet shows a finished set with its
+    // own poses; EndCycleRetained shows the retained pair again while a set may stay
+    // acquired. At most one set is pending, so each swapchain has at most one waited image
+    // (the other pair holds the image on display).
+
+    OpenXRBeginStatus BeginCycle(OpenXRFrame& cycle) {
+        cycle = {};
+        if (!bound_ || runtime_ == nullptr || frame_active_) {
+            Fail("BeginCycle called before binding or with a compositor frame open");
+            return OpenXRBeginStatus::Error;
+        }
+        const auto status = BeginCompositorCycle();
+        if (status != OpenXRBeginStatus::Ready) return status;
+        cycle_wake_ = std::chrono::steady_clock::now();
+        active_frame_serial_ = active_frame_.serial;
+        cycle = active_frame_;
+        return OpenXRBeginStatus::Ready;
+    }
+
+    std::chrono::steady_clock::time_point CycleWakeTime() const { return cycle_wake_; }
+    bool HasPendingSet() const { return pending_packet_serial_ != 0; }
+
+    OpenXRBeginStatus PrepareSet(const OpenXRPresentation& presentation, XrTime display_time,
+                                 const OpenXRFrame& cycle, OpenXRBackendFrame& set) {
+        set = {};
+        set.presentation = presentation;
+        if (!bound_ || runtime_ == nullptr || pending_packet_serial_ != 0) {
+            Fail("PrepareSet called before binding or with a set pending");
+            return OpenXRBeginStatus::Error;
+        }
+        if (runtime_->ShouldExit()) return OpenXRBeginStatus::ExitRequested;
+        if (!runtime_->IsSessionRunning()) return OpenXRBeginStatus::SessionNotRunning;
+        set.xr_frame.serial = next_packet_serial_++;
+        set.xr_frame.predicted_display_period = cycle.predicted_display_period;
+        set.xr_frame.should_render = cycle.should_render;
+        for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+            set.render_width[eye] = eye_swapchains_[eye].width;
+            set.render_height[eye] = eye_swapchains_[eye].height;
+        }
+        if (!set.xr_frame.should_render) {
+            set.xr_frame.predicted_display_time = display_time;
+            return OpenXRBeginStatus::Ready;
+        }
+        if (!runtime_->LocateViewsAt(display_time, set.xr_frame)) {
+            Fail("xrLocateViews failed for a Vulkan eye set");
+            return OpenXRBeginStatus::Error;
+        }
+        if (!set.xr_frame.views_valid) return OpenXRBeginStatus::Ready;
+        render_session_serial_ = runtime_->SessionRunSerial();
+        render_space_serial_ = runtime_->LastReferenceSpaceChange().serial;
+        // A failure here is fatal for the session (the caller ends it).
+        const auto status = PrepareTargets(set);
+        if (status == OpenXRBeginStatus::Ready) pending_packet_serial_ = set.xr_frame.serial;
+        return status;
+    }
+
+    bool CancelSet(OpenXRBackendFrame& set) {
+        if (pending_packet_serial_ == 0 || set.xr_frame.serial != pending_packet_serial_ ||
+            !set.expects_gpu_submission || !aurora_vulkan_win32_cancel(set.xr_frame.serial)) return false;
+        {
+            std::lock_guard lock(submission_mutex_);
+            awaiting_token_ = submitted_token_ = 0;
+            submission_arrived_ = submission_success_ = submission_unsafe_ = false;
+        }
+        set.expects_gpu_submission = false;
+        pending_packet_serial_ = 0;
+        // The images stay acquired for the next set (PrepareTargets reuses them): nothing
+        // wrote them, and a release here would only churn the swapchain.
+        return true;
+    }
+
+    // Shows the finished set with its own poses at this cycle's display time. Call only
+    // after WaitForSubmissionUntil(set) returned Success.
+    bool EndCycleWithSet(OpenXRBackendFrame& set) {
+        if (!frame_active_ || pending_packet_serial_ == 0 || set.xr_frame.serial != pending_packet_serial_) {
+            return Fail("EndCycleWithSet needs an open compositor cycle and the pending set");
+        }
+        OpenXRBackendFrame frame = set;
+        frame.xr_frame.serial = active_frame_.serial;
+        frame.xr_frame.predicted_display_time = active_frame_.predicted_display_time;
+        frame.xr_frame.predicted_display_period = active_frame_.predicted_display_period;
+        frame.xr_frame.should_render = active_frame_.should_render;
+        {
+            std::lock_guard lock(submission_mutex_);
+            if (submitted_token_ == set.xr_frame.serial) submitted_token_ = frame.xr_frame.serial;
+            awaiting_token_ = frame.xr_frame.serial;
+        }
+        active_frame_serial_ = frame.xr_frame.serial;
+        pending_packet_serial_ = 0;
+        const bool ok = FinishFrame(frame, true);
+        set.expects_gpu_submission = false;
+        return ok;
+    }
+
+    // Ends the open cycle on the retained layer; a pending set stays acquired.
+    bool EndCycleRetained() {
+        if (!frame_active_ || runtime_ == nullptr) return Fail("EndCycleRetained needs an open compositor cycle");
+        const bool ended = EndRetainedFrame(false);
+        frame_active_ = false;
+        active_frame_ = {};
+        active_frame_serial_ = 0;
+        if (!ended) return Fail("OpenXR could not resubmit the retained Vulkan frame");
+        return true;
+    }
+
+    // A set that will never be shown (session stopped): released only once the GPU
+    // finished it.
+    bool DropSet(OpenXRBackendFrame& set) {
+        if (pending_packet_serial_ == 0 || set.xr_frame.serial != pending_packet_serial_) return true;
+        if (CancelSet(set)) return true;
+        const auto status = WaitForSubmissionUntil(set, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+        if (status != OpenXRSubmissionStatus::Success) {
+            AbandonAcquiredSwapchains();
+            pending_packet_serial_ = 0;
+            return Fail("an OpenXR Vulkan eye set could not be confirmed finished; its images stay acquired");
+        }
+        pending_packet_serial_ = 0;
+        set.expects_gpu_submission = false;
+        {
+            std::lock_guard lock(submission_mutex_);
+            awaiting_token_ = submitted_token_ = 0;
+            submission_arrived_ = submission_success_ = submission_unsafe_ = false;
+        }
+        return ReleaseAcquiredSwapchains();
+    }
+
     OpenXRSubmissionStatus CopyRenderedEyes(const OpenXRBackendFrame& frame) {
         if (!frame_active_ || frame.xr_frame.serial != active_frame_serial_) {
             Fail("CopyRenderedEyes received a stale Vulkan frame");
@@ -525,24 +897,51 @@ public:
 
     OpenXRWindowsVulkanSubmissionStatus WaitForSubmission(const OpenXRWindowsVulkanFrame& frame,
                                                   uint32_t timeout_ms) {
+        const auto deadline = timeout_ms == std::numeric_limits<uint32_t>::max()
+                                  ? std::chrono::steady_clock::time_point::max()
+                                  : std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        return WaitForSubmissionUntil(frame, deadline);
+    }
+
+    // Success only once Aurora submitted the set and the GPU finished it.
+    OpenXRSubmissionStatus WaitForSubmissionUntil(const OpenXRBackendFrame& frame,
+                                                  std::chrono::steady_clock::time_point deadline) {
         if (!frame.expects_gpu_submission) {
             return OpenXRWindowsVulkanSubmissionStatus::Success;
         }
-        std::unique_lock lock(submission_mutex_);
-        const auto ready = [&] {
-            return shutting_down_ ||
-                   (submission_arrived_ && submitted_token_ == frame.xr_frame.serial);
-        };
-        if (timeout_ms == std::numeric_limits<uint32_t>::max()) {
-            submission_cv_.wait(lock, ready);
-        } else if (!submission_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready)) {
-            return OpenXRWindowsVulkanSubmissionStatus::Timeout;
+        uint64_t gpu_value = 0;
+        {
+            std::unique_lock lock(submission_mutex_);
+            const auto ready = [&] {
+                return shutting_down_ ||
+                       (submission_arrived_ && submitted_token_ == frame.xr_frame.serial);
+            };
+            if (deadline == std::chrono::steady_clock::time_point::max()) {
+                submission_cv_.wait(lock, ready);
+            } else if (!submission_cv_.wait_until(lock, deadline, ready)) {
+                return OpenXRWindowsVulkanSubmissionStatus::Timeout;
+            }
+            if (shutting_down_) {
+                return OpenXRWindowsVulkanSubmissionStatus::ShuttingDown;
+            }
+            if (!submission_success_) {
+                return OpenXRWindowsVulkanSubmissionStatus::Failed;
+            }
+            gpu_value = submitted_gpu_value_;
         }
-        if (shutting_down_) {
-            return OpenXRWindowsVulkanSubmissionStatus::ShuttingDown;
+        const auto gpu_deadline = deadline == std::chrono::steady_clock::time_point::max()
+                                      ? std::chrono::steady_clock::now() + std::chrono::hours(1)
+                                      : deadline;
+        if (gpu_.WaitUntil(gpu_value, gpu_deadline)) {
+            return OpenXRWindowsVulkanSubmissionStatus::Success;
         }
-        return submission_success_ ? OpenXRWindowsVulkanSubmissionStatus::Success
-                                   : OpenXRWindowsVulkanSubmissionStatus::Failed;
+        if (gpu_.Failed()) {
+            std::lock_guard lock(submission_mutex_);
+            submission_unsafe_ = true;
+            submission_success_ = false;
+            return OpenXRWindowsVulkanSubmissionStatus::Failed;
+        }
+        return OpenXRWindowsVulkanSubmissionStatus::Timeout;
     }
 
     bool TryCancelPendingFrame(OpenXRWindowsVulkanFrame& frame) {
@@ -582,6 +981,20 @@ public:
         if (submission_unsafe) {
             AbandonAcquiredSwapchains();
             Fail("Aurora's Vulkan stereo submission failed after GPU work may have been queued");
+        } else if (frame.expects_gpu_submission) {
+            // Callers wait first; this is the last line of defence: SteamVR would show
+            // an image the GPU is still writing.
+            bool arrived;
+            uint64_t gpu_value;
+            {
+                std::lock_guard lock(submission_mutex_);
+                arrived = submission_arrived_ && submitted_token_ == frame.xr_frame.serial && submission_success_;
+                gpu_value = submitted_gpu_value_;
+            }
+            if (arrived && !gpu_.WaitUntil(gpu_value, std::chrono::steady_clock::now() + std::chrono::seconds(1))) {
+                AbandonAcquiredSwapchains();
+                Fail("an OpenXR Vulkan eye set did not finish on the GPU within 1 s; its images stay acquired");
+            }
         }
         const diagnostics::Stopwatch release_timer;
         bool release_ok = ReleaseAcquiredSwapchains();
@@ -760,6 +1173,8 @@ public:
             bridge_drained = aurora_vulkan_win32_disable();
             bridge_enabled_ = false;
         }
+        // The bridge's drain waited for the queue to go idle; the watcher can go.
+        if (bridge_drained) gpu_.Stop();
         if (!bridge_drained) {
             AbandonAcquiredSwapchains();
             shutdown_unsafe_ = true;
@@ -1054,11 +1469,27 @@ private:
         }
     }
 
+    // Aurora's frame worker, right after the queue.Submit holding the eyes and the
+    // bridge's release barrier (Aurora's queue-submit mutex held).
     static void OnAuroraSubmitted(uint64_t token, bool success, void* userdata) {
         auto* self = static_cast<Impl*>(userdata);
         if (self == nullptr) {
             return;
         }
+        const int64_t now = diagnostics::detail::NowNs();
+        {
+            std::lock_guard lock(self->submission_mutex_);
+            if (token != self->awaiting_token_) {
+                return;
+            }
+        }
+        uint64_t gpu_value = 0;
+        if (success) {
+            gpu_value = self->gpu_.Signal(now);
+            // No completion marker for work already queued: never release these images.
+            if (gpu_value == std::numeric_limits<uint64_t>::max()) success = false;
+        }
+        pacing::OnSetSubmitted(now, aurora_vulkan_win32_submitting_retained());
         {
             std::lock_guard lock(self->submission_mutex_);
             if (token != self->awaiting_token_) {
@@ -1068,6 +1499,7 @@ private:
             self->submission_success_ = success;
             self->submission_arrived_ = true;
             self->submission_unsafe_ = !success;
+            self->submitted_gpu_value_ = gpu_value;
         }
         self->submission_cv_.notify_all();
     }
@@ -1122,6 +1554,9 @@ private:
     std::condition_variable submission_cv_;
     uint64_t awaiting_token_ = 0;
     uint64_t submitted_token_ = 0;
+    uint64_t submitted_gpu_value_ = 0;
+    GpuCompletion gpu_;
+    PFN_vkGetInstanceProcAddr vk_get_proc_ = nullptr;
     bool submission_arrived_ = false;
     bool submission_success_ = false;
     bool submission_unsafe_ = false;
@@ -1137,6 +1572,7 @@ private:
     uint64_t render_session_serial_ = 0;
     uint64_t render_space_serial_ = 0;
     OpenXRFrame active_frame_{};
+    std::chrono::steady_clock::time_point cycle_wake_{};
     bool requirements_queried_ = false;
     bool owns_session_ = false;
     bool bridge_enabled_ = false;
@@ -1161,6 +1597,11 @@ bool OpenXRWindowsVulkanBackend::BindAurora(OpenXRRuntime& runtime) {
 OpenXRWindowsVulkanBeginStatus OpenXRWindowsVulkanBackend::BeginFrame(
     const OpenXRWindowsVulkanPresentation& presentation, OpenXRWindowsVulkanFrame& frame) {
     return m_impl->BeginFrame(presentation, frame);
+}
+
+OpenXRWindowsVulkanSubmissionStatus OpenXRWindowsVulkanBackend::WaitForSubmissionUntil(
+    const OpenXRWindowsVulkanFrame& frame, std::chrono::steady_clock::time_point deadline) {
+    return m_impl->WaitForSubmissionUntil(frame, deadline);
 }
 
 OpenXRWindowsVulkanSubmissionStatus OpenXRWindowsVulkanBackend::WaitForSubmission(
@@ -1193,6 +1634,17 @@ OpenXRSubmissionStatus OpenXRWindowsVulkanBackend::CopyRenderedEyes(const OpenXR
     return m_impl->CopyRenderedEyes(frame);
 }
 OpenXRBeginStatus OpenXRWindowsVulkanBackend::KeepAliveCycle() { return m_impl->KeepAliveCycle(); }
+OpenXRBeginStatus OpenXRWindowsVulkanBackend::BeginCycle(OpenXRFrame& cycle) { return m_impl->BeginCycle(cycle); }
+std::chrono::steady_clock::time_point OpenXRWindowsVulkanBackend::CycleWakeTime() const { return m_impl->CycleWakeTime(); }
+bool OpenXRWindowsVulkanBackend::HasPendingSet() const { return m_impl->HasPendingSet(); }
+OpenXRBeginStatus OpenXRWindowsVulkanBackend::PrepareSet(const OpenXRPresentation& presentation, XrTime display_time,
+                                                         const OpenXRFrame& cycle, OpenXRBackendFrame& set) {
+    return m_impl->PrepareSet(presentation, display_time, cycle, set);
+}
+bool OpenXRWindowsVulkanBackend::EndCycleWithSet(OpenXRBackendFrame& set) { return m_impl->EndCycleWithSet(set); }
+bool OpenXRWindowsVulkanBackend::EndCycleRetained() { return m_impl->EndCycleRetained(); }
+bool OpenXRWindowsVulkanBackend::CancelSet(OpenXRBackendFrame& set) { return m_impl->CancelSet(set); }
+bool OpenXRWindowsVulkanBackend::DropSet(OpenXRBackendFrame& set) { return m_impl->DropSet(set); }
 
 bool OpenXRWindowsVulkanBackend::Shutdown() { return m_impl->Shutdown(); }
 

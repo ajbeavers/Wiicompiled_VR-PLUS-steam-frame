@@ -923,7 +923,8 @@ struct PendingStereoSink {
 };
 
 std::optional<PendingStereoSink> run_stereo_sink(wgpu::CommandEncoder& encoder, uint64_t frameToken,
-                                                 uint32_t logicalFrame, AuroraStereoFrameMode mode) noexcept {
+                                                 uint32_t logicalFrame, AuroraStereoFrameMode mode,
+                                                 bool retained = false) noexcept {
   StereoSinkRegistration registration;
   {
     std::lock_guard lock(g_stereoRegistrationMutex);
@@ -937,6 +938,7 @@ std::optional<PendingStereoSink> run_stereo_sink(wgpu::CommandEncoder& encoder, 
       .frameToken = frameToken,
       .logicalFrame = logicalFrame,
       .mode = mode,
+      .retained = retained,
   };
   const int orientation = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY ? webgpu::g_RaceOutputCopyMode : 0;
   const bool correction = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && webgpu::g_RaceOutputNeedsCopy;
@@ -2041,7 +2043,7 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
         stereo_overlay::composite_flat(encoder,output.view,output.size,eye);
       }
     }
-    const auto sink=run_stereo_sink(encoder,input->frameToken,g_retainedStereo.logicalFrame,input->mode);
+    const auto sink=run_stereo_sink(encoder,input->frameToken,g_retainedStereo.logicalFrame,input->mode,true);
     const auto buffer=encoder.Finish();std::lock_guard submitLock(g_queueSubmitMutex);
     g_queue.Submit(1,&buffer);
     if(sink && sink->submitted) sink->submitted(sink->frame,sink->userdata);
@@ -2059,7 +2061,7 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
     stereo_overlay::composite_immersive(encoder, g_stereoEyeTargets[eye].output().view, replay.eyes[eye].projection,
                                         replay.eyes[eye].viewFromCenter, eye);
   }
-  const auto sink = run_stereo_sink(encoder, input->frameToken, g_retainedStereo.logicalFrame, input->mode);
+  const auto sink = run_stereo_sink(encoder, input->frameToken, g_retainedStereo.logicalFrame, input->mode, true);
   const auto buffer = encoder.Finish();
   std::lock_guard submitLock(g_queueSubmitMutex);
   g_queue.Submit(1, &buffer);

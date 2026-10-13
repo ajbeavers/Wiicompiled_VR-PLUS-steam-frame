@@ -20,6 +20,8 @@ struct SinkFrame {
   uint64_t frameToken = 0;
   uint32_t logicalFrame = 0;
   AuroraStereoFrameMode mode = AURORA_STEREO_FRAME_IMMERSIVE_REPLAY;
+  // Rendered from the retained game frame (interpolation, projected menu), not a new one.
+  bool retained = false;
   std::array<EyeImage, AURORA_STEREO_EYE_COUNT> eyes{};
 };
 

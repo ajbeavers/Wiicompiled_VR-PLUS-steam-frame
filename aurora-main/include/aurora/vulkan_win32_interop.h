@@ -17,6 +17,10 @@ bool aurora_vulkan_win32_set_targets_with_panel(uint64_t token, const AuroraD3D1
                                                 const AuroraD3D12StereoTarget* panel);
 bool aurora_vulkan_win32_cancel(uint64_t token);
 bool aurora_vulkan_win32_disable();
+// Only inside the submitted callback, on the frame worker: true when the set being
+// reported was rendered from a retained game frame (VR frame interpolation, the
+// projected menu) instead of a newly sealed one.
+bool aurora_vulkan_win32_submitting_retained();
 void* aurora_vulkan_win32_lock_queue();
 void aurora_vulkan_win32_unlock_queue(void* guard);
 #ifdef __cplusplus

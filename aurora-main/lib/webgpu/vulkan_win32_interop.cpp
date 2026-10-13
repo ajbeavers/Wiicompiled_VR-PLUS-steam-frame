@@ -28,6 +28,8 @@ int AuroraDawnVulkanDrain(void* handle);
 namespace aurora::vulkan_win32 {
 namespace {
 Module Log("aurora::vulkan_win32");
+// Set on the frame worker around the submitted callback (see aurora_vulkan_win32_submitting_retained).
+thread_local bool submittingRetained = false;
 struct Api {
   AuroraDawnVulkanConfigureFn configure = nullptr;
   AuroraDawnVulkanHandlesFn handles = nullptr;
@@ -174,7 +176,9 @@ public:
     const bool success = api.release(webgpu::g_device.Get(), textures.data(), images) != 0;
     const auto completed = token;
     token = 0; encoded = false;
+    submittingRetained = frame.retained;
     callback(completed, success, userdata);
+    submittingRetained = false;
   }
 };
 std::unique_ptr<Bridge> bridge;
@@ -221,6 +225,7 @@ bool aurora_vulkan_win32_disable() {
   bridge.reset();
   return true;
 }
+bool aurora_vulkan_win32_submitting_retained() { return aurora::vulkan_win32::submittingRetained; }
 void* aurora_vulkan_win32_lock_queue() {
   return aurora::vulkan_win32::api.lock(aurora::webgpu::g_device.Get());
 }
@@ -241,6 +246,7 @@ bool aurora_vulkan_win32_set_targets_with_panel(uint64_t, const AuroraD3D12Stere
                                                 const AuroraD3D12StereoTarget*) { return false; }
 bool aurora_vulkan_win32_cancel(uint64_t) { return false; }
 bool aurora_vulkan_win32_disable() { return true; }
+bool aurora_vulkan_win32_submitting_retained() { return false; }
 void* aurora_vulkan_win32_lock_queue() { return nullptr; }
 void aurora_vulkan_win32_unlock_queue(void*) {}
 #endif

@@ -8,6 +8,7 @@
 #include "vr/openxr_runtime.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -59,6 +60,10 @@ public:
     // the caller may keep pacing with RepeatFrame while Aurora still owns them.
     OpenXRWindowsVulkanSubmissionStatus WaitForSubmission(const OpenXRWindowsVulkanFrame& frame,
                                                   uint32_t timeout_ms = UINT32_MAX);
+    // Success only once Aurora submitted this token AND the GPU finished it (the
+    // timeline semaphore the bridge signals after the set; see GpuCompletion).
+    OpenXRWindowsVulkanSubmissionStatus WaitForSubmissionUntil(const OpenXRWindowsVulkanFrame& frame,
+                                                       std::chrono::steady_clock::time_point deadline);
 
     // Withdraws this token only if Aurora has not encoded it. On success no GPU
     // command can reference the acquired images, and FinishFrame(frame, false)
@@ -87,6 +92,23 @@ public:
     OpenXRBeginStatus BeginFrameForPacket(const OpenXRBackendFrame& packet, OpenXRBackendFrame& frame);
     OpenXRSubmissionStatus CopyRenderedEyes(const OpenXRBackendFrame& frame);
     OpenXRBeginStatus KeepAliveCycle();
+
+    // VR interpolation's per-refresh eye sets (inline and pipelined pacing, see
+    // openxr_integration.cpp). BeginCycle: xrWaitFrame + xrBeginFrame. PrepareSet: one
+    // xrLocateViews for display_time, the pending pair acquired and handed to Aurora (with
+    // or without a compositor frame open). EndCycleWithSet: the set's images released (after
+    // WaitForSubmissionUntil said the GPU finished them) and the cycle ended with the set's
+    // own poses. EndCycleRetained: the cycle ended on the retained layer, a pending set stays
+    // acquired. CancelSet: before Aurora encoded it. DropSet: released unshown once finished.
+    OpenXRBeginStatus BeginCycle(OpenXRFrame& cycle);
+    std::chrono::steady_clock::time_point CycleWakeTime() const;
+    bool HasPendingSet() const;
+    OpenXRBeginStatus PrepareSet(const OpenXRPresentation& presentation, XrTime display_time,
+                                 const OpenXRFrame& cycle, OpenXRBackendFrame& set);
+    bool EndCycleWithSet(OpenXRBackendFrame& set);
+    bool EndCycleRetained();
+    bool CancelSet(OpenXRBackendFrame& set);
+    bool DropSet(OpenXRBackendFrame& set);
 
     // Call on the XR owner thread after Aurora's worker is idle and before
     // aurora_shutdown(). Safe to repeat. False means a submitted Vulkan command

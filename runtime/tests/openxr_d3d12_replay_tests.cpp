@@ -32,6 +32,7 @@
 
 #include "vr/openxr_wii_remote.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -148,6 +149,7 @@ bool aurora_vulkan_win32_get_handles(AuroraDawnVulkanHandles* handles, int64_t* 
 }
 void* aurora_vulkan_win32_lock_queue() { Require(!queue_locked); queue_locked = true; return &queue_locked; }
 void aurora_vulkan_win32_unlock_queue(void*) { Require(queue_locked); queue_locked = false; }
+bool aurora_vulkan_win32_submitting_retained() { return false; }
 #else
 bool aurora_d3d12_get_native_handles(AuroraD3D12NativeHandles* handles) {
     static ID3D12DeviceVtbl vtable{};
@@ -308,7 +310,7 @@ bool OpenXRRuntime::LocateViews(OpenXRFrame& frame) {
     return true;
 }
 bool OpenXRRuntime::LocateViewsAt(XrTime time, OpenXRFrame& frame) {
-    Require(!compositor_open);
+    if (expect_render_first) Require(!compositor_open);
     frame.predicted_display_time = time;
     return LocateViews(frame);
 }
@@ -607,7 +609,85 @@ void TestVirtualScreenContentRect() {
     Require(SameRect(OpenXRVirtualScreenContentRect(1344, 1408, 0.0f), 0, 0, 1344, 1408));
 }
 
+#if defined(TEST_WINDOWS_VULKAN)
+// VR interpolation's per-refresh eye sets (inline and pipelined pacing): a set is shown with
+// its own poses, only after it completed; a late set leaves the retained layer on display
+// and is shown by a later cycle; the two swapchain pairs alternate so no swapchain ever has
+// two images acquired (the stub requires it).
+void TestEyeSets() {
+    display_time = 0;
+    OpenXRRuntime runtime;
+    OpenXRD3D12Backend backend;
+    Require(backend.QueryGraphicsRequirements(runtime) && backend.BindAurora(runtime));
+    OpenXRPresentation presentation;
+    OpenXRFrame cycle;
+    OpenXRBackendFrame set;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+
+    // Inline: located for this cycle's display time, shown by it.
+    for (int i = 0; i < 4; ++i) {
+        Require(backend.BeginCycle(cycle) == OpenXRBeginStatus::Ready && compositor_open);
+        Require(backend.PrepareSet(presentation, cycle.predicted_display_time, cycle, set) == OpenXRBeginStatus::Ready);
+        Require(set.expects_gpu_submission && set.xr_frame.predicted_display_time == cycle.predicted_display_time);
+        Require(backend.WaitForSubmissionUntil(set, now()) == OpenXRSubmissionStatus::Timeout);
+        Complete();
+        Require(backend.WaitForSubmissionUntil(set, now()) == OpenXRSubmissionStatus::Success);
+        const auto before = releases;
+        Require(backend.EndCycleWithSet(set) && !compositor_open);
+        Require(releases == before + 2 && layer_count == 1 && displayed_content == set.xr_frame.serial);
+    }
+    const auto shown = displayed_content;
+
+    // Late: the retained layer is repeated, nothing is released, then the set is shown.
+    Require(backend.BeginCycle(cycle) == OpenXRBeginStatus::Ready);
+    Require(backend.PrepareSet(presentation, cycle.predicted_display_time, cycle, set) == OpenXRBeginStatus::Ready);
+    encoded = true;
+    const auto before_late = releases;
+    Require(backend.WaitForSubmissionUntil(set, now()) == OpenXRSubmissionStatus::Timeout);
+    Require(backend.EndCycleRetained() && layer_count == 1 && displayed_content == shown && releases == before_late);
+    Require(backend.HasPendingSet());
+    Require(backend.BeginCycle(cycle) == OpenXRBeginStatus::Ready);
+    Require(backend.WaitForSubmissionUntil(set, now()) == OpenXRSubmissionStatus::Timeout);
+    Require(!backend.CancelSet(set));  // Aurora is encoding it
+    Require(backend.EndCycleRetained() && displayed_content == shown && releases == before_late);
+    Require(backend.BeginCycle(cycle) == OpenXRBeginStatus::Ready);
+    Complete();
+    Require(backend.WaitForSubmissionUntil(set, now()) == OpenXRSubmissionStatus::Success);
+    Require(backend.EndCycleWithSet(set) && displayed_content == set.xr_frame.serial && !backend.HasPendingSet());
+
+    // Pipelined: located for the next cycle, published after this one ended, shown by it.
+    Require(backend.BeginCycle(cycle) == OpenXRBeginStatus::Ready);
+    Require(backend.EndCycleRetained());
+    for (int i = 0; i < 6; ++i) {
+        const XrTime next = cycle.predicted_display_time + cycle.predicted_display_period;
+        Require(backend.PrepareSet(presentation, next, cycle, set) == OpenXRBeginStatus::Ready && !compositor_open);
+        Complete();
+        Require(backend.BeginCycle(cycle) == OpenXRBeginStatus::Ready);
+        Require(cycle.predicted_display_time == next);
+        Require(backend.WaitForSubmissionUntil(set, now()) == OpenXRSubmissionStatus::Success);
+        Require(backend.EndCycleWithSet(set) && displayed_content == set.xr_frame.serial);
+    }
+
+    // A canceled set keeps its images for the next one; a dropped one is released only
+    // after it completed.
+    Require(backend.PrepareSet(presentation, cycle.predicted_display_time + 1, cycle, set) == OpenXRBeginStatus::Ready);
+    const auto before_cancel = releases;
+    Require(backend.CancelSet(set) && !backend.HasPendingSet() && releases == before_cancel);
+    Require(backend.PrepareSet(presentation, cycle.predicted_display_time + 2, cycle, set) == OpenXRBeginStatus::Ready);
+    Complete();
+    const auto shown_last = displayed_content;
+    Require(backend.DropSet(set) && !backend.HasPendingSet());
+    Require(backend.BeginCycle(cycle) == OpenXRBeginStatus::Ready);
+    Require(backend.EndCycleRetained() && displayed_content == shown_last);
+    Require(backend.Shutdown() && live_swapchains == 0);
+    display_time = 0;
+}
+#endif
+
 int main() {
+#if defined(TEST_WINDOWS_VULKAN)
+    TestEyeSets();
+#endif
     TestRenderFirst();
     TestPanelLayer();
     TestVirtualScreenContentRect();
