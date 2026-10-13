@@ -333,8 +333,11 @@ bool OpenXRInput::CreateActions() {
         info.countSubactionPaths=1;info.subactionPaths=m_hand_paths;
         if(!Check(xrCreateAction(m_action_set,&info,spec.action),spec.name)) return false;
     }
-    // Steam Frame actions carry no hand: SteamVR may bind them to either controller.
-    for (const Spec& spec : std::array<Spec,9>{{
+    // Steam Frame actions carry no hand: the Frame profile binds them in code, and a SteamVR binding file may bind them to either controller.
+    for (const Spec& spec : std::array<Spec,12>{{
+        {&m_frame_accelerate,"frame_accelerate","Accelerate",XR_ACTION_TYPE_FLOAT_INPUT},
+        {&m_frame_reverse,"frame_reverse","Reverse",XR_ACTION_TYPE_FLOAT_INPUT},
+        {&m_frame_brake,"frame_brake","Brake / back",XR_ACTION_TYPE_BOOLEAN_INPUT},
         {&m_frame_item,"frame_item","Use item",XR_ACTION_TYPE_BOOLEAN_INPUT},
         {&m_frame_look_back,"frame_look_back","Look back",XR_ACTION_TYPE_BOOLEAN_INPUT},
         {&m_frame_drift,"frame_drift","Drift / hop",XR_ACTION_TYPE_BOOLEAN_INPUT},
@@ -362,6 +365,7 @@ bool OpenXRInput::SuggestBindings() {
         }
         std::vector<XrActionSuggestedBinding> suggested;
         if(std::string_view(profile)=="/interaction_profiles/htc/vive_controller") m_vive_profile=profile_path;
+        if(std::string_view(profile)=="/interaction_profiles/valve/frame_controller") m_frame_profile=profile_path;
         suggested.reserve(bindings.size());
         for (const Binding& binding : bindings) {
             XrPath path = XR_NULL_PATH;
@@ -395,6 +399,72 @@ bool OpenXRInput::SuggestBindings() {
         return true;
     };
 
+    // Steam Frame controllers (XR_VALVE_frame_controller_interaction), bound entirely in code.
+    // Paths follow Valve's frame_controller input profile: right hand a, b, x, y, menu, bumper,
+    // trigger, squeeze, thumbstick; left hand dpad_*, view, bumper, trigger, squeeze, thumbstick;
+    // aim pose on both. One invalid path fails the whole call, so the grip pose and the grip
+    // component name (squeeze/value, else grip/value) are tried in turn.
+    {
+        const auto& extensions = m_runtime->EnabledExtensions();
+        if (std::find(extensions.begin(), extensions.end(), std::string("XR_VALVE_frame_controller_interaction")) ==
+            extensions.end()) {
+            Log(OpenXRLogLevel::Info, "XR_VALVE_frame_controller_interaction not enabled; Frame controller bindings skipped");
+        } else {
+            const std::string L = "/user/hand/left/input/", R = "/user/hand/right/input/";
+            for (const bool grip_pose : {true, false}) {
+                for (const char* squeeze : {"squeeze/value", "grip/value"}) {
+                    std::vector<std::string> paths; // keeps the c_str()s alive
+                    paths.reserve(64);
+                    std::vector<Binding> bindings;
+                    const auto add = [&](XrAction* action, const std::string& path) {
+                        paths.push_back(path);
+                        bindings.push_back({action, paths.back().c_str()});
+                    };
+                    paths.clear();
+                    add(&m_thumbstick, L + "thumbstick");
+                    add(&m_thumbstick, R + "thumbstick");
+                    add(&m_thumbstick_click, L + "thumbstick/click");
+                    add(&m_thumbstick_click, R + "thumbstick/click");
+                    // Menus and the settings panel: triggers select, A confirms, B backs out.
+                    add(&m_trigger, L + "trigger/value");
+                    add(&m_trigger, R + "trigger/value");
+                    add(&m_squeeze, L + squeeze);
+                    add(&m_squeeze, R + squeeze);
+                    add(&m_button_primary, R + "a/click");
+                    add(&m_button_secondary, R + "b/click");
+                    add(&m_aim_pose, L + "aim/pose");
+                    add(&m_aim_pose, R + "aim/pose");
+                    if (grip_pose) {
+                        add(&m_grip_pose, L + "grip/pose");
+                        add(&m_grip_pose, R + "grip/pose");
+                    }
+                    add(&m_haptic, "/user/hand/left/output/haptic");
+                    add(&m_haptic, "/user/hand/right/output/haptic");
+                    add(&m_frame_accelerate, R + "trigger/value");
+                    add(&m_frame_accelerate, R + "a/click");
+                    add(&m_frame_reverse, L + "trigger/value");
+                    add(&m_frame_brake, R + "b/click");
+                    add(&m_frame_item, R + "x/click");
+                    add(&m_frame_item, L + "bumper/click");
+                    add(&m_frame_look_back, R + "y/click");
+                    add(&m_frame_drift, R + "bumper/click");
+                    add(&m_frame_start, R + "menu/click");
+                    add(&m_frame_back, L + "view/click");
+                    add(&m_frame_dpad[0], L + "dpad_up/click");
+                    add(&m_frame_dpad[1], L + "dpad_down/click");
+                    add(&m_frame_dpad[2], L + "dpad_left/click");
+                    add(&m_frame_dpad[3], L + "dpad_right/click");
+                    if (suggest("/interaction_profiles/valve/frame_controller", bindings, false)) {
+                        m_frame_profile_suggested = true;
+                        Log(OpenXRLogLevel::Info, std::string("Steam Frame controller bindings accepted (") + squeeze +
+                                                      (grip_pose ? ", with grip pose)" : ", no grip pose)"));
+                        break;
+                    }
+                }
+                if (m_frame_profile_suggested) break;
+            }
+        }
+    }
     // Meta Quest Touch controllers (Quest 2 / 3 / Pro all expose this profile).
     const std::vector<Binding> touch{
         {&m_thumbstick, "/user/hand/left/input/thumbstick"},
@@ -625,9 +695,12 @@ void OpenXRInput::Destroy() {
     m_button_primary = m_button_secondary = m_menu = m_haptic = XR_NULL_HANDLE;
     m_options_x = m_options_y = XR_NULL_HANDLE;
     m_frame_item = m_frame_look_back = m_frame_drift = m_frame_start = m_frame_back = XR_NULL_HANDLE;
+    m_frame_accelerate = m_frame_reverse = m_frame_brake = XR_NULL_HANDLE;
+    m_frame_profile = XR_NULL_PATH;
+    m_frame_profile_suggested = false;
+    m_frame_view.Reset();
     m_frame_dpad = {};
-    m_frame_layout = m_frame_back_held = m_frame_back_consumed = false;
-    m_frame_back_down = m_frame_back_pulse_until = 0;
+    m_frame_layout = false;
     m_options_previous=0;
     m_aim_pose = m_grip_pose = XR_NULL_HANDLE;
     m_hand_paths[0] = m_hand_paths[1] = XR_NULL_PATH;
@@ -663,6 +736,7 @@ void OpenXRInput::Idle() {
     m_panel_select_held = false;
     OpenXRPublishSettingsPanelPointer(false, 0.0f, 0.0f, false, 0.0f);
     m_first_person_click.Reset();
+    m_frame_view.Reset();
     ResetDriving();
     StopRumble();
     // Nothing stays held on the gamepad either while input is away.
@@ -777,7 +851,9 @@ void OpenXRInput::Sync(XrTime predicted_display_time, const OpenXRPointerScreen&
             ? static_cast<float>(input_time - m_last_input_time) * 1.0e-9f
             : 0.0f;
     m_last_input_time = input_time;
-    // Steam Frame layout (see m_frame_item). An action counts as bound once SteamVR reports it active.
+    // Steam Frame layout (see m_frame_item). The layout latches when the runtime reports the Frame
+    // profile on either hand; as a fallback (a SteamVR binding file on another profile) when any
+    // frame_* action reports active.
     bool frame_bound=false;
     const auto frame_button=[&](XrAction action) {
         if(action==XR_NULL_HANDLE) return false;
@@ -788,39 +864,48 @@ void OpenXRInput::Sync(XrTime predicted_display_time, const OpenXRPointerScreen&
         frame_bound=true;
         return state.currentState==XR_TRUE;
     };
+    const auto frame_float=[&](XrAction action) {
+        if(action==XR_NULL_HANDLE) return 0.f;
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action=action;
+        XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+        if(XR_FAILED(xrGetActionStateFloat(m_runtime->Session(),&info,&state)) || state.isActive!=XR_TRUE) return 0.f;
+        frame_bound=true;
+        return state.currentState;
+    };
     const bool frame_item=frame_button(m_frame_item), frame_look_back=frame_button(m_frame_look_back);
     const bool frame_drift=frame_button(m_frame_drift), frame_start=frame_button(m_frame_start);
-    const bool frame_back=frame_button(m_frame_back);
+    const bool frame_back=frame_button(m_frame_back), frame_brake=frame_button(m_frame_brake);
+    const float frame_accelerate=frame_float(m_frame_accelerate), frame_reverse=frame_float(m_frame_reverse);
     std::array<bool,4> frame_dpad{};
     for(size_t i=0;i<frame_dpad.size();++i) frame_dpad[i]=frame_button(m_frame_dpad[i]);
     // Latched for the session: SteamVR briefly reports the actions inactive (a controller dozing,
     // focus changes), and the layout must not switch under the player mid-race.
+    if(!m_frame_layout && m_frame_profile!=XR_NULL_PATH) {
+        for(uint32_t hand=0;hand<kHands && !m_frame_layout;++hand) {
+            XrInteractionProfileState current{XR_TYPE_INTERACTION_PROFILE_STATE};
+            if(XR_SUCCEEDED(xrGetCurrentInteractionProfile(m_runtime->Session(),m_hand_paths[hand],&current)) &&
+               current.interactionProfile==m_frame_profile) {
+                m_frame_layout=true;
+                Log(OpenXRLogLevel::Info,"Steam Frame button layout active (interaction profile)");
+            }
+        }
+    }
     if(frame_bound && !m_frame_layout) {
         m_frame_layout=true;
-        Log(OpenXRLogLevel::Info,"Steam Frame button layout active");
+        Log(OpenXRLogLevel::Info,"Steam Frame button layout active (frame actions bound)");
     }
     // View: a tap is GameCube B (back), a 0.5 s hold opens the VR settings, and with the settings
     // open a press closes them. The tap is sent on release so that a hold never also goes back.
-    constexpr XrDuration kFrameBackHoldNs=500'000'000, kFrameBackPulseNs=120'000'000;
-    const bool frame_back_pressed=frame_back && !m_frame_back_held;
-    if(frame_back_pressed) {
-        m_frame_back_down=input_time;
-        m_frame_back_consumed=OpenXRSettingsPanelOpen();
-    }
-    bool frame_back_panel=false;
-    if(frame_back && !m_frame_back_consumed && input_time-m_frame_back_down>=kFrameBackHoldNs) {
-        frame_back_panel=true;
-        m_frame_back_consumed=true;
-    }
-    if(!frame_back && m_frame_back_held && !m_frame_back_consumed) m_frame_back_pulse_until=input_time+kFrameBackPulseNs;
-    m_frame_back_held=frame_back;
-    const bool frame_back_pulse=input_time<m_frame_back_pulse_until;
+    const auto view=m_frame_view.Update(frame_back,input_time,OpenXRSettingsPanelOpen());
+    const bool frame_back_panel=view.open_panel;
+    const bool frame_back_pulse=view.back_pulse;
 
     std::array<wii_remote::HandInputs, kHands> panel_hands = hands;
     panel_hands[0].primary |= boolean(m_options_x,0);
     panel_hands[0].secondary |= boolean(m_options_y,0);
     if(frame_back_panel) panel_hands[0].primary=panel_hands[0].secondary=true;
-    if(frame_back_pressed && m_frame_back_consumed) panel_hands[0].menu=true;
+    if(view.close_press) panel_hands[0].menu=true;
     const auto physical=m_runtime->RuntimeInfo().runtime_name.find("SteamVR")!=std::string::npos ?
         OpenXRReadPhysicalOptionsButtons() : PhysicalOptionsButtons{};
     if(physical.valid) {
@@ -924,22 +1009,24 @@ void OpenXRInput::Sync(XrTime predicted_display_time, const OpenXRPointerScreen&
         if(pause.pause && !panel.withheld) OpenXRRequestTutorialPause();
     } else port.pause=hands[0].menu;
     if(m_frame_layout) {
-        // A modern gamepad layout over the GameCube pad, the same in both views: A or the right
-        // trigger accelerates, the right bumper drifts (no cockpit A = drift swap), and Menu is
-        // Start. D-pad up goes through the tricks axis, not `trick`, which MapQuestInput reads with
-        // the item as the VR settings chord. Either grip also drifts, except in the cockpit with
-        // hand steering on, where the grips only hold the wheel.
-        const bool grips_hold_wheel=port.cockpit_controls && RuntimeConfigFile::VrHandSteering();
-        port.cockpit_controls=false;
-        port.item=(frame_item || port.item>.5f)?1.f:0.f;
-        port.look_back=frame_look_back;
-        port.drift=std::max(grips_hold_wheel ? 0.f : std::max(ui.buttons[0].squeeze,ui.buttons[1].squeeze),
-                            frame_drift?1.f:0.f);
-        port.trick=false;
-        port.tricks_y=std::clamp(port.tricks_y+(frame_dpad[0]?1.f:0.f)-(frame_dpad[1]?1.f:0.f),-1.f,1.f);
-        port.tricks_x=std::clamp(port.tricks_x+(frame_dpad[3]?1.f:0.f)-(frame_dpad[2]?1.f:0.f),-1.f,1.f);
-        port.pause=frame_start;
-        port.brake=port.brake || frame_back_pulse;
+        // A modern gamepad layout over the GameCube pad, the same in both views (frame_controls.h).
+        // D-pad up goes through the tricks axis, not `trick`, which MapQuestInput reads with the
+        // item as the VR settings chord. Grips only hold the wheel in the cockpit with hand
+        // steering on; the right bumper drifts everywhere.
+        frame::Inputs in;
+        in.right_trigger=std::max(frame_accelerate,hands[1].trigger);
+        in.left_trigger=std::max(frame_reverse,hands[0].trigger);
+        in.right_squeeze=ui.buttons[1].squeeze;in.left_squeeze=ui.buttons[0].squeeze;
+        in.a=hands[1].primary;in.b=frame_brake||hands[1].secondary;
+        in.x=frame_item;in.left_bumper=false;in.y=frame_look_back;
+        in.right_bumper=frame_drift;in.menu=frame_start;in.view=frame_back;
+        in.dpad=frame_dpad;
+        in.left_stick_x=hands[0].stick_x;in.left_stick_y=hands[0].stick_y;
+        in.right_stick_x=hands[1].stick_x;in.right_stick_y=hands[1].stick_y;
+        frame::Context ctx;
+        ctx.grips_hold_wheel=port.cockpit_controls && RuntimeConfigFile::VrHandSteering();
+        ctx.view_back_pulse=frame_back_pulse;
+        port=frame::Map(in,ctx,port);
     }
     if(panel.withheld) {
         const auto rawX=port.raw_steering_x,rawY=port.raw_steering_y;

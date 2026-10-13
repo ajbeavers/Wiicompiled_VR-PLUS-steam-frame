@@ -49,4 +49,4 @@ scratch user state is `~/.cache/kf-mockrun/data/WiiCompiled`. It aborts when the
 missing or empty and when a game is already running. Never run the game with the real runtime from an
 agent. Known facts: Valve's implicit OpenXR layer `XrApiLayer_VALVE_fdm_injection` is loaded in front of
 the mock; the mock offers no `XR_KHR_convert_timespec_time` yet, so the game logs "no clock
-conversion"; the binary links the system libabsl, libpng, freetype (present on SteamOS).
+conversion"; abseil, zlib, libpng and freetype are built static from pinned sources (AURORA_VENDOR_THIRD_PARTY); the binary needs only glibc, libstdc++ and libgcc_s.

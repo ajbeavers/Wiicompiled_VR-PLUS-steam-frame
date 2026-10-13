@@ -14,15 +14,29 @@ bool PublishQuestControllers() {
 #if defined(__ANDROID__)
         const char* resources=std::getenv("MKW_ANDROID_RESOURCES_DIR");
         if(!resources) return false;
-#else
+        const std::string modelDir=std::string(resources)+"/quest_touch_plus/";
+        const char* modelLabel="Touch Plus";
+#elif defined(_WIN32)
         const char* base=SDL_GetBasePath();
         if(!base) return false;
-        const std::string resources=std::string(base)+"resources";
+        const std::string modelDir=std::string(base)+"resources/quest_touch_plus/";
+        const char* modelLabel="Touch Plus";
+#else
+        // Linux (the Steam Frame): the simplified Frame models that frame/frame-controller-models.py
+        // converted from the user's own SteamVR install at setup time. Without them the procedural
+        // controllers stay. Nothing here ever asks OpenVR for the full render models (about 93k
+        // vertices animated on the CPU, 45 fps menus).
+        const std::string modelDir=(RuntimeConfigFile::ApplicationDataDirectory()/"controller_models"/"frame").string()+"/";
+        const char* modelLabel="Steam Frame";
+        if(!std::filesystem::exists(modelDir+"left.wccontroller") || !std::filesystem::exists(modelDir+"right.wccontroller")) {
+            std::fprintf(stderr,"[vr-menu] No converted Frame controller models in %s; procedural controllers\n",modelDir.c_str());
+            return false;
+        }
 #endif
         ready=true;
         for(uint32_t hand=0;hand<2;++hand) {
             auto& asset=g_questControllerAssets[hand];
-            const std::string prefix=std::string(resources)+"/quest_touch_plus/"+(hand?"right":"left");
+            const std::string prefix=modelDir+(hand?"right":"left");
             std::ifstream model(prefix+".wccontroller",std::ios::binary);
             char magic[4]{};uint32_t count=0,deltas=0;
             model.read(magic,4);model.read(reinterpret_cast<char*>(&count),4);model.read(reinterpret_cast<char*>(&deltas),4);
@@ -40,7 +54,7 @@ bool PublishQuestControllers() {
             if(!texture) {ready=false;break;}
             aurora_set_vr_controller_texture(0x51530000+hand,width,height,rgba.data());
             aurora_set_vr_controller_anchors(hand,asset.anchors.data());
-            std::fprintf(stderr,"[vr-menu] Loaded Touch Plus %s: %u textured vertices\n",hand?"right":"left",count);
+            std::fprintf(stderr,"[vr-menu] Loaded %s %s controller: %u textured vertices\n",modelLabel,hand?"right":"left",count);
         }
     }
     if(!ready) return false;
