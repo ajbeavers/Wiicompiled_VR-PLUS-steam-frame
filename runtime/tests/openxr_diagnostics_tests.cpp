@@ -315,6 +315,9 @@ void TestPacingLineFormat() {
     std::vector<std::string> lines;
     pacing::SetSink([&](std::string_view line) { lines.emplace_back(line); });
     pacing::Reset();
+    // Reset announces the session start clock ("vr pacing clock: ..."); the per-second line is
+    // what this test checks.
+    lines.clear();
     pacing::SetMode("pipelined");
     for (int i = 0; i < 120; ++i) {
         pacing::OnTick(120.0f, i == 7 ? 2u : 0u);
