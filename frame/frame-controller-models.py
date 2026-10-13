@@ -22,8 +22,8 @@ What is converted, per hand:
     and View button stand in for primary and secondary on the left).
 
 usage: frame-controller-models.py [OUTDIR [SteamVR rendermodels dir]]
-OUTDIR defaults to <user data dir>/controller_models/frame, where the user data dir is
-$KARTFRAME_DATA_DIR, else $XDG_DATA_HOME/WiiCompiled (default ~/.local/share/WiiCompiled).
+OUTDIR defaults to $KARTFRAME_HOME/UserData/controller_models/frame (KARTFRAME_HOME defaults to
+~/.local/share/KartFrame), where the game looks for them.
 Needs Python 3 and GdkPixbuf (python3-gobject), both on SteamOS. No numpy or PIL.
 """
 import json
@@ -375,8 +375,8 @@ def convert(hand, rendermodels, outdir):
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
         sys.exit(__doc__)
-    data = os.environ.get('KARTFRAME_DATA_DIR') or os.path.join(
-        os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'WiiCompiled')
+    home = os.environ.get('KARTFRAME_HOME') or os.path.expanduser('~/.local/share/KartFrame')
+    data = os.path.join(home, 'UserData')
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(data, 'controller_models', 'frame')
     os.makedirs(out, exist_ok=True)
     src = sys.argv[2] if len(sys.argv) > 2 else RENDERMODELS
