@@ -23,6 +23,7 @@
 #include <SDL3/SDL_stdinc.h>
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -588,7 +589,7 @@ void OpenXRInput::LoadInputClock() {
     if (enabled("XR_KHR_win32_convert_performance_counter_time")) {
         m_runtime->GetInstanceProcAddress("xrConvertWin32PerformanceCounterToTimeKHR", &function);
     }
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) || defined(__linux__)
     if (enabled("XR_KHR_convert_timespec_time")) {
         m_runtime->GetInstanceProcAddress("xrConvertTimespecTimeToTimeKHR", &function);
     }
@@ -751,9 +752,18 @@ void OpenXRInput::Sync(XrTime predicted_display_time, const OpenXRPointerScreen&
         return;
     }
     if (!m_runtime->IsSessionFocused()) {
+        // SteamVR takes focus for a few milliseconds now and then (VISIBLE, then FOCUSED again).
+        // Actions read as inactive meanwhile, so keep what was last published instead of
+        // releasing every button; only a loss longer than a second idles the controllers.
+        const auto now = std::chrono::steady_clock::now();
+        if (m_runtime->IsSessionVisible() && m_last_focused != std::chrono::steady_clock::time_point{} &&
+            now - m_last_focused < std::chrono::seconds(1)) {
+            return;
+        }
         Idle();
         return;
     }
+    m_last_focused = std::chrono::steady_clock::now();
     XrActiveActionSet active{m_action_set, XR_NULL_PATH};
     XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
     sync.countActiveActionSets = 1;

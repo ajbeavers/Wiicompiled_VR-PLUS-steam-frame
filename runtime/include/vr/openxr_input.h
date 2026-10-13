@@ -12,6 +12,7 @@
 #include "vr/openxr_wii_remote.h"
 #include "vr/steering_wheel.h"
 
+#include <chrono>
 #include <array>
 #include <cstdint>
 #include <string>
@@ -191,6 +192,7 @@ private:
     wii_remote::PointerFilter m_pointer;
     settings_panel::Controls m_panel_controls;
     XrTime m_last_input_time = 0;
+    std::chrono::steady_clock::time_point m_last_focused{};
     bool m_panel_select_held = false;
     std::array<float, 2> m_horizon{1.0f, 0.0f};
     bool m_haptics_active[kHands]{};

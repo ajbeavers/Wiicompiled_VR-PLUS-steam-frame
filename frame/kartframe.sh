@@ -11,7 +11,8 @@
 #   KARTFRAME_HOME          data folder, default ~/.local/share/KartFrame (game/, build/, sessions/)
 #   KARTFRAME_REFRESH_HZ    refresh rate asked of SteamVR, 90 or 120 (default 120)
 #   KARTFRAME_FDM_LAYER=0   sets DISABLE_VULKAN_FDM_INJECTION_LAYER=1 (A/B: Valve's FDM layer off)
-#   KARTFRAME_SYSMEM=1      sets TU_DEBUG=sysmem (A/B: Turnip sysmem rendering)
+#   KARTFRAME_SYSMEM=0      leaves Turnip in tiled mode; default 1 sets TU_DEBUG=sysmem (measured: the
+#                           race holds 120 Hz at 1728 only with it)
 #   KARTFRAME_PACING        passed through to the game (auto | inline | pipelined)
 #   KARTFRAME_VRTIMING=0    no compositor timing log
 #   KARTFRAME_SESSION_ENV_ONCE=1   (inside session.env) delete session.env after this launch
@@ -35,7 +36,7 @@ if [ -f "$KFHOME/session.env" ]; then
     [ "$KARTFRAME_SESSION_ENV_ONCE" = 1 ] && { rm -f "$KFHOME/session.env"; log "session.env deleted (KARTFRAME_SESSION_ENV_ONCE)"; }
 fi
 [ "$KARTFRAME_FDM_LAYER" = 0 ] && { export DISABLE_VULKAN_FDM_INJECTION_LAYER=1; log "A/B: Valve FDM layer disabled"; }
-[ "$KARTFRAME_SYSMEM" = 1 ] && { export TU_DEBUG=sysmem; log "A/B: TU_DEBUG=sysmem"; }
+[ "${KARTFRAME_SYSMEM:-1}" = 1 ] && { export TU_DEBUG=sysmem; log "TU_DEBUG=sysmem (KARTFRAME_SYSMEM=0 turns it off)"; }
 [ -n "$KARTFRAME_PACING" ] && { export KARTFRAME_PACING; log "KARTFRAME_PACING=$KARTFRAME_PACING"; }
 
 # The game: Steam's %command% (the binary the shortcut names), else the installed one.

@@ -17,7 +17,8 @@ required = false
 render_scale = 1.000000
 # 1 = render at the headset's refresh rate (120 Hz), interpolated from the game's 60 fps.
 frame_interpolation_fps = 1
-# TODO(lane A): frame_pacing = "auto" | "inline" | "pipelined" once the key is parsed (KARTFRAME_PACING overrides it).
+frame_pacing = "auto"
+refresh_rate = 120
 # Grips hold the wheel in the first-person cockpit (the right bumper drifts there); elsewhere they drift.
 hand_steering = true
 # 0 = plain dark background behind the menus (the raymarched one is far too heavy).
