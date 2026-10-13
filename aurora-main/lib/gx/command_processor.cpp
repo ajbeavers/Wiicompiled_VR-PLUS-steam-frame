@@ -2519,8 +2519,12 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   const auto drawScreenRect = screen_rect(prim, fmt, vertices, vtxCount, vtxStride);
   // Fades are blended over the picture (the respawn's black filter, wipes, the scene fader). Opaque and
   // logic-op full-frame quads are not: the race draws such quads every frame (backgrounds, a logic-op
-  // pass), and one shown across the eye blacked it out.
-  const bool fadeCandidate = g_gxState.colorUpdate && g_gxState.blendMode == GX_BM_BLEND;
+  // pass), and one shown across the eye blacked it out. Nor is a textured one (lane I, 90 Hz headset
+  // session): a full-frame quad sampling a texture composites a picture (the Time Trial ghost from its
+  // offscreen copy, the player's character), which pinned across the eye from frame space doubled
+  // against the world on every head turn. Only untextured, constant-colour quads (no texgens) are fades.
+  const bool fadeCandidate =
+      g_gxState.colorUpdate && g_gxState.blendMode == GX_BM_BLEND && g_gxState.numTexGens == 0;
   const auto invisible_blend = [] {
     const auto& st = g_gxState;
     if (st.blendMode != GX_BM_BLEND || st.blendFacSrc != GX_BL_SRCALPHA || st.blendFacDst != GX_BL_INVSRCALPHA ||
