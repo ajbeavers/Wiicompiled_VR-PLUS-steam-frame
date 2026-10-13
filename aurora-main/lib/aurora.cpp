@@ -926,7 +926,7 @@ struct PendingStereoSink {
 
 std::optional<PendingStereoSink> run_stereo_sink(wgpu::CommandEncoder& encoder, uint64_t frameToken,
                                                  uint32_t logicalFrame, AuroraStereoFrameMode mode,
-                                                 bool retained = false) noexcept {
+                                                 bool retained = false, uint64_t displayTimeNanos = 0) noexcept {
   StereoSinkRegistration registration;
   {
     std::lock_guard lock(g_stereoRegistrationMutex);
@@ -941,6 +941,7 @@ std::optional<PendingStereoSink> run_stereo_sink(wgpu::CommandEncoder& encoder, 
       .logicalFrame = logicalFrame,
       .mode = mode,
       .retained = retained,
+      .displayTimeNanos = displayTimeNanos,
   };
   const int orientation = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY ? webgpu::g_RaceOutputCopyMode : 0;
   const bool correction = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && webgpu::g_RaceOutputNeedsCopy;
@@ -2003,9 +2004,16 @@ struct RetainedStereoContext {
 
 gfx::StereoReplayFrame interpolated_stereo_frame(const AuroraStereoFrame& input, float& weight) {
   const auto& retained = g_retainedStereo;
-  weight = retained.continuous
-               ? stereo::interpolation_weight(input.displayTimeNanos, retained.boundary, retained.interval)
-               : 1.0f;
+  // KARTFRAME_SCENE_CLOCK=0: the fixed rule (display time against the frame's own interval), which
+  // gives weight 1 for nearly every set on a headset (see stereo::SceneClock).
+  static const bool sceneClock = [] {
+    const char* env = std::getenv("KARTFRAME_SCENE_CLOCK");
+    return env == nullptr || env[0] != '0';
+  }();
+  static stereo::SceneClock clock;
+  weight = !retained.continuous ? 1.0f
+           : sceneClock         ? clock.weight(input.displayTimeNanos, retained.boundary, retained.interval)
+                                : stereo::interpolation_weight(input.displayTimeNanos, retained.boundary, retained.interval);
   auto replay = make_stereo_replay_frame(input, retained.anchor);
   if (retained.continuous && retained.anchor.active && retained.previousAnchor.active) {
     replay.interpolateInAnchor = true;
@@ -2045,7 +2053,7 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
         stereo_overlay::composite_flat(encoder,output.view,output.size,eye);
       }
     }
-    const auto sink=run_stereo_sink(encoder,input->frameToken,g_retainedStereo.logicalFrame,input->mode,true);
+    const auto sink=run_stereo_sink(encoder,input->frameToken,g_retainedStereo.logicalFrame,input->mode,true,input->displayTimeNanos);
     const auto buffer=encoder.Finish();std::lock_guard submitLock(g_queueSubmitMutex);
     g_queue.Submit(1,&buffer);
     if(sink && sink->submitted) sink->submitted(sink->frame,sink->userdata);
@@ -2054,6 +2062,20 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
   if(input->mode != AURORA_STEREO_FRAME_IMMERSIVE_REPLAY || !gfx::has_late_stereo_replay(sealedFrame)) return;
   float weight;
   auto replay = interpolated_stereo_frame(*input, weight);
+  {
+    // How the eye sets sample the game: weight 0 shows the previous game frame, 1 the current one,
+    // between interpolates. Display times too far ahead of the game's frame boundary give 1 every
+    // time (each game frame shown twice at 120 Hz).
+    static std::array<uint32_t, 4> bins{};
+    static auto binsStart = std::chrono::steady_clock::now();
+    ++bins[!g_retainedStereo.continuous ? 3 : weight <= 0.f ? 0 : weight >= 1.f ? 2 : 1];
+    if (const auto now = std::chrono::steady_clock::now(); now - binsStart >= std::chrono::seconds(10)) {
+      Log.info("VR interpolation weights (10 s): 0: {}, between: {}, 1: {}, no previous frame: {}", bins[0], bins[1],
+               bins[2], bins[3]);
+      bins = {};
+      binsStart = now;
+    }
+  }
   auto encoder = g_device.CreateCommandEncoder();
   if (!gfx::prepare_late_stereo_replay(sealedFrame, encoder, replay, weight))
     return;
@@ -2063,7 +2085,8 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
     stereo_overlay::composite_immersive(encoder, g_stereoEyeTargets[eye].output().view, replay.eyes[eye].projection,
                                         replay.eyes[eye].viewFromCenter, eye);
   }
-  const auto sink = run_stereo_sink(encoder, input->frameToken, g_retainedStereo.logicalFrame, input->mode, true);
+  const auto sink = run_stereo_sink(encoder, input->frameToken, g_retainedStereo.logicalFrame, input->mode, true,
+                                    input->displayTimeNanos);
   const auto buffer = encoder.Finish();
   std::lock_guard submitLock(g_queueSubmitMutex);
   g_queue.Submit(1, &buffer);
@@ -2372,7 +2395,8 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     }
   }
   if (stereoOutput) {
-    pendingStereoSink = run_stereo_sink(encoder, ctx.stereoFrameToken, ctx.logicalFrame, ctx.stereoFrameMode);
+    pendingStereoSink = run_stereo_sink(encoder, ctx.stereoFrameToken, ctx.logicalFrame, ctx.stereoFrameMode, false,
+                                        ctx.stereoInput ? ctx.stereoInput->displayTimeNanos : 0);
   }
   auto pendingFrameCapture = encode_frame_capture(encoder, ctx.presentSource);
   presentationJobs.push_back({

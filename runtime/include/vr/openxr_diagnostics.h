@@ -381,6 +381,13 @@ void OnSetGpu(double ms);
 // The last set's consumed, submitted and GPU-complete times (steady ns; 0 unknown), for
 // KARTFRAME_PACING_DEBUG.
 void LastSetTimes(int64_t& consumed_ns, int64_t& submitted_ns, int64_t& complete_ns);
+// Pacing thread, every compositor cycle: the predicted display time's step from the last
+// cycle's minus one period (0 for the first or after lost refreshes), and how far ahead of now
+// it lies (steady ns). Every set shown: its locate time minus the cycle's predicted time.
+// Every 10 s a line "vr display times (10 s): ..." sums them up (SteamVR's prediction is
+// not always exactly one period after the last; a pipelined set is located for that guess).
+void OnCycleTimes(int64_t step_error_ns, int64_t lead_ns);
+void OnSetShown(int64_t locate_minus_cycle_ns);
 // Pacing thread: writes the line once a second has passed since the last one.
 void Flush();
 // Writes the session's totals line (and resets nothing).

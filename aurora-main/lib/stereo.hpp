@@ -23,6 +23,8 @@ struct SinkFrame {
   // Rendered from the retained game frame (interpolation, projected menu), not a new one.
   bool retained = false;
   std::array<EyeImage, AURORA_STEREO_EYE_COUNT> eyes{};
+  // The packet's display time (steady clock ns): the time its eye poses were located for.
+  uint64_t displayTimeNanos = 0;
 };
 
 // Runs synchronously on the frame worker after both eye replays have been

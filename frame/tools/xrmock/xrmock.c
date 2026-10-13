@@ -45,6 +45,22 @@
 //                             <dir>/t<seconds>-sc<id>-<n>.ppm: at the seconds in
 //                             MOCK_XR_DUMP_AT=<s>,<s>... (default every 10 s), the next
 //                             MOCK_XR_DUMP_FRAMES=<n> (1) releases of every swapchain
+//   MOCK_XR_STAMP=1           Vulkan, with KARTFRAME_FRAME_STAMP=1 in the app: every eye image a
+//                             projection layer submits carries the display time its poses were
+//                             located for (a block in its corner); compared with the locate the
+//                             layer's poses came from (summary line "stamps")
+//   MOCK_XR_PREDICT_JITTER=<ms>  predictedDisplayTime is off its refresh by up to +-<ms> (uniform,
+//                             at most 3), as SteamVR's prediction is not always exactly one period
+//                             after the last
+//   MOCK_XR_FOV=<l>,<r>,<u>,<d>  the left eye's field of view in degrees (the right eye mirrors it);
+//                             default an asymmetric one like the Frame's (-52,44,48,-52), "sym"
+//                             the old symmetric +-48.1
+//   MOCK_XR_HANDS=1           controllers held in front of the player (left and right action
+//                             spaces at chest height, pointing ahead), instead of all at the head
+//   MOCK_XR_PRESS=<path>@<start s>/<every s>[;...]  scripted presses for the current profile
+//                             (MOCK_XR_PROFILE): the action bound to <path> (e.g.
+//                             /user/hand/right/input/a/click) is held for 150 ms every <every> s from
+//                             <start> s on; actions of that profile then report isActive
 // The graphics API is chosen by the app's binding (xrmock_gfx.h).
 //
 // Checks (ERROR lines in the trace, and a summary on stderr when the session
@@ -103,6 +119,8 @@ typedef struct {
     int waited;  // of the images acquired, how many were waited for
     int released;  // an image was released since the last xrEndFrame
     int dumpMark, dumped;  // MOCK_XR_DUMP: the dump time this chain is on, images written for it
+    int stampSlot;         // MOCK_XR_STAMP: the last released image's stamp read-back slot, -1 none
+    unsigned stampGen;
 } Chain;
 static Chain gChains[MAXSC];
 static int gErrors = 0;  // ERROR lines in the trace
@@ -124,6 +142,9 @@ static int64_t gNextBlip = 0, gRefocusAt = 0;
 static int gFocused = 0, gBlips = 0, gProfileSent = 0;
 static const char* gProfile = NULL;
 static int64_t gT0 = 0, gPeriod = 8333333, gEndAt = 0;
+static int64_t gJitterNs = 0;  // MOCK_XR_PREDICT_JITTER
+// MOCK_XR_FOV: the left eye's angles in degrees (left, right, up, down); the right eye mirrors it.
+static float gFovDeg[4] = {-52.0f, 44.0f, 48.0f, -52.0f};
 static int gQuitSent = 0;
 
 static void pushState(int s) {
@@ -217,10 +238,18 @@ static XrResult XRAPI_CALL mCreateRefSpace(XrSession s, const XrReferenceSpaceCr
     *out = (XrSpace)(uintptr_t)(100 + gSpaces++);
     return XR_SUCCESS;
 }
+// MOCK_XR_HANDS: which hand each action space belongs to (-1: none).
+static int gSpaceHand[256];
+static int gHands = 0;
+static const char* pathString(XrPath p);
 static XrResult XRAPI_CALL mCreateActionSpace(XrSession s, const XrActionSpaceCreateInfo* ci, XrSpace* out) {
     (void)s;
-    (void)ci;
-    *out = (XrSpace)(uintptr_t)(100 + gSpaces++);
+    int id = gSpaces++;
+    if (id < 256) {
+        const char* sub = pathString(ci->subactionPath);
+        gSpaceHand[id] = !sub ? -1 : strstr(sub, "/left") ? 0 : strstr(sub, "/right") ? 1 : -1;
+    }
+    *out = (XrSpace)(uintptr_t)(100 + id);
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mDestroySpace(XrSpace s) { (void)s; return XR_SUCCESS; }
@@ -245,13 +274,19 @@ static XrResult XRAPI_CALL mEnumRefSpaces(XrSession s, uint32_t cap, uint32_t* c
 }
 static XrResult XRAPI_CALL mDestroyActionSet(XrActionSet a) { (void)a; return XR_SUCCESS; }
 static XrResult XRAPI_CALL mLocateSpace(XrSpace sp, XrSpace base, XrTime t, XrSpaceLocation* loc) {
-    (void)sp;
     (void)base;
     (void)t;
     loc->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
                          XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
     loc->pose.orientation = (XrQuaternionf){0, 0, 0, 1};
     loc->pose.position = (XrVector3f){0, 1.6f, 0};
+    int id = (int)((uintptr_t)sp - 100);
+    if (gHands && id >= 0 && id < 256 && id < gSpaces && gSpaceHand[id] >= 0) {
+        // Held at chest height, pointing ahead and a little up (the right one at the menu screen).
+        const float pitch = 0.08f;
+        loc->pose.orientation = (XrQuaternionf){sinf(pitch * 0.5f), 0, 0, cosf(pitch * 0.5f)};
+        loc->pose.position = (XrVector3f){gSpaceHand[id] ? 0.16f : -0.2f, 1.3f, -0.32f};
+    }
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mEnumViewConfigViews(XrInstance i, XrSystemId s, XrViewConfigurationType t, uint32_t cap, uint32_t* count,
@@ -289,6 +324,7 @@ static XrResult XRAPI_CALL mCreateSwapchain(XrSession s, const XrSwapchainCreate
     c->mips = (int)ci->mipCount;
     c->format = ci->format;
     c->count = 3;
+    c->stampSlot = -1;
     c->images = gGfx->create_images(c->format, ci->usageFlags, c->w, c->h, c->mips, c->count);
     trace("createSwapchain sc%d %dx%d mips=%d format=0x%llx usage=0x%llx", gChainCount, c->w, c->h, c->mips, (long long)c->format,
           (unsigned long long)ci->usageFlags);
@@ -332,10 +368,56 @@ static double gBusyMaxMs = 0.0;
 static int gWaitHist[5];
 static int gPoseAge[6];  // display time minus locate time in refreshes: <0, 0, 1, 2, 3, more
 static int gPoseSets = 0, gPoseSameTime = 0, gPoseEarlier = 0, gPoseLater = 0, gPoseSplit = 0, gPoseUnknown = 0;
-static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh);
+static int checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh);
+static XrTime locateTime(int i);
 // Frames by what they showed: a projection layer whose eye images were both released since
 // the last xrEndFrame (fresh), one shown again (repeat), none.
 static int gEnds = 0, gFreshSets = 0, gFreshSame = 0, gFreshEarlier = 0, gFreshLater = 0, gRepeatSets = 0, gQuadEnds = 0, gEmptyEnds = 0;
+// MOCK_XR_STAMP: eye images of submitted projection layers waiting for their stamp read-back.
+static int gStampOn = 0;
+#define STAMP_PENDING 256
+static struct {
+    int slot, eye, fresh;
+    unsigned gen;
+    XrTime expect;  // the time the layer's poses were located for
+} gStampPending[STAMP_PENDING];
+static int gStampPendingCount = 0;
+static int gStampChecked = 0, gStampMatch = 0, gStampOther = 0, gStampOtherEye = 0, gStampNone = 0, gStampLost = 0, gStampUnknownPose = 0;
+static int gStampOff[5];  // stamp minus locate in refreshes: <=-2, -1, between, +1, >=+2
+static void stampPoll(int wait) {
+    for (int i = 0; i < gStampPendingCount;) {
+        uint64_t value = 0;
+        int eye = 0;
+        int r = gGfx->stamp_read(gStampPending[i].slot, gStampPending[i].gen, wait, &value, &eye);
+        if (r == 0) {
+            i++;
+            continue;
+        }
+        gStampChecked++;
+        if (r == -2) gStampLost++;
+        else if (r < 0) gStampNone++;
+        else {
+            int64_t diff = (int64_t)value - (int64_t)(gStampPending[i].expect - gTimeOffset);
+            int sameTime = diff > -200000 && diff < 200000;
+            if (sameTime && eye == gStampPending[i].eye) gStampMatch++;
+            else if (sameTime) {
+                gStampOtherEye++;
+                trace("ERROR stamp: eye %d image carries the other eye's stamp", gStampPending[i].eye);
+                gErrors++;
+            } else {
+                gStampOther++;
+                double k = (double)diff / (double)gPeriod;
+                long n = lround(k);
+                gStampOff[fabs(k - (double)n) > 0.1 ? 2 : n <= -2 ? 0 : n == -1 ? 1 : n == 1 ? 3 : 4]++;
+                if (gStampOther <= 20)
+                    trace("ERROR stamp: eye %d image rendered for a display time %.2f ms %s the one its submitted poses were located for%s",
+                          gStampPending[i].eye, fabs((double)diff) / 1e6, diff < 0 ? "before" : "after", gStampPending[i].fresh ? "" : " (repeat)");
+                gErrors++;
+            }
+        }
+        gStampPending[i] = gStampPending[--gStampPendingCount];
+    }
+}
 static XrResult XRAPI_CALL mWaitImage(XrSwapchain sc, const XrSwapchainImageWaitInfo* wi) {
     (void)wi;
     Chain* c = chainOf(sc);
@@ -431,6 +513,10 @@ static XrResult XRAPI_CALL mRelease(XrSwapchain sc, const XrSwapchainImageReleas
         }
     }
     maybeDump(c, sc);
+    if (gStampOn && gGfx && gGfx->stamp_capture) {
+        int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
+        c->stampSlot = gGfx->stamp_capture(c->images, idx, c->w, c->h, &c->stampGen);
+    }
     c->acquired--;
     c->waited--;
     c->released = 1;
@@ -470,6 +556,15 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
             "xrmock: frames: %d ended; %d showed newly released eyes (from one locate for the display time submitted %d, for an earlier one %d, "
             "a later one %d), %d repeated a projection layer, %d a quad, %d no layer; focus blips %d\n",
             gEnds, gFreshSets, gFreshSame, gFreshEarlier, gFreshLater, gRepeatSets, gQuadEnds, gEmptyEnds, gBlips);
+    if (gStampOn) {
+        if (gGfx && gGfx->stamp_read) stampPoll(1);
+        fprintf(stderr,
+                "xrmock: stamps: %d eye images of projection layers checked: %d rendered for the locate of their submitted poses, %d for "
+                "another (refreshes <=-2: %d, -1: %d, between: %d, +1: %d, >=+2: %d), %d with the other eye's stamp, %d without a stamp, %d "
+                "not read back, %d layers with poses from no locate\n",
+                gStampChecked, gStampMatch, gStampOther, gStampOff[0], gStampOff[1], gStampOff[2], gStampOff[3], gStampOff[4], gStampOtherEye,
+                gStampNone, gStampLost, gStampUnknownPose);
+    }
     if (gReleases) {
         fprintf(stderr, "xrmock: queue drain time at the releases: <0.5 ms %d, 0.5-1 %d, 1-2 %d, 2-4 %d, >4 %d\n", gWaitHist[0], gWaitHist[1], gWaitHist[2],
                 gWaitHist[3], gWaitHist[4]);
@@ -545,6 +640,13 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
         nanosleep(&ts, NULL);
     }
     fs->predictedDisplayTime = wake + 2 * gPeriod + gTimeOffset;
+    if (gJitterNs > 0) {
+        // Deterministic: the same sequence every run.
+        static uint64_t lcg = 0x2545F4914F6CDD1Dull;
+        lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+        double u = (double)(lcg >> 11) / 9007199254740992.0;  // [0, 1)
+        fs->predictedDisplayTime += (int64_t)((2.0 * u - 1.0) * (double)gJitterNs);
+    }
     fs->predictedDisplayPeriod = gPeriod;
     fs->shouldRender = XR_TRUE;
     gWaits++;
@@ -554,6 +656,7 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
     }
     gFrame++;
     trace("waitFrame");
+    if (gStampOn && gGfx && gGfx->stamp_read) stampPoll(0);
     if (gGfx && gGfx->poll_snapshots) {
         int changed = gGfx->poll_snapshots(0);
         for (int k = 0; k < changed; k++) {
@@ -584,7 +687,23 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
                 if (fresh) gFreshSets++;
                 else gRepeatSets++;
             }
-            checkPoses(p, ei->displayTime, fresh);
+            int located = checkPoses(p, ei->displayTime, fresh);
+            if (gStampOn && gGfx && gGfx->stamp_read && p->viewCount == 2) {
+                for (int v = 0; v < 2; v++) {
+                    Chain* ch = chainOf(p->views[v].subImage.swapchain);
+                    if (located < 0) gStampUnknownPose++;
+                    else if (ch->stampSlot < 0) gStampNone++;
+                    else if (gStampPendingCount < STAMP_PENDING) {
+                        gStampPending[gStampPendingCount].slot = ch->stampSlot;
+                        gStampPending[gStampPendingCount].gen = ch->stampGen;
+                        gStampPending[gStampPendingCount].eye = v;
+                        gStampPending[gStampPendingCount].fresh = fresh;
+                        gStampPending[gStampPendingCount].expect = locateTime(located);
+                        gStampPendingCount++;
+                    } else
+                        gStampLost++;
+                }
+            }
             snprintf(t, sizeof(t), " proj[flags=%llx", (unsigned long long)p->layerFlags);
             strcat(buf, t);
             for (uint32_t v = 0; v < p->viewCount; v++) {
@@ -607,6 +726,14 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
         }
     }
     trace("endFrame layers=%u%s", ei->layerCount, buf);
+    // Display times increase from one xrEndFrame to the next (the app keeps them so; a runtime may
+    // take an older one for a frame it already showed).
+    static XrTime lastDisplay = 0;
+    if (ei->displayTime <= lastDisplay) {
+        trace("ERROR endFrame display time %.3f ms not after the previous one", (double)(ei->displayTime - lastDisplay) / 1e6);
+        gErrors++;
+    }
+    lastDisplay = ei->displayTime;
     gEnds++;
     if (ei->layerCount == 0) gEmptyEnds++;
     else if (ei->layers[0]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) gQuadEnds++;
@@ -633,7 +760,10 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
         float x = e ? 0.032f : -0.032f;
         v[e].pose.orientation = (XrQuaternionf){0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)};
         v[e].pose.position = (XrVector3f){x * c, 1.6f, -x * sn};
-        v[e].fov = (XrFovf){-0.84f, 0.84f, 0.84f, -0.84f};
+        const float rad = 3.14159265f / 180.0f;
+        // The right eye mirrors the left (its outer side is on the right).
+        v[e].fov = e ? (XrFovf){-gFovDeg[1] * rad, -gFovDeg[0] * rad, gFovDeg[2] * rad, gFovDeg[3] * rad}
+                     : (XrFovf){gFovDeg[0] * rad, gFovDeg[1] * rad, gFovDeg[2] * rad, gFovDeg[3] * rad};
         gLocates[gLocateNext].pose[e] = v[e].pose;
     }
     gLocates[gLocateNext].time = li->displayTime;
@@ -641,11 +771,12 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
     return XR_SUCCESS;
 }
 
+static XrTime locateTime(int i) { return gLocates[i].time; }
 static int samePose(const XrPosef* a, const XrPosef* b) { return !memcmp(a, b, sizeof(XrPosef)); }
 
 // Both eyes of a projection layer: from one locate, and for which time.
-static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh) {
-    if (p->viewCount != 2) return;
+static int checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh) {
+    if (p->viewCount != 2) return -1;
     gPoseSets++;
     int left = -1, both = -1;
     for (int i = 0; i < LOCATES; i++) {
@@ -663,7 +794,7 @@ static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime
         } else {
             gPoseUnknown++;
         }
-        return;
+        return -1;
     }
     XrTime t = gLocates[both].time;
     if (t == displayTime) gPoseSameTime++;
@@ -676,6 +807,7 @@ static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime
     }
     long k = lround((double)(displayTime - t) / (double)gPeriod);
     gPoseAge[k < 0 ? 0 : k > 3 ? 5 : k + 1]++;
+    return both;
 }
 static XrResult XRAPI_CALL mStringToPath(XrInstance i, const char* s, XrPath* p) {
     (void)i;
@@ -713,15 +845,55 @@ static XrResult XRAPI_CALL mCreateAction(XrActionSet s, const XrActionCreateInfo
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mPathToString(XrInstance i, XrPath p, uint32_t cap, uint32_t* len, char* buf);
+// The current profile's suggested bindings, and MOCK_XR_PRESS's scripted presses.
+static struct {
+    XrAction action;
+    char path[128];
+} gBindings[128];
+static int gBindingCount = 0;
+static struct {
+    char path[128];
+    double start, every;
+} gPresses[16];
+static int gPressCount = 0;
+static const char* pathString(XrPath p) {
+    for (int k = 0; k < gPathCount; k++)
+        if (gPaths[k] == p) return gPathStr[k];
+    return NULL;
+}
+// Whether the action, for the hand of `sub` (0: either), is held by a scripted press now.
+static int pressed(XrAction action, XrPath sub, int* active) {
+    *active = gPressCount > 0 && gProfileSent;
+    if (!*active || !gT0) return 0;
+    const char* hand = sub ? pathString(sub) : NULL;
+    double t = (double)(nowNs() - gT0) / 1e9;
+    for (int b = 0; b < gBindingCount; b++) {
+        if (gBindings[b].action != action || (hand && strncmp(gBindings[b].path, hand, strlen(hand)) != 0)) continue;
+        for (int k = 0; k < gPressCount; k++) {
+            if (strcmp(gPresses[k].path, gBindings[b].path) != 0 || t < gPresses[k].start) continue;
+            double phase = fmod(t - gPresses[k].start, gPresses[k].every);
+            if (phase < 0.15) return 1;
+        }
+    }
+    return 0;
+}
 static XrResult XRAPI_CALL mSuggest(XrInstance i, const XrInteractionProfileSuggestedBinding* b) {
     (void)i;
     char profile[128] = "";
     uint32_t len = 0;
     if (gProfile && mPathToString(i, b->interactionProfile, sizeof(profile), &len, profile) == XR_SUCCESS && !strcmp(profile, gProfile)) {
         trace("suggestBindings %s: %u bindings accepted", profile, b->countSuggestedBindings);
+        gBindingCount = 0;
         for (uint32_t k = 0; k < b->countSuggestedBindings; k++) {
             char path[128] = "";
-            if (mPathToString(i, b->suggestedBindings[k].binding, sizeof(path), &len, path) == XR_SUCCESS) trace("  binding %s", path);
+            if (mPathToString(i, b->suggestedBindings[k].binding, sizeof(path), &len, path) == XR_SUCCESS) {
+                trace("  binding %s", path);
+                if (gBindingCount < 128) {
+                    gBindings[gBindingCount].action = b->suggestedBindings[k].action;
+                    strncpy(gBindings[gBindingCount].path, path, sizeof(gBindings[0].path) - 1);
+                    gBindingCount++;
+                }
+            }
         }
     }
     return XR_SUCCESS;
@@ -738,22 +910,25 @@ static XrResult XRAPI_CALL mSync(XrSession s, const XrActionsSyncInfo* a) {
 }
 static XrResult XRAPI_CALL mGetBool(XrSession s, const XrActionStateGetInfo* g, XrActionStateBoolean* o) {
     (void)s;
-    (void)g;
-    o->isActive = XR_FALSE;
-    o->currentState = XR_FALSE;
+    int active = 0;
+    o->currentState = pressed(g->action, g->subactionPath, &active) ? XR_TRUE : XR_FALSE;
+    o->isActive = active ? XR_TRUE : XR_FALSE;
+    o->changedSinceLastSync = XR_FALSE;
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mGetFloat(XrSession s, const XrActionStateGetInfo* g, XrActionStateFloat* o) {
     (void)s;
-    (void)g;
-    o->isActive = XR_FALSE;
-    o->currentState = 0;
+    int active = 0;
+    o->currentState = pressed(g->action, g->subactionPath, &active) ? 1.0f : 0.0f;
+    o->isActive = active ? XR_TRUE : XR_FALSE;
+    o->changedSinceLastSync = XR_FALSE;
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mGetVec2(XrSession s, const XrActionStateGetInfo* g, XrActionStateVector2f* o) {
     (void)s;
-    (void)g;
-    o->isActive = XR_FALSE;
+    int active = 0;
+    pressed(g->action, g->subactionPath, &active);
+    o->isActive = active ? XR_TRUE : XR_FALSE;
     o->currentState.x = o->currentState.y = 0;
     return XR_SUCCESS;
 }
@@ -871,6 +1046,35 @@ static void init(void) {
     }
     gProfile = getenv("MOCK_XR_PROFILE");
     if (gProfile && !*gProfile) gProfile = NULL;
+    gStampOn = getenv("MOCK_XR_STAMP") != NULL;
+    gHands = getenv("MOCK_XR_HANDS") != NULL;
+    const char* presses = getenv("MOCK_XR_PRESS");
+    if (presses) {
+        char* copy = strdup(presses);
+        for (char* tok = strtok(copy, ";"); tok && gPressCount < 16; tok = strtok(NULL, ";")) {
+            char* at = strchr(tok, '@');
+            if (!at) continue;
+            *at = 0;
+            strncpy(gPresses[gPressCount].path, tok, sizeof(gPresses[0].path) - 1);
+            gPresses[gPressCount].start = atof(at + 1);
+            const char* every = strchr(at + 1, '/');
+            gPresses[gPressCount].every = every ? atof(every + 1) : 1.0;
+            if (gPresses[gPressCount].every < 0.3) gPresses[gPressCount].every = 0.3;
+            gPressCount++;
+        }
+        free(copy);
+    }
+    const char* jitter = getenv("MOCK_XR_PREDICT_JITTER");
+    if (jitter) {
+        double ms = atof(jitter);
+        gJitterNs = (int64_t)((ms < 0 ? 0 : ms > 3 ? 3 : ms) * 1e6);
+    }
+    const char* fov = getenv("MOCK_XR_FOV");
+    if (fov && !strcmp(fov, "sym")) {
+        gFovDeg[0] = -48.13f, gFovDeg[1] = 48.13f, gFovDeg[2] = 48.13f, gFovDeg[3] = -48.13f;
+    } else if (fov) {
+        sscanf(fov, "%f,%f,%f,%f", &gFovDeg[0], &gFovDeg[1], &gFovDeg[2], &gFovDeg[3]);
+    }
     const char* list = getenv("MOCK_XR_EXTENSIONS");
     if (list) {
         char* copy = strdup(list);

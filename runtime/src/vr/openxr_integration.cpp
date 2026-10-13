@@ -1251,6 +1251,19 @@ private:
         if (diagnostics::Enabled()) {
             NoteFrameDiagnostics(set, immersive);
         }
+        if (set.xr_frame.views_valid && !fov_logged_) {
+            fov_logged_ = true;
+            constexpr double kDeg = 57.29577951308232;
+            std::ostringstream fov;
+            fov.setf(std::ios::fixed);
+            fov.precision(2);
+            for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+                const auto& f = set.xr_frame.views[eye].fov;
+                fov << (eye ? "; right " : "left ") << f.angleLeft * kDeg << ' ' << f.angleRight * kDeg << ' '
+                    << f.angleUp * kDeg << ' ' << f.angleDown * kDeg;
+            }
+            RT_LOG(RT_TAG_RUNTIME) << "OpenXR eye fields of view (deg, left right up down): " << fov.str() << std::endl;
+        }
         // All of these read this set's located head pose.
         ServiceRecenterRequest();
         ApplyPendingReferenceSpaceChange(set.xr_frame);
@@ -1300,10 +1313,18 @@ private:
         UpdateFrameTiming(cycle);
         const XrDuration period = cycle.predicted_display_period > 0 ? cycle.predicted_display_period : 8'333'333;
         uint32_t missed = 0;
+        int64_t step_error = 0;
         if (st.last_display_time != 0 && cycle.predicted_display_time > st.last_display_time) {
             const double steps = static_cast<double>(cycle.predicted_display_time - st.last_display_time) /
                                  static_cast<double>(period);
             if (steps > 1.5) missed = static_cast<uint32_t>(std::lround(steps)) - 1;
+            else step_error = cycle.predicted_display_time - st.last_display_time - period;
+        }
+        {
+            const uint64_t display_ns = DisplayTimeNanos(cycle.predicted_display_time);
+            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            pacing::OnCycleTimes(step_error, display_ns != 0 ? static_cast<int64_t>(display_ns) - now_ns : 0);
         }
         st.last_display_time = cycle.predicted_display_time;
         pacing::OnTick(headset_hz_.load(std::memory_order_relaxed), missed);
@@ -1323,6 +1344,7 @@ private:
                 return backend_->WaitForSubmissionUntil(st.set, deadline);
             });
             if (status == OpenXRSubmissionStatus::Success) {
+                pacing::OnSetShown(st.set.xr_frame.predicted_display_time - cycle.predicted_display_time);
                 if (!backend_->EndCycleWithSet(st.set)) {
                     SetError(backend_->LastError());
                     return CycleResult::Fatal;
@@ -2396,6 +2418,7 @@ private:
     SetPacingState set_pacing_;
     std::chrono::steady_clock::time_point last_focused_{};
     PacingMode pacing_mode_ = PacingMode::Pipelined;
+    bool fov_logged_ = false;
     HalfRatePolicy half_rate_policy_ = HalfRatePolicy::Auto;
     int pacing_debug_ = std::getenv("KARTFRAME_PACING_DEBUG") ? 60 : 0;
     std::string pacing_mode_source_ = "auto";

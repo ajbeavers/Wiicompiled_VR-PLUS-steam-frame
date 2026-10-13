@@ -22,12 +22,72 @@ int AuroraDawnVulkanDrain(void* handle);
 #endif
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <vector>
 namespace aurora::vulkan_win32 {
 namespace {
 Module Log("aurora::vulkan_win32");
+// KARTFRAME_FRAME_STAMP=1 (tests only): each eye image gets a 256x12 pixel block in its top left
+// corner naming the display time its poses were located for and the eye, written after the eye
+// copy. The mock runtime (MOCK_XR_STAMP) reads it back from the image a projection layer submits
+// and compares it with the locate the layer's poses came from. Layout, 4x4 pixel cells, white = 1:
+// row 0 the 64 bits of the display time (steady clock ns, bit 0 first), row 1 their complement,
+// row 2: cell 0 the eye (1 = right), cell 1 its complement, cells 2-5 the marker 1 0 1 0.
+constexpr uint32_t kStampCell = 4;
+bool StampEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("KARTFRAME_FRAME_STAMP");
+    return env != nullptr && env[0] == '1';
+  }();
+  return enabled;
+}
+// A 2x1 cell texture: black, then white.
+wgpu::Texture StampPalette(wgpu::TextureFormat format) {
+  static wgpu::Texture palette;
+  static wgpu::TextureFormat paletteFormat = wgpu::TextureFormat::Undefined;
+  if (palette && paletteFormat == format) return palette;
+  const wgpu::Extent3D size{2 * kStampCell, kStampCell, 1};
+  const wgpu::TextureDescriptor descriptor{.label = "Frame stamp palette",
+                                           .usage = wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst,
+                                           .dimension = wgpu::TextureDimension::e2D,
+                                           .size = size,
+                                           .format = format,
+                                           .mipLevelCount = 1,
+                                           .sampleCount = 1};
+  palette = webgpu::g_device.CreateTexture(&descriptor);
+  paletteFormat = format;
+  std::array<uint8_t, 2 * kStampCell * kStampCell * 4> pixels{};
+  for (uint32_t y = 0; y < kStampCell; ++y)
+    for (uint32_t x = 0; x < 2 * kStampCell; ++x)
+      for (uint32_t c = 0; c < 4; ++c) pixels[(y * 2 * kStampCell + x) * 4 + c] = x >= kStampCell || c == 3 ? 255 : 0;
+  const wgpu::TexelCopyTextureInfo destination{.texture = palette};
+  const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = 2 * kStampCell * 4, .rowsPerImage = kStampCell};
+  webgpu::g_queue.WriteTexture(&destination, pixels.data(), pixels.size(), &layout, &size);
+  return palette;
+}
+void WriteStamp(wgpu::CommandEncoder& encoder, const wgpu::Texture& target, wgpu::TextureFormat format, uint64_t value,
+                uint32_t eye) {
+  const auto palette = StampPalette(format);
+  const auto cell = [&](uint32_t column, uint32_t row, bool one) {
+    wgpu::TexelCopyTextureInfo source, destination;
+    source.texture = palette;
+    source.origin = {one ? kStampCell : 0u, 0, 0};
+    destination.texture = target;
+    destination.origin = {column * kStampCell, row * kStampCell, 0};
+    const wgpu::Extent3D size{kStampCell, kStampCell, 1};
+    encoder.CopyTextureToTexture(&source, &destination, &size);
+  };
+  for (uint32_t bit = 0; bit < 64; ++bit) {
+    const bool one = ((value >> bit) & 1u) != 0;
+    cell(bit, 0, one);
+    cell(bit, 1, !one);
+  }
+  cell(0, 2, eye == 1);
+  cell(1, 2, eye != 1);
+  for (uint32_t k = 0; k < 4; ++k) cell(2 + k, 2, (k & 1u) == 0);
+}
 // Set on the frame worker around the submitted callback (see aurora_vulkan_win32_submitting_retained).
 thread_local bool submittingRetained = false;
 struct Api {
@@ -162,6 +222,9 @@ public:
       destination.texture = active[i];
       wgpu::Extent3D size{targets[i].width, targets[i].height, 1};
       encoder.CopyTextureToTexture(&source, &destination, &size);
+      if (StampEnabled() && i < count && count == 2 && targets[i].width >= 64 * kStampCell &&
+          targets[i].height >= 3 * kStampCell)
+        WriteStamp(encoder, active[i], sources[i].format, frame.displayTimeNanos, i);
     }
     encoded = true;
     return true;

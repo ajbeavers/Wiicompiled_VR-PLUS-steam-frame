@@ -26,6 +26,7 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -872,6 +873,8 @@ public:
         }
         OpenXRBackendFrame frame = set;
         frame.xr_frame.serial = active_frame_.serial;
+        // The layer is ended with the display time its poses were located for (EndFrameWithPanel).
+        next_layer_locate_time_ = set.xr_frame.predicted_display_time;
         frame.xr_frame.predicted_display_time = active_frame_.predicted_display_time;
         frame.xr_frame.predicted_display_period = active_frame_.predicted_display_period;
         frame.xr_frame.should_render = active_frame_.should_render;
@@ -1056,10 +1059,12 @@ public:
             }
             retained_panel_valid_ = frame.presentation.panel.requested;
             retained_frame_ = frame;
+            retained_locate_time_ = next_layer_locate_time_;
             retained_session_serial_ = render_session_serial_;
             retained_space_serial_ = render_space_serial_;
             have_retained_frame_ = true;
         }
+        next_layer_locate_time_ = 0;
         const bool end_ok = EndRetainedFrame(can_submit);
 
         frame_active_ = false;
@@ -1125,6 +1130,7 @@ public:
         if (!have_retained_frame_ || !active_frame_.should_render) {
             diagnostics::OnEmptyFrame(!active_frame_.should_render ? diagnostics::EmptyFrameReason::ShouldRenderOff
                                                                     : diagnostics::EmptyFrameReason::NoRetainedLayer);
+            last_end_display_time_ = std::max(last_end_display_time_, active_frame_.predicted_display_time);
             return runtime_->EndFrameWithoutLayers(active_frame_);
         }
         diagnostics::OnLayer(fresh);
@@ -1194,6 +1200,25 @@ public:
             panel_quad = OpenXRPanelQuadLayer(panel, runtime_->AppSpace(), retained_panel_swapchain_.handle);
             layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel_quad);
         }
+        // A set's layer goes out with the display time its poses were located for, also when it is
+        // repeated or shown a refresh late: the poses and that time belong together, whatever
+        // this cycle's prediction says (SteamVR's is not always one period after the last).
+        // OpenXR allows any display time; the compositor reprojects. KARTFRAME_END_TIME=cycle:
+        // this cycle's predicted time instead (the behaviour before lane G).
+        static const bool end_at_cycle = [] {
+            const char* env = std::getenv("KARTFRAME_END_TIME");
+            return env != nullptr && std::string_view(env) == "cycle";
+        }();
+        // Display times stay increasing from one xrEndFrame to the next: a layer shown again (or a
+        // late set whose time an earlier frame already used) goes out at this cycle's time.
+        if (!end_at_cycle && retained_locate_time_ != 0 && retained_locate_time_ > last_end_display_time_ &&
+            retained_locate_time_ != active_frame_.predicted_display_time) {
+            OpenXRFrame located = active_frame_;
+            located.predicted_display_time = retained_locate_time_;
+            last_end_display_time_ = retained_locate_time_;
+            return runtime_->EndFrame(located, layers, count);
+        }
+        last_end_display_time_ = std::max(last_end_display_time_, active_frame_.predicted_display_time);
         return runtime_->EndFrame(active_frame_, layers, count);
     }
 
@@ -1478,6 +1503,7 @@ private:
         DestroySwapchainPair(retained_swapchains_);
         have_retained_frame_ = false;
         retained_frame_ = {};
+        retained_locate_time_ = 0;
         swapchain_format_ = VK_FORMAT_UNDEFINED;
     }
 
@@ -1585,6 +1611,11 @@ private:
     uint64_t retained_session_serial_ = 0;
     uint64_t retained_space_serial_ = 0;
     bool have_retained_frame_ = false;
+    // The display time the retained layer's poses were located for (0: unknown, the cycle's is
+    // used), and the one the layer being finished brings.
+    XrTime retained_locate_time_ = 0;
+    XrTime next_layer_locate_time_ = 0;
+    XrTime last_end_display_time_ = 0;  // the display time of the last xrEndFrame
     VkFormat aurora_format_ = VK_FORMAT_UNDEFINED;
     VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
     std::string last_error_;

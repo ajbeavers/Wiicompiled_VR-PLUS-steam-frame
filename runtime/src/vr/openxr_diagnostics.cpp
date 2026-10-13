@@ -627,6 +627,11 @@ struct State {
     Window total;  // gpu/encode samples are kept for the totals' percentiles
     std::atomic_int64_t consumed_ns{0};
     int64_t last_consumed = 0, last_submitted = 0, last_complete = 0;
+    // OnCycleTimes / OnSetShown, summed up every 10 s.
+    int64_t times_start_ns = 0;
+    std::vector<float> step_error_ms, lead_ms;
+    uint32_t shown = 0, shown_other = 0;
+    float shown_min_ms = 0.0f, shown_max_ms = 0.0f;
 };
 State& S() {
     static State state;
@@ -686,6 +691,10 @@ void Reset() {
         s.session_start_ns = s.window_start_ns = diagnostics::detail::NowNs();
         s.window.Clear();
         s.total.Clear();
+        s.times_start_ns = 0;
+        s.step_error_ms.clear();
+        s.lead_ms.clear();
+        s.shown = s.shown_other = 0;
         sink = s.sink;
         // t=0 of the "vr pacing:" lines on the steady clock (CLOCK_MONOTONIC), so other logs can be
         // lined up with them (aurora's "hitch:" lines carry mono=).
@@ -741,28 +750,74 @@ void LastSetTimes(int64_t& consumed_ns, int64_t& submitted_ns, int64_t& complete
     submitted_ns = S().last_submitted;
     complete_ns = S().last_complete;
 }
+void OnCycleTimes(int64_t step_error_ns, int64_t lead_ns) {
+    auto& s = S();
+    std::lock_guard lock(s.mutex);
+    if (s.step_error_ms.size() < 4096) s.step_error_ms.push_back(static_cast<float>(static_cast<double>(step_error_ns) / 1e6));
+    if (s.lead_ms.size() < 4096) s.lead_ms.push_back(static_cast<float>(static_cast<double>(lead_ns) / 1e6));
+}
+void OnSetShown(int64_t locate_minus_cycle_ns) {
+    auto& s = S();
+    std::lock_guard lock(s.mutex);
+    ++s.shown;
+    if (locate_minus_cycle_ns == 0) return;
+    const float ms = static_cast<float>(static_cast<double>(locate_minus_cycle_ns) / 1e6);
+    if (s.shown_other++ == 0) s.shown_min_ms = s.shown_max_ms = ms;
+    s.shown_min_ms = std::min(s.shown_min_ms, ms);
+    s.shown_max_ms = std::max(s.shown_max_ms, ms);
+}
+namespace {
+// The 10 s display-time line, or empty (call with the mutex held).
+std::string DisplayTimesLine(State& s, int64_t now) {
+    if (s.times_start_ns == 0) s.times_start_ns = now;
+    if (now - s.times_start_ns < 10'000'000'000 || s.lead_ms.empty()) return {};
+    const auto range = [](std::vector<float>& v, char* out, size_t cap) {
+        const auto [lo, hi] = std::minmax_element(v.begin(), v.end());
+        const double low = *lo, high = *hi;  // before Percentile reorders the values
+        std::snprintf(out, cap, "%.3f/%.3f/%.3f", static_cast<double>(Percentile(v, 0.5)), low, high);
+    };
+    char step[64] = "-", lead[64] = "-", line[384];
+    if (!s.step_error_ms.empty()) range(s.step_error_ms, step, sizeof(step));
+    range(s.lead_ms, lead, sizeof(lead));
+    std::snprintf(line, sizeof(line),
+                  "vr display times (10 s): predicted step minus period ms p50/min/max=%s, display lead ms "
+                  "p50/min/max=%s, sets shown %u, located for another time than their cycle's %u (ms %.3f..%.3f)",
+                  step, lead, s.shown, s.shown_other, static_cast<double>(s.shown_min_ms),
+                  static_cast<double>(s.shown_max_ms));
+    s.step_error_ms.clear();
+    s.lead_ms.clear();
+    s.shown = s.shown_other = 0;
+    s.shown_min_ms = s.shown_max_ms = 0.0f;
+    s.times_start_ns = now;
+    return line;
+}
+} // namespace
 void Flush() {
     auto& s = S();
-    std::string line;
+    std::string line, times;
     std::function<void(std::string_view)> sink;
     {
         std::lock_guard lock(s.mutex);
         const int64_t now = diagnostics::detail::NowNs();
-        if (s.window_start_ns == 0) s.session_start_ns = s.window_start_ns = now;
-        if (now - s.window_start_ns < 1'000'000'000) return;
-        auto& w = s.window;
-        auto& t = s.total;
-        t.ticks += w.ticks; t.rendered += w.rendered; t.interpolated += w.interpolated;
-        t.late += w.late; t.missed += w.missed; t.repeats += w.repeats;
-        t.gpu.insert(t.gpu.end(), w.gpu.begin(), w.gpu.end());
-        t.encode.insert(t.encode.end(), w.encode.begin(), w.encode.end());
-        line = Format("vr pacing:", static_cast<double>(now - s.session_start_ns) / 1.0e9, s.hz, s.mode, w);
-        WriteSamples(static_cast<double>(now - s.session_start_ns) / 1.0e9, w);
-        w.Clear();
-        s.window_start_ns = now;
+        times = DisplayTimesLine(s, now);
         sink = s.sink;
+        if (s.window_start_ns == 0) s.session_start_ns = s.window_start_ns = now;
+        if (now - s.window_start_ns >= 1'000'000'000) {
+            auto& w = s.window;
+            auto& t = s.total;
+            t.ticks += w.ticks; t.rendered += w.rendered; t.interpolated += w.interpolated;
+            t.late += w.late; t.missed += w.missed; t.repeats += w.repeats;
+            t.gpu.insert(t.gpu.end(), w.gpu.begin(), w.gpu.end());
+            t.encode.insert(t.encode.end(), w.encode.begin(), w.encode.end());
+            line = Format("vr pacing:", static_cast<double>(now - s.session_start_ns) / 1.0e9, s.hz, s.mode, w);
+            WriteSamples(static_cast<double>(now - s.session_start_ns) / 1.0e9, w);
+            w.Clear();
+            s.window_start_ns = now;
+        }
     }
-    if (sink) sink(line);
+    if (!sink) return;
+    if (!times.empty()) sink(times);
+    if (!line.empty()) sink(line);
 }
 void Totals() {
     auto& s = S();

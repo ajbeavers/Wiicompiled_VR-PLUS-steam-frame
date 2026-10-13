@@ -4,7 +4,8 @@
 #   frame/tools/mockrun.sh [--flat] [--seconds N] [--game DIR] [--exe PATH]
 #
 # Needs Xvfb (a virtual X server; nothing is shown anywhere). --flat runs without the mock: VR off, desktop renderer (title screen check).
-# Environment: MOCK_XR_* settings of xrmock (MOCK_XR_SECONDS, MOCK_XR_HZ, MOCK_XR_TRACE, ...),
+# Environment: MOCK_XR_* settings of xrmock (MOCK_XR_SECONDS, MOCK_XR_HZ, MOCK_XR_TRACE, ...; MOCK_XR_STAMP
+# also sets the game's KARTFRAME_FRAME_STAMP=1, MOCK_XR_PRESS the Frame controller profile),
 # KF_BUILD (build dir, default <repo>/build-linux), KF_MOCKRUN_HOME (scratch user dir, default
 # ~/.cache/kf-mockrun), KF_XRMOCK_DIR (where the mock is built; default one per checkout under
 # ~/.cache/kf-xrmock, rebuilt when its sources change), KF_MOCKRUN_VR (extra lines for the [vr]
@@ -98,6 +99,10 @@ if [ $FLAT = 0 ]; then
   LIBPATH=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["library_path"])' "$XR_RUNTIME_JSON")
   [ -s "$LIBPATH" ] || die "mock runtime library missing or empty: $LIBPATH"
   export MOCK_XR_SECONDS=${MOCK_XR_SECONDS:-$SECONDS_RUN}
+  # The mock's image/pose check needs the game's stamp in each eye image.
+  [ -n "${MOCK_XR_STAMP:-}" ] && export KARTFRAME_FRAME_STAMP=1
+  # Scripted presses act on the Frame controller profile.
+  [ -n "${MOCK_XR_PRESS:-}" ] && export MOCK_XR_PROFILE=${MOCK_XR_PROFILE:-/interaction_profiles/valve/frame_controller}
   export MOCK_XR_TRACE=${MOCK_XR_TRACE:-$OUT/logs/$(basename "$LOG" .log).trace}
 else
   unset XR_RUNTIME_JSON
@@ -114,7 +119,7 @@ WATCH=$!
 wait $PID; RC=$?
 kill $WATCH 2>/dev/null
 echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
-grep -a 'xrmock: summary\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|vr pacing totals' "$LOG" || true
+grep -a 'xrmock: summary\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|xrmock: stamps\|vr pacing totals' "$LOG" || true
 echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
 FATAL=$(grep -a -c 'fatal dialog\|Signal 11' "$LOG")
 echo "mockrun: fatal lines: $FATAL"

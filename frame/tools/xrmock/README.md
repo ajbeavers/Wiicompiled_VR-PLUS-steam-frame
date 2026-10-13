@@ -52,3 +52,21 @@ not CLOCK_MONOTONIC), the recommended eye size of the Frame (1728x1728, `MOCK_XR
 focus blips (`MOCK_XR_FOCUS_BLIP=<ms>[@<s>]`), a current interaction profile
 (`MOCK_XR_PROFILE`), and a second summary line counting frames that showed newly released eyes
 (and for which display time their one locate was made) apart from repeated layers.
+
+Lane G additions:
+
+- `MOCK_XR_STAMP=1` (mockrun also sets the game's `KARTFRAME_FRAME_STAMP=1`): the game writes the
+  display time an eye set was located for and the eye into a 256x12 pixel block of each eye image;
+  the mock copies the block out at every release and, for every projection layer, compares it with
+  the locate the layer's poses came from ("xrmock: stamps" line; a mismatch is an ERROR). This is
+  the exact check that a shown image and the poses submitted with it belong together.
+- `MOCK_XR_PREDICT_JITTER=<ms>`: predictedDisplayTime off its refresh by up to +-ms (deterministic);
+  an app that ends a layer with another display time than its poses were located for shows up as
+  "for an earlier one / a later one" in the summary.
+- Display times must increase from one xrEndFrame to the next (ERROR otherwise).
+- `MOCK_XR_FOV=l,r,u,d` (degrees, left eye; the right mirrors it), default an asymmetric
+  Frame-like -52,44,48,-52; `sym` restores the old symmetric one.
+- `MOCK_XR_HANDS=1`: controllers held in front of the player; `MOCK_XR_PRESS=<path>@<s>/<every s>`
+  (several separated by `;`): scripted presses on the Frame controller profile (mockrun sets
+  MOCK_XR_PROFILE for it), e.g. `/user/hand/right/input/a/click@20/1.5` to walk through menus.
+

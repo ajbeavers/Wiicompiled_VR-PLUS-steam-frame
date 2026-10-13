@@ -60,3 +60,32 @@ TEST(StereoInterpolation, MissingTimingAndStallsDoNotExtrapolate) {
   EXPECT_FLOAT_EQ(interpolation_weight(105, 100, 10), 0.5);
   EXPECT_FLOAT_EQ(interpolation_weight(500, 100, 10), 1);
 }
+
+// A headset set's display time lies one to three refreshes after the newest game frame's boundary;
+// the scene clock must still interpolate (not stick at 1) and advance uniformly.
+TEST(StereoInterpolation, SceneClockInterpolatesAheadOfTheBoundary) {
+  constexpr uint64_t interval = 16'666'667;
+  for (uint64_t hz : {90u, 120u}) {
+    for (uint64_t lead : {16'666'667ull, 25'000'000ull, 33'000'000ull}) {
+      aurora::stereo::SceneClock clock;
+      double previousPosition = 0;
+      uint32_t between = 0, samples = 0;
+      for (uint64_t sample = 1; sample <= 20 * hz; ++sample) {
+        const uint64_t render = 1'000'000'000 + sample * 1'000'000'000 / hz;
+        const uint64_t display = render + lead;
+        // The newest frame at render time: n, sealed in its own interval, due at the next retrace.
+        const uint64_t n = (render - 1'000'000'000) / interval;
+        const uint64_t boundary = 1'000'000'000 + (n + 1) * interval;
+        const float weight = clock.weight(display, boundary, interval);
+        const double position = static_cast<double>(n) - 1.0 + weight;
+        if (sample > 4 * hz) {  // after the mean settled
+          ++samples;
+          between += weight > 0.f && weight < 1.f;
+          EXPECT_NEAR(position - previousPosition, 1'000'000'000.0 / hz / interval, 0.02);
+        }
+        previousPosition = position;
+      }
+      EXPECT_GT(between, samples * 9 / 10) << hz << " Hz, lead " << lead;
+    }
+  }
+}
