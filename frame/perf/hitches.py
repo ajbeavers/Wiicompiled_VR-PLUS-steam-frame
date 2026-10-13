@@ -28,7 +28,7 @@ HITCH = re.compile(r"hitch: mono=([\d.]+) frame_ms=([\d.]+)(?: game_cpu_ms=([\d.
 
 def load(d):
     hitches, races, start = [], [], None
-    t_last, race_open = 0, None
+    t_last, race_open, screens = 0, None, {}
     with open(os.path.join(d, "game.log"), errors="replace") as f:
         for line in f:
             m = re.search(r"vr pacing clock: session start mono=([\d.]+)", line)
@@ -42,12 +42,17 @@ def load(d):
             elif "exited RaceScene" in line and race_open is not None:
                 races.append((race_open, t_last + 1))
                 race_open = None
+            m = re.search(r"presentation=immersive-race, scene=\d+, screens=(\d+)", line)
+            if m and race_open is not None:
+                screens[race_open] = int(m.group(1))
             m = HITCH.search(line)
             if m:
                 v = [float(x) if x is not None else -1.0 for x in m.groups()]
                 hitches.append(dict(zip(("mono", "ms", "cpu", "runq", "begin", "worker", "pnew", "pwait", "pinl", "pinlms", "tex", "texkb", "upkb", "joins"), v)))
     if race_open is not None:
         races.append((race_open, 1e9))
+    # Split-screen demo races (2 and 4 players) are reported apart: the owner races alone.
+    races = [(a, b, screens.get(a, 1)) for a, b in races]
     io = []
     p = os.path.join(d, "io.tsv")
     if os.path.exists(p):
@@ -96,18 +101,22 @@ def main(d, window, limit=60):
         print("no 'vr pacing clock' line; is this a run of a build with lane E's diagnostics?")
         return 1
     groups = {"menus": [], "race": [], "race start (first %ds)" % window: []}
+    for tag in sorted({" %dp" % n for _, _, n in races if n > 1}):
+        groups["race" + tag] = []
+        groups["race start (first %ds)" % window + tag] = []
     rows = []
     for h in hitches:
         t = h["mono"] - start
         part = "menus"
-        for a, b in races:
+        for a, b, n in races:
             if a <= t < b:
-                part = "race start (first %ds)" % window if t - a < window else "race"
+                tag = "" if n <= 1 else " %dp" % n
+                part = ("race start (first %ds)" % window if t - a < window else "race") + tag
         rb, files = io_between(io, h["mono"] - h["ms"] / 1000.0, h["mono"])
         c = cause(h, rb, files)
         groups[part].append((h, c))
         rows.append((t, part, h, c, rb, files))
-    print("races at session seconds: %s" % ", ".join("%d-%s" % (a, "end" if b >= 1e9 else int(b)) for a, b in races))
+    print("races at session seconds: %s" % ", ".join("%d-%s (%dp)" % (a, "end" if b >= 1e9 else int(b), n) for a, b, n in races))
     print()
     print("| part | frames > 20 ms | " + " | ".join("%d-%s ms" % (a, "" if b >= 1e9 else int(b)) for a, b in BUCKETS) +
           " | " + " | ".join(CAUSES) + " |")

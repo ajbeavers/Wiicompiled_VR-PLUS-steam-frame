@@ -26,16 +26,28 @@ def pct(values, p):
     return v[min(len(v) - 1, int(p * (len(v) - 1) + 0.5))]
 
 
+def race_part(in_race, screens):
+    if not in_race:
+        return "menus"
+    return "race" if screens <= 1 else ("race 2p" if screens == 2 else "race 4p")
+
+
 def run(d):
+    # The attract-mode demo alternates 1, 2 and 4 player races (MKW runs 3 and 4 players at 30 fps):
+    # "race" is the 1-player race (the owner's case), "race Np" the split-screen ones.
     parts = {k: {"s": 0, "ticks": 0, "rendered": 0, "late": 0, "missed": 0, "repeats": 0, "gpu": [], "enc": [], "half": 0,
                  "frames": 0, "fsecs": 0.0, "done_ms": 0.0}
-             for k in ("menus", "race")}
+             for k in ("menus", "race", "race 2p", "race 4p")}
+    screens = 1
     second_part = {}
     in_race = False
     totals = mock = None
     half = []
     with open(os.path.join(d, "game.log"), errors="replace") as f:
         for line in f:
+            m = re.search(r"presentation=immersive-race, scene=\d+, screens=(\d+)", line)
+            if m:
+                screens = int(m.group(1))
             if "entered RaceScene" in line or "presentation=immersive-race" in line:
                 in_race = True
             elif "exited RaceScene" in line or "presentation=virtual-screen" in line or "presentation=desktop" in line:
@@ -47,7 +59,7 @@ def run(d):
             m = PACING.search(line)
             if m:
                 t = int(m.group(1))
-                p = parts["race" if in_race else "menus"]
+                p = parts[race_part(in_race, screens)]
                 second_part[t] = p
                 p["s"] += 1
                 for i, k in ((4, "ticks"), (5, "rendered"), (7, "late"), (8, "missed"), (9, "repeats")):
@@ -55,7 +67,7 @@ def run(d):
                 continue
             m = FPS.search(line)
             if m:
-                p = parts["race" if in_race else "menus"]
+                p = parts[race_part(in_race, screens)]
                 p["frames"] += int(m.group(1))
                 p["fsecs"] += float(m.group(2))
                 p["done_ms"] += float(m.group(3)) * int(m.group(1))
@@ -89,7 +101,7 @@ def main(dirs):
     for d in dirs:
         name = os.path.basename(os.path.normpath(d))
         parts, totals, mock, half = run(d)
-        for k in ("menus", "race"):
+        for k in ("menus", "race", "race 2p", "race 4p"):
             p = parts[k]
             if not p["s"]:
                 continue

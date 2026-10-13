@@ -40,6 +40,7 @@
 //                             default none); an INTERACTION_PROFILE_CHANGED
 //                             event follows the first FOCUSED, and suggested
 //                             bindings for it are traced
+//   MOCK_XR_RATES=<hz>,...    refresh rates XR_FB_display_refresh_rate offers (72,90,120)
 //   MOCK_XR_DUMP=<dir>        Vulkan: write released images as PPM files (every 4th pixel)
 //                             <dir>/t<seconds>-sc<id>-<n>.ppm: at the seconds in
 //                             MOCK_XR_DUMP_AT=<s>,<s>... (default every 10 s), the next
@@ -786,12 +787,20 @@ static XrResult XRAPI_CALL mReqRefresh(XrSession s, float hz) {
 }
 static XrResult XRAPI_CALL mEnumRefresh(XrSession s, uint32_t cap, uint32_t* count, float* r) {
     (void)s;
-    *count = 3;
-    if (cap) {
-        r[0] = 72;
-        r[1] = 90;
-        r[2] = 120;
+    // MOCK_XR_RATES=<hz>,<hz>... (default 72,90,120); SteamVR on the Frame offered only 90 in H1.
+    float rates[8] = {72, 90, 120};
+    uint32_t n = 3;
+    if (getenv("MOCK_XR_RATES")) {
+        n = 0;
+        for (const char* q = getenv("MOCK_XR_RATES"); q && *q && n < 8;) {
+            rates[n++] = (float)atof(q);
+            q = strchr(q, ',');
+            if (q) q++;
+        }
     }
+    *count = n;
+    if (cap)
+        for (uint32_t i = 0; i < n && i < cap; i++) r[i] = rates[i];
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mGetRefresh(XrSession s, float* hz) {
