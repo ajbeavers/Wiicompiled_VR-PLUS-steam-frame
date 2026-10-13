@@ -7,9 +7,9 @@ shared build lock is in use. Timings are from the Frame (5 CPUs), page cache war
 | Step | Command | Output | Time |
 | --- | --- | --- | --- |
 | Extract | `frame/setup.sh extract <iso> <dest>` | `<dest>/DATA`, `main.dol`, `StaticR.rel`, `.complete` | 3 s warm (a minute or two cold) |
-| Translator publish (maintainer, once) | `frame/publish-translator.sh <outdir>` | `<outdir>/Translator.Cli` (34 MiB, self-contained single file), `.sha256` | about 1 min of CPU |
+| Translator publish (maintainer, once) | `frame/publish-translator.sh <outdir>` | `<outdir>/Translator.Cli` (34 MiB, self-contained single file), `.sha256` | not timed alone (10 min wall, mostly waiting for the build lock) |
 | Translate | `frame/setup.sh translate <dest> <out>` | `<out>/generated`, `<out>/build/base` | 49 s (translate-recursive 42 s, base manifest 1 s, data init 0.5 s, shards 5 s) |
-| Toolchain | `frame/toolchain.sh [destdir]` | `<root>/bin/{clang,clang++,ld.lld,llvm-ar,cmake,ninja}`, 581 MiB | about 75 s plus about 1.2 GB of downloads |
+| Toolchain | `frame/toolchain.sh [destdir]` | `<root>/bin/{clang,clang++,ld.lld,llvm-ar,cmake,ninja}`, 581 MiB | about 75 s plus about 1.8 GB of downloads |
 | Boundary check | `frame/boundary-check.sh <dir\|tarball> [allowlist]` | exit 1 on any disc-derived file | seconds |
 
 ## Inputs and pins
@@ -17,13 +17,13 @@ shared build lock is in use. Timings are from the Frame (5 CPUs), page cache war
 - Disc: PAL `RMCP01`. `setup.sh` reads the game id with `nodtool info` first, then checks
   `main.dol` and `StaticR.rel` against the sha256 values in `projects/mkwii/recomp.yml`.
 - nodtool `v2.0.0-alpha.10` (the version upstream pins) from encounter/nod, linux-aarch64 asset,
-  sha256 `b0d94617...b689a1b907b`; cached in `~/.cache/kartframe/nodtool/<version>/`.
+  sha256 `b0d94617ed2393334845669cc1f74f1e4fce0d6acb24e8be28c479689a1b907b`; cached in `~/.cache/kartframe/nodtool/<version>/`.
 - .NET 8 SDK (arm64) in `~/.local/opt/dotnet`, installed with Microsoft's `dotnet-install.sh
   --channel 8.0`. Only the publish step needs it; set `DOTNET_CLI_TELEMETRY_OPTOUT=1`.
 - Toolchain: upstream's `Launcher/prepare-portable-tools.sh --arch aarch64` (patched LLVM 22.1.8,
   CMake 4.3.3, Ninja 1.13.2, all sha256-pinned there). `toolchain.sh` runs a copy of it from
   `~/.cache/kartframe/toolchain/launcher` so downloads and scratch stay out of the repo. The
-  downloads can be deleted after the first run (`toolchain/launcher/artifacts`, about 1.2 GB).
+  downloads can be deleted after the first run (`toolchain/launcher/artifacts`, about 1.8 GB).
 
 ## Extracted layout (same as upstream's Linux setup, `DiscTool.cs`)
 
