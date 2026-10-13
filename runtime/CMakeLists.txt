@@ -551,13 +551,15 @@ if(MKW_ENABLE_OPENXR AND MKW_PLATFORM_WINDOWS)
     target_compile_features(mkw_openxr_replay_tests PRIVATE cxx_std_17)
     set_target_properties(mkw_openxr_replay_tests PROPERTIES UNITY_BUILD OFF)
     add_test(NAME mkw_openxr_replay_tests COMMAND mkw_openxr_replay_tests)
+endif()
+if(MKW_ENABLE_OPENXR AND (MKW_PLATFORM_WINDOWS OR MKW_PLATFORM_LINUX))
     add_executable(mkw_openxr_vulkan_replay_tests
         tests/openxr_d3d12_replay_tests.cpp src/vr/openxr_vulkan_win32.cpp src/vr/openxr_diagnostics.cpp)
     target_include_directories(mkw_openxr_vulkan_replay_tests PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/include"
         "${CMAKE_CURRENT_LIST_DIR}/../aurora-main/include"
         "$<TARGET_PROPERTY:${MKW_OPENXR_TARGET},INTERFACE_INCLUDE_DIRECTORIES>")
-    target_compile_definitions(mkw_openxr_vulkan_replay_tests PRIVATE MKW_ENABLE_OPENXR=1 TEST_WINDOWS_VULKAN=1)
+    target_compile_definitions(mkw_openxr_vulkan_replay_tests PRIVATE MKW_ENABLE_OPENXR=1 TEST_WINDOWS_VULKAN=1 $<$<PLATFORM_ID:Linux>:TARGET_PC>)
     target_compile_features(mkw_openxr_vulkan_replay_tests PRIVATE cxx_std_17)
     set_target_properties(mkw_openxr_vulkan_replay_tests PROPERTIES UNITY_BUILD OFF)
     add_test(NAME mkw_openxr_vulkan_replay_tests COMMAND mkw_openxr_vulkan_replay_tests)
