@@ -5,6 +5,7 @@
 #if defined(MKW_ENABLE_OPENXR)
 
 #include "vr/camera_toggle.h"
+#include "vr/frame_controls.h"
 #include "vr/openxr_driving.h"
 #include "vr/openxr_runtime.h"
 #include "vr/openxr_settings_panel.h"
@@ -171,11 +172,15 @@ private:
     XrAction m_frame_start = XR_NULL_HANDLE;
     XrAction m_frame_back = XR_NULL_HANDLE;
     std::array<XrAction, 4> m_frame_dpad{}; // up, down, left, right
+    // Bound directly on the Frame profile (XR_VALVE_frame_controller_interaction): throttle,
+    // reverse and brake, and the right bumper's drift. Nothing goes through the Touch mapping.
+    XrAction m_frame_accelerate = XR_NULL_HANDLE; // float: right trigger, A
+    XrAction m_frame_reverse = XR_NULL_HANDLE;    // float: left trigger
+    XrAction m_frame_brake = XR_NULL_HANDLE;      // boolean: B
+    XrPath m_frame_profile = XR_NULL_PATH;
+    bool m_frame_profile_suggested = false;
     bool m_frame_layout = false;
-    bool m_frame_back_held = false;
-    bool m_frame_back_consumed = false;
-    XrTime m_frame_back_down = 0;
-    XrTime m_frame_back_pulse_until = 0;
+    frame::ViewButton m_frame_view;
     XrPath m_hand_paths[kHands]{};
     XrSpace m_aim_spaces[kHands]{};
     XrSpace m_grip_spaces[kHands]{};
