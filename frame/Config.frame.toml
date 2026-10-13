@@ -1,0 +1,35 @@
+# KartFrame defaults for the Steam Frame, seeded into Config.toml on the first run (setup.sh and the
+# launch wrapper copy this file only when there is no Config.toml). The in-game VR settings panel
+# edits Config.toml in place afterwards; this file is never read again.
+[paths]
+# The extracted game's DATA folder (the one holding sys/fst.bin and files/). The placeholder is
+# replaced with the real path when the file is seeded. TODO(lane B): confirm the placeholder name.
+dvd_root = "@DVD_ROOT@"
+
+[video]
+widescreen = true
+resolution_multiplier = 1.0
+
+[vr]
+enabled = true
+required = false
+# 1.0 renders the eyes at the size SteamVR's resolutionOverride (1728, set by the launch wrapper) asks for.
+render_scale = 1.000000
+# 1 = render at the headset's refresh rate (120 Hz), interpolated from the game's 60 fps.
+frame_interpolation_fps = 1
+# TODO(lane A): frame_pacing = "auto" | "inline" | "pipelined" once the key is parsed (KARTFRAME_PACING overrides it).
+# Grips hold the wheel in the first-person cockpit (the right bumper drifts there); elsewhere they drift.
+hand_steering = true
+# 0 = plain dark background behind the menus (the raymarched one is far too heavy).
+menu_shader_quality = 0
+hand_hud = false
+# The virtual screen for menus and the race HUD, as the upstream defaults.
+hud_virtual_screen = true
+hud_distance_meters = 2.0
+hud_width_meters = 2.4
+foveation = "off"
+passthrough = false
+adaptive_resolution = false
+
+[diagnostics]
+openxr_logging = false
