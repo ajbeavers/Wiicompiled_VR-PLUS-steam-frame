@@ -129,7 +129,7 @@ HWATCH=$!
 wait $PID; RC=$?
 kill $WATCH $HWATCH 2>/dev/null
 echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
-grep -a 'xrmock: summary\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|xrmock: stamps\|vr pacing totals' "$LOG" || true
+grep -a 'xrmock: summary\|xrmock: end times\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|xrmock: stamps\|vr pacing totals' "$LOG" || true
 echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
 FATAL=$(grep -a -c 'fatal dialog\|Signal 11' "$LOG")
 echo "mockrun: fatal lines: $FATAL"

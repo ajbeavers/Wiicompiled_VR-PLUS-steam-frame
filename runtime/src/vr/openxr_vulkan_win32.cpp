@@ -30,6 +30,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace mkw::vr {
 namespace {
@@ -50,6 +54,8 @@ namespace {
 // records each set's submit-to-completion time. Without timeline semaphores the release
 // drains the queue instead (correct, slower; logged). KARTFRAME_NO_GPU_WAIT=1 skips the
 // wait: the negative test for the mock's MOCK_XR_BUSY_MS check.
+std::atomic<uint32_t> g_gpu_watcher_tid{0};
+
 class GpuCompletion {
 public:
     using Clock = std::chrono::steady_clock;
@@ -177,6 +183,9 @@ private:
     static constexpr uint64_t kRing = 64;
 
     void Watch() {
+#if defined(__linux__)
+        g_gpu_watcher_tid.store(static_cast<uint32_t>(syscall(SYS_gettid)), std::memory_order_release);
+#endif
         uint64_t next = 1;
         for (;;) {
             {
@@ -887,7 +896,7 @@ public:
         }
         OpenXRBackendFrame frame = set;
         frame.xr_frame.serial = active_frame_.serial;
-        // The layer is ended with the display time its poses were located for (EndFrameWithPanel).
+        // KARTFRAME_END_TIME=locate ends the layer with the time its poses were located for (EndFrameWithPanel).
         next_layer_locate_time_ = set.xr_frame.predicted_display_time;
         frame.xr_frame.predicted_display_time = active_frame_.predicted_display_time;
         frame.xr_frame.predicted_display_period = active_frame_.predicted_display_period;
@@ -1254,18 +1263,22 @@ public:
             panel_quad = OpenXRPanelQuadLayer(panel, runtime_->AppSpace(), retained_panel_swapchain_.handle);
             layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel_quad);
         }
-        // A set's layer goes out with the display time its poses were located for, also when it is
-        // repeated or shown a refresh late: the poses and that time belong together, whatever
-        // this cycle's prediction says (SteamVR's is not always one period after the last).
-        // OpenXR allows any display time; the compositor reprojects. KARTFRAME_END_TIME=cycle:
-        // this cycle's predicted time instead (the behaviour before lane G).
-        static const bool end_at_cycle = [] {
+        // Every frame ends with its own cycle's predicted display time: SteamVR matches a frame to
+        // its refresh by that time. The layer's poses say where the images were rendered from; the
+        // compositor reprojects them to the head pose at display. A pipelined set is located for
+        // the next cycle's time (this cycle's prediction + one period, the same within SteamVR's
+        // +-0.02 ms jitter); a late set is shown a refresh after that. In the third headset session
+        // lane G's rule (end with the poses' locate time) gave every late set (24 % of the race)
+        // a time one refresh older than its cycle's; SteamVR's mispresented frames went from 116
+        // to 1284 and reused app frames from 0.2 to 4.4 %. KARTFRAME_END_TIME=locate restores it
+        // (the mock's end-time check counts each such frame as an error).
+        static const bool end_at_locate = [] {
             const char* env = std::getenv("KARTFRAME_END_TIME");
-            return env != nullptr && std::string_view(env) == "cycle";
+            return env != nullptr && std::string_view(env) == "locate";
         }();
         // Display times stay increasing from one xrEndFrame to the next: a layer shown again (or a
         // late set whose time an earlier frame already used) goes out at this cycle's time.
-        if (!end_at_cycle && retained_locate_time_ != 0 && retained_locate_time_ > last_end_display_time_ &&
+        if (end_at_locate && retained_locate_time_ != 0 && retained_locate_time_ > last_end_display_time_ &&
             retained_locate_time_ != active_frame_.predicted_display_time) {
             OpenXRFrame located = active_frame_;
             located.predicted_display_time = retained_locate_time_;
@@ -1836,6 +1849,8 @@ const OpenXRWindowsVulkanGraphicsRequirements& OpenXRWindowsVulkanBackend::Graph
 int64_t OpenXRWindowsVulkanBackend::SwapchainFormat() const { return m_impl->SwapchainFormat(); }
 
 const std::string& OpenXRWindowsVulkanBackend::LastError() const { return m_impl->LastError(); }
+
+uint32_t OpenXRVulkanGpuWatcherThreadId() noexcept { return g_gpu_watcher_tid.load(std::memory_order_acquire); }
 
 } // namespace mkw::vr
 

@@ -630,7 +630,7 @@ struct State {
     // OnCycleTimes / OnSetShown, summed up every 10 s.
     int64_t times_start_ns = 0;
     std::vector<float> step_error_ms, lead_ms;
-    uint32_t shown = 0, shown_other = 0;
+    uint32_t shown = 0, shown_other = 0, shown_late = 0;  // late: a refresh or more after its locate time
     float shown_min_ms = 0.0f, shown_max_ms = 0.0f;
 };
 State& S() {
@@ -694,7 +694,7 @@ void Reset() {
         s.times_start_ns = 0;
         s.step_error_ms.clear();
         s.lead_ms.clear();
-        s.shown = s.shown_other = 0;
+        s.shown = s.shown_other = s.shown_late = 0;
         sink = s.sink;
         // t=0 of the "vr pacing:" lines on the steady clock (CLOCK_MONOTONIC), so other logs can be
         // lined up with them (aurora's "hitch:" lines carry mono=).
@@ -762,6 +762,9 @@ void OnSetShown(int64_t locate_minus_cycle_ns) {
     ++s.shown;
     if (locate_minus_cycle_ns == 0) return;
     const float ms = static_cast<float>(static_cast<double>(locate_minus_cycle_ns) / 1e6);
+    // SteamVR's predictions jitter by +-0.02 ms: a set located for "this prediction + one period" is
+    // off its showing cycle's by that much. Half a refresh or more is a set shown a refresh late.
+    if (ms <= -4.0f) ++s.shown_late;
     if (s.shown_other++ == 0) s.shown_min_ms = s.shown_max_ms = ms;
     s.shown_min_ms = std::min(s.shown_min_ms, ms);
     s.shown_max_ms = std::max(s.shown_max_ms, ms);
@@ -776,17 +779,18 @@ std::string DisplayTimesLine(State& s, int64_t now) {
         const double low = *lo, high = *hi;  // before Percentile reorders the values
         std::snprintf(out, cap, "%.3f/%.3f/%.3f", static_cast<double>(Percentile(v, 0.5)), low, high);
     };
-    char step[64] = "-", lead[64] = "-", line[384];
+    char step[64] = "-", lead[64] = "-", line[512];
     if (!s.step_error_ms.empty()) range(s.step_error_ms, step, sizeof(step));
     range(s.lead_ms, lead, sizeof(lead));
     std::snprintf(line, sizeof(line),
                   "vr display times (10 s): predicted step minus period ms p50/min/max=%s, display lead ms "
-                  "p50/min/max=%s, sets shown %u, located for another time than their cycle's %u (ms %.3f..%.3f)",
+                  "p50/min/max=%s, sets shown %u, located for another time than their cycle's %u (ms %.3f..%.3f; a refresh "
+                  "or more earlier, shown late: %u)",
                   step, lead, s.shown, s.shown_other, static_cast<double>(s.shown_min_ms),
-                  static_cast<double>(s.shown_max_ms));
+                  static_cast<double>(s.shown_max_ms), s.shown_late);
     s.step_error_ms.clear();
     s.lead_ms.clear();
-    s.shown = s.shown_other = 0;
+    s.shown = s.shown_other = s.shown_late = 0;
     s.shown_min_ms = s.shown_max_ms = 0.0f;
     s.times_start_ns = now;
     return line;

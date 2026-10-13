@@ -132,6 +132,9 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
+// The Linux thread id of the thread that waits for the GPU to finish eye sets (0 until it runs).
+uint32_t OpenXRVulkanGpuWatcherThreadId() noexcept;
+
 } // namespace mkw::vr
 
 #endif // defined(MKW_ENABLE_OPENXR) && defined(_WIN32)

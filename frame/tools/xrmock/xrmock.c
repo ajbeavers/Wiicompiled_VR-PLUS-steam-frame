@@ -44,17 +44,23 @@
 //   MOCK_XR_DUMP=<dir>        Vulkan: write released images as PPM files (every 4th pixel)
 //                             <dir>/t<seconds>-sc<id>-<n>.ppm: at the seconds in
 //                             MOCK_XR_DUMP_AT=<s>,<s>... (default every 10 s), the next
-//                             MOCK_XR_DUMP_FRAMES=<n> (1) releases of every swapchain
+//                             MOCK_XR_DUMP_FRAMES=<n> (1) releases of every swapchain;
+//                             MOCK_XR_DUMP_STEP=<n> every n-th pixel (4; 1: full resolution)
 //   MOCK_XR_STAMP=1           Vulkan, with KARTFRAME_FRAME_STAMP=1 in the app: every eye image a
 //                             projection layer submits carries the display time its poses were
 //                             located for (a block in its corner); compared with the locate the
 //                             layer's poses came from (summary line "stamps")
 //   MOCK_XR_PREDICT_JITTER=<ms>  predictedDisplayTime is off its refresh by up to +-<ms> (uniform,
-//                             at most 3), as SteamVR's prediction is not always exactly one period
-//                             after the last
+//                             at most 3; default 0.02, SteamVR's on the Frame in the third headset
+//                             session), as SteamVR's prediction is not always exactly one period
+//                             after the last; 0 turns it off
+//   MOCK_XR_LEAD=<refreshes>  predictedDisplayTime this many refreshes after xrWaitFrame's wake-up
+//                             (default 3: SteamVR's lead on the Frame was 25 to 27 ms at 120 Hz)
 //   MOCK_XR_FOV=<l>,<r>,<u>,<d>  the left eye's field of view in degrees (the right eye mirrors it);
-//                             default an asymmetric one like the Frame's (-52,44,48,-52), "sym"
-//                             the old symmetric +-48.1
+//                             default the Frame's own, per eye (left -59.08,50.39,49.47,-60.00, right
+//                             -50.29,59.16,49.88,-59.55), "sym" the old symmetric +-48.1
+// Every xrEndFrame must carry the predictedDisplayTime of the xrWaitFrame its xrBeginFrame followed
+// (ERROR otherwise; summary line "end times").
 //   MOCK_XR_HANDS=1           controllers held in front of the player (left and right action
 //                             spaces at chest height, pointing ahead), instead of all at the head
 //   MOCK_XR_PRESS=<path>@<start s>/<every s>[;...]  scripted presses for the current profile
@@ -142,9 +148,15 @@ static int64_t gNextBlip = 0, gRefocusAt = 0;
 static int gFocused = 0, gBlips = 0, gProfileSent = 0;
 static const char* gProfile = NULL;
 static int64_t gT0 = 0, gPeriod = 8333333, gEndAt = 0;
-static int64_t gJitterNs = 0;  // MOCK_XR_PREDICT_JITTER
-// MOCK_XR_FOV: the left eye's angles in degrees (left, right, up, down); the right eye mirrors it.
-static float gFovDeg[4] = {-52.0f, 44.0f, 48.0f, -52.0f};
+static int64_t gJitterNs = 20000;  // MOCK_XR_PREDICT_JITTER
+static int64_t gLead = 3;         // MOCK_XR_LEAD (refreshes)
+// xrEndFrame against the frame's predicted display time (the one its xrBeginFrame followed).
+static XrTime gWaitPredicted = 0, gBegunPredicted = 0;
+static int gEndTimeMatch = 0, gEndTimeOff = 0, gEndTimeOffPeriods[3];  // [0] within a refresh, [1] a refresh earlier or more, [2] later
+static double gEndTimeOffWorstMs = 0.0;
+// The eyes' angles in degrees (left, right, up, down): the Frame's (its OpenXR eye fields of view, logged
+// in the third headset session). MOCK_XR_FOV sets the left eye's; the right eye then mirrors it.
+static float gFovDeg[2][4] = {{-59.08f, 50.39f, 49.47f, -60.00f}, {-50.29f, 59.16f, 49.88f, -59.55f}};
 static int gQuitSent = 0;
 
 static void pushState(int s) {
@@ -440,7 +452,7 @@ static XrResult XRAPI_CALL mWaitImage(XrSwapchain sc, const XrSwapchainImageWait
 static void maybeDump(Chain* c, XrSwapchain sc) {
     static const char* dir = NULL;
     static double at[64];
-    static int atCount = -1, frames = 1;
+    static int atCount = -1, frames = 1, step = 4;
     if (atCount < 0) {
         dir = getenv("MOCK_XR_DUMP");
         atCount = 0;
@@ -453,6 +465,7 @@ static void maybeDump(Chain* c, XrSwapchain sc) {
         if (!atCount)
             for (; atCount < 64; atCount++) at[atCount] = 10.0 * (atCount + 1);
         if (getenv("MOCK_XR_DUMP_FRAMES")) frames = atoi(getenv("MOCK_XR_DUMP_FRAMES"));
+        if (getenv("MOCK_XR_DUMP_STEP") && atoi(getenv("MOCK_XR_DUMP_STEP")) >= 1) step = atoi(getenv("MOCK_XR_DUMP_STEP"));
     }
     if (!dir || !gGfx || !gGfx->dump_image || !gT0) return;
     double t = (double)(nowNs() - gT0) / 1e9;
@@ -467,7 +480,7 @@ static void maybeDump(Chain* c, XrSwapchain sc) {
     int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
     char path[512];
     snprintf(path, sizeof(path), "%s/t%03d-sc%d-%02d.ppm", dir, (int)at[mark - 1], chainId(sc), c->dumped);
-    if (gGfx->dump_image(c->images, idx, c->w, c->h, c->format, 4, path)) trace("dump sc%d %s", chainId(sc), path);
+    if (gGfx->dump_image(c->images, idx, c->w, c->h, c->format, step, path)) trace("dump sc%d %s", chainId(sc), path);
     c->dumped++;
 }
 
@@ -550,6 +563,10 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
             "%d projection layers: eyes from one locate for the display time submitted %d, for an earlier one %d, a later one %d; eyes from "
             "different locates %d, poses not from a locate %d\n",
             gErrors, gReleases, gBusyReleases, gBusyMaxMs, gPoseSets, gPoseSameTime, gPoseEarlier, gPoseLater, gPoseSplit, gPoseUnknown);
+    fprintf(stderr,
+            "xrmock: end times: %d frames ended with their predicted display time, %d with another (within a refresh %d, a refresh or more "
+            "earlier %d, later %d; worst %.3f ms)\n",
+            gEndTimeMatch, gEndTimeOff, gEndTimeOffPeriods[0], gEndTimeOffPeriods[1], gEndTimeOffPeriods[2], gEndTimeOffWorstMs);
     fprintf(stderr, "xrmock: projection layers by refreshes from the locate to the display time: later %d, 0: %d, 1: %d, 2: %d, 3: %d, more %d\n", gPoseAge[0],
             gPoseAge[1], gPoseAge[2], gPoseAge[3], gPoseAge[4], gPoseAge[5]);
     fprintf(stderr,
@@ -639,7 +656,7 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
         struct timespec ts = {(time_t)((wake - now) / 1000000000ll), (long)((wake - now) % 1000000000ll)};
         nanosleep(&ts, NULL);
     }
-    fs->predictedDisplayTime = wake + 2 * gPeriod + gTimeOffset;
+    fs->predictedDisplayTime = wake + gLead * gPeriod + gTimeOffset;
     if (gJitterNs > 0) {
         // Deterministic: the same sequence every run.
         static uint64_t lcg = 0x2545F4914F6CDD1Dull;
@@ -649,6 +666,7 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
     }
     fs->predictedDisplayPeriod = gPeriod;
     fs->shouldRender = XR_TRUE;
+    gWaitPredicted = fs->predictedDisplayTime;
     gWaits++;
     if (gEndAt && nowNs() > gEndAt && !gQuitSent) {
         gQuitSent = 1;
@@ -670,6 +688,7 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
 static XrResult XRAPI_CALL mBeginFrame(XrSession s, const XrFrameBeginInfo* bi) {
     (void)s;
     (void)bi;
+    gBegunPredicted = gWaitPredicted;
     trace("beginFrame");
     return XR_SUCCESS;
 }
@@ -736,6 +755,19 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
         gErrors++;
     }
     lastDisplay = ei->displayTime;
+    // The frame's own predicted time: SteamVR matches a frame to its refresh by it; an older time showed
+    // as mispresented frames and reused app frames on the headset.
+    if (gBegunPredicted && ei->displayTime != gBegunPredicted) {
+        const double ms = (double)(ei->displayTime - gBegunPredicted) / 1e6;
+        gEndTimeOff++;
+        gEndTimeOffPeriods[ms > 0 ? 2 : -ms * 1e6 >= 0.5 * (double)gPeriod ? 1 : 0]++;
+        if (fabs(ms) > fabs(gEndTimeOffWorstMs)) gEndTimeOffWorstMs = ms;
+        trace("ERROR endFrame display time %.3f ms off the frame's predicted time", ms);
+        gErrors++;
+    } else if (gBegunPredicted) {
+        gEndTimeMatch++;
+    }
+    gBegunPredicted = 0;
     gEnds++;
     if (ei->layerCount == 0) gEmptyEnds++;
     else if (ei->layers[0]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) gQuadEnds++;
@@ -763,9 +795,7 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
         v[e].pose.orientation = (XrQuaternionf){0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)};
         v[e].pose.position = (XrVector3f){x * c, 1.6f, -x * sn};
         const float rad = 3.14159265f / 180.0f;
-        // The right eye mirrors the left (its outer side is on the right).
-        v[e].fov = e ? (XrFovf){-gFovDeg[1] * rad, -gFovDeg[0] * rad, gFovDeg[2] * rad, gFovDeg[3] * rad}
-                     : (XrFovf){gFovDeg[0] * rad, gFovDeg[1] * rad, gFovDeg[2] * rad, gFovDeg[3] * rad};
+        v[e].fov = (XrFovf){gFovDeg[e][0] * rad, gFovDeg[e][1] * rad, gFovDeg[e][2] * rad, gFovDeg[e][3] * rad};
         gLocates[gLocateNext].pose[e] = v[e].pose;
     }
     gLocates[gLocateNext].time = li->displayTime;
@@ -1069,14 +1099,21 @@ static void init(void) {
     const char* jitter = getenv("MOCK_XR_PREDICT_JITTER");
     if (jitter) {
         double ms = atof(jitter);
+        gJitterNs = 0;
         gJitterNs = (int64_t)((ms < 0 ? 0 : ms > 3 ? 3 : ms) * 1e6);
     }
     const char* fov = getenv("MOCK_XR_FOV");
     if (fov && !strcmp(fov, "sym")) {
-        gFovDeg[0] = -48.13f, gFovDeg[1] = 48.13f, gFovDeg[2] = 48.13f, gFovDeg[3] = -48.13f;
+        gFovDeg[0][0] = -48.13f, gFovDeg[0][1] = 48.13f, gFovDeg[0][2] = 48.13f, gFovDeg[0][3] = -48.13f;
     } else if (fov) {
-        sscanf(fov, "%f,%f,%f,%f", &gFovDeg[0], &gFovDeg[1], &gFovDeg[2], &gFovDeg[3]);
+        sscanf(fov, "%f,%f,%f,%f", &gFovDeg[0][0], &gFovDeg[0][1], &gFovDeg[0][2], &gFovDeg[0][3]);
     }
+    if (fov) {
+        // The right eye mirrors the left (its outer side is on the right).
+        gFovDeg[1][0] = -gFovDeg[0][1], gFovDeg[1][1] = -gFovDeg[0][0], gFovDeg[1][2] = gFovDeg[0][2], gFovDeg[1][3] = gFovDeg[0][3];
+    }
+    const char* lead = getenv("MOCK_XR_LEAD");
+    if (lead && atoi(lead) >= 1) gLead = atoi(lead);
     const char* list = getenv("MOCK_XR_EXTENSIONS");
     if (list) {
         char* copy = strdup(list);
