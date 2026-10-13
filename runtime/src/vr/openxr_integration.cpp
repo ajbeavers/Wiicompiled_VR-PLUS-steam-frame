@@ -23,10 +23,14 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -115,7 +119,9 @@ inline constexpr bool kWindowShapedEyesSupported = false;
 // On Android always: under Lepton, SteamVR turns a quad layer into a slow submission, so quality 0
 // only swaps Aurora's raymarched menu background for a plain one, which the GPU draws for free.
 inline bool OpenXRProjectedMenus() noexcept {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MKW_OPENXR_LINUX_DESKTOP)
+    // The Frame (native SteamVR): menus in the eyes as well, so they are rendered every refresh
+    // from that refresh's head pose; menu_shader_quality 0 gives the plain background.
     return true;
 #else
     return RuntimeConfigFile::Get().vrMenuShaderQuality>0 || OpenXRIntroductionActive();
@@ -383,6 +389,7 @@ public:
         // the sink may be replaced.
         diagnostics::SetLogSink(
             [](std::string_view line) { RT_LOG(RT_TAG_RUNTIME) << line << std::endl; });
+        pacing::SetSink([](std::string_view line) { RT_LOG(RT_TAG_RUNTIME) << line << std::endl; });
         diagnostics::SetEnabled(RuntimeConfigFile::DiagnosticsOpenXRLogging(false));
         requested_ = RuntimeConfigFile::VrEnabled(kVrEnabledDefault);
         ConfigurePolicy(requested_);
@@ -426,7 +433,7 @@ public:
         AddHandMeshExtensions(config);
 #elif defined(MKW_OPENXR_LINUX_DESKTOP)
         config.required_extensions = {"XR_KHR_vulkan_enable2"};
-        config.optional_extensions = {"XR_KHR_convert_timespec_time",
+        config.optional_extensions = {"XR_KHR_convert_timespec_time", "XR_VALVE_frame_controller_interaction",
                                       "XR_FB_display_refresh_rate", "XR_EXT_performance_settings"};
         AddHandMeshExtensions(config);
 #else
@@ -463,13 +470,16 @@ public:
 #endif
         if (has_extension("XR_FB_display_refresh_rate")) {
             runtime_->LoadFunction("xrGetDisplayRefreshRateFB", &get_display_refresh_rate_);
+            runtime_->LoadFunction("xrEnumerateDisplayRefreshRatesFB", &enumerate_display_refresh_rates_);
+            runtime_->LoadFunction("xrRequestDisplayRefreshRateFB", &request_display_refresh_rate_);
         }
         if (has_extension("XR_EXT_performance_settings")) {
             runtime_->LoadFunction("xrPerfSettingsSetPerformanceLevelEXT", &set_performance_level_);
         }
-#if defined(__ANDROID__)
-        // Lepton's SteamVR bridge has no XR_KHR_convert_timespec_time; DisplayTimeNanos falls back
-        // to reading XrTime as CLOCK_MONOTONIC (see MonotonicDisplayDelta).
+#if defined(__ANDROID__) || defined(MKW_OPENXR_LINUX_DESKTOP)
+        // Lepton's SteamVR bridge has no XR_KHR_convert_timespec_time (native SteamVR on the
+        // Frame has it); without it DisplayTimeNanos falls back to reading XrTime as
+        // CLOCK_MONOTONIC, or anchors it to the first frame (see MonotonicDisplayDelta).
         interpolation_available_.store(true, std::memory_order_release);
         clock_fallback_logged_ = false;
         clock_offset_valid_ = false;
@@ -526,6 +536,8 @@ public:
             diagnostics::SetDisplayTimeConverter(
                 [this](int64_t xr_time) { return static_cast<int64_t>(DisplayTimeNanos(xr_time)); });
         }
+        ReadPacingMode();
+        set_pacing_ = {};
         running_.store(true, std::memory_order_release);
         try {
             pacing_thread_ = std::thread([this] { PacingThread(); });
@@ -586,6 +598,9 @@ public:
         prepared_ = false;
         convert_display_time_ = nullptr;
         get_display_refresh_rate_ = nullptr;
+        enumerate_display_refresh_rates_ = nullptr;
+        request_display_refresh_rate_ = nullptr;
+        logged_refresh_hz_ = 0.0f;
         set_performance_level_ = nullptr;
         headset_hz_.store(0, std::memory_order_relaxed);
         rendered_fps_.store(0, std::memory_order_relaxed);
@@ -782,8 +797,44 @@ private:
             return false;
         }
         diagnostics::NotePacketConsumed();
+        pacing::NoteSetConsumed();
         *output = frame->frame;
         return true;
+    }
+
+    // Asks for the display refresh rate in-app as well (the wrapper sets SteamVR's per-app
+    // 120 Hz too): KARTFRAME_REFRESH_HZ, else [vr] refresh_rate, else 120; the nearest rate
+    // the runtime offers. 0 leaves the runtime's choice.
+    void RequestDisplayRefreshRate() {
+        if (runtime_ == nullptr || !runtime_->HasSession() || enumerate_display_refresh_rates_ == nullptr ||
+            request_display_refresh_rate_ == nullptr) {
+            return;
+        }
+        std::string wanted_text;
+        if (const char* env = std::getenv("KARTFRAME_REFRESH_HZ"); env != nullptr && *env != '\0') {
+            wanted_text = env;
+        } else {
+            wanted_text = ReadVrConfigText("refresh_rate");
+        }
+        const float wanted = wanted_text.empty() ? 120.0f : std::strtof(wanted_text.c_str(), nullptr);
+        uint32_t count = 0;
+        if (XR_FAILED(enumerate_display_refresh_rates_(runtime_->Session(), 0, &count, nullptr)) || count == 0) return;
+        std::vector<float> rates(count);
+        if (XR_FAILED(enumerate_display_refresh_rates_(runtime_->Session(), count, &count, rates.data()))) return;
+        rates.resize(count);
+        std::ostringstream offered;
+        for (size_t i = 0; i < rates.size(); ++i) offered << (i ? ", " : "") << rates[i];
+        if (!(wanted > 0.0f)) {
+            RT_LOG(RT_TAG_RUNTIME) << "display refresh rates: " << offered.str() << "; requested none (runtime's choice)" << std::endl;
+            return;
+        }
+        float best = rates.front();
+        for (float rate : rates) {
+            if (std::fabs(rate - wanted) < std::fabs(best - wanted)) best = rate;
+        }
+        const XrResult result = request_display_refresh_rate_(runtime_->Session(), best);
+        RT_LOG(RT_TAG_RUNTIME) << "display refresh rates: " << offered.str() << "; requested " << best << " Hz"
+                               << (XR_SUCCEEDED(result) ? "" : " (refused)") << std::endl;
     }
 
     void PacingThread() noexcept {
@@ -808,6 +859,7 @@ private:
         }
 #endif
         ApplyPerformanceLevel();
+        RequestDisplayRefreshRate();
         bool fatal = false;
         uint32_t consecutive_skips = 0;
         bool store_gate_set = false;
@@ -836,10 +888,15 @@ private:
                 applied_session_run_serial_ = session_run_serial;
                 ResetTrackingOrigin();
                 diagnostics::OnSessionStarted();
+                pacing::Reset();
+                set_pacing_.half_rate = false;
+                set_pacing_.results.clear();
+                set_pacing_.last_display_time = 0;
             }
             if (session_active != session_was_active_) {
                 session_was_active_ = session_active;
                 if (!session_active) {
+                    pacing::Totals();
                     ResetTrackingOrigin();
                     // Nothing is displayed while the session is not running (the system menu,
                     // the headset taken off), so the stall of a cache store is invisible here.
@@ -856,6 +913,10 @@ private:
                 break;
             }
             if (!session_active) {
+                if (!DropPendingSet()) {
+                    fatal = true;
+                    break;
+                }
                 if (input_ != nullptr) {
                     input_->Idle();
                 }
@@ -869,7 +930,7 @@ private:
             // Reference spaces can only be replaced between XR frames. The
             // startup pose check schedules this after the previous submission,
             // so eyes, menu and controller rays all use the new space together.
-            if (startup_origin_pending_) {
+            if (startup_origin_pending_ && !set_pacing_.pending) {
                 startup_origin_pending_=false;
                 if(runtime_->ResetAppSpace(startup_origin_pose_)) {
                     const auto& q=startup_origin_pose_.orientation;
@@ -964,169 +1025,30 @@ private:
             if (last_pacing_mode != static_cast<int>(render_first)) {
                 last_pacing_mode = static_cast<int>(render_first);
                 RT_LOG(RT_TAG_RUNTIME) << "OpenXR " << kGraphicsBackendName << " pacing: "
-                    << (render_first ? "render-first" : "frame-first (VR interpolation)") << std::endl;
+                    << (render_first ? std::string("render-first")
+                                     : std::string("per-refresh eye sets (VR interpolation), ") +
+                                           PacingModeName(pacing_mode_) + " (frame_pacing " + pacing_mode_source_ + ")")
+                    << std::endl;
+                pacing::SetMode(PacingModeName(pacing_mode_));
             }
-            if (render_first) {
+            // A set still in flight is shown (or dropped) by the set loop before switching.
+            if (render_first && !set_pacing_.pending) {
                 if (!RenderFirstCycle(presentation, policy, immersive, consecutive_skips,
                                       immersive_submission_logged)) {
                     fatal = true;
                 }
                 continue;
             }
-            OpenXRBackendFrame frame{};
-            const OpenXRBeginStatus begin = backend_->BeginFrame(presentation, frame);
-            if (begin == OpenXRBeginStatus::SessionNotRunning) {
-                MkwVRPolicySetSessionActive(false);
-                continue;
-            }
-            if (begin == OpenXRBeginStatus::ExitRequested) {
-                SetError("OpenXR runtime requested session exit; continuing on the mirror output");
-                break;
-            }
-            if (begin == OpenXRBeginStatus::Error) {
-                SetError(backend_->LastError());
+            const CycleResult result = SetCycle(presentation, policy, immersive, interpolation_target,
+                                                immersive_submission_logged);
+            if (result == CycleResult::Fatal) {
                 fatal = true;
+            } else if (result == CycleResult::Break) {
                 break;
-            }
-
-            UpdateFrameTiming(frame.xr_frame);
-            if (diagnostics::Enabled()) {
-                NoteFrameDiagnostics(frame, immersive);
-            }
-            // Both of these read this frame's located head pose and must run
-            // before FinishFrame submits a layer built from it.
-            ServiceRecenterRequest();
-            ApplyPendingReferenceSpaceChange(frame.xr_frame);
-            UpdateVirtualScreenPose(frame);
-            const OpenXRPointerScreen panel_screen = SettingsPanelScreen(frame, policy, immersive);
-            PlacePanelLayer(frame, panel_screen);
-            if (input_ != nullptr) {
-                const diagnostics::ScopedStage input_timer(diagnostics::Stage::InputSync);
-                // After the screen is placed, so the pointer aims at this
-                // frame's screen rather than the previous one's.
-                input_->Sync(frame.xr_frame.predicted_display_time, PointerScreen(frame, policy, immersive),
-                             panel_screen, InputSeatFrame(immersive));
-            }
-
-            if (!frame.expects_gpu_submission) {
-                if (!backend_->FinishFrame(frame, false)) {
-                    SetError(backend_->LastError());
-                    fatal = true;
-                }
-                continue;
-            }
-
-            if (aurora_get_stereo_frame_interpolation() &&
-                !interpolation_pacing_.ShouldRender(frame.xr_frame.predicted_display_time, interpolation_target)) {
-                diagnostics::OnInterpolationSkip();
-                if (!diagnostics::Measure(diagnostics::Stage::Cancel, [&] {
-                    return backend_->TryCancelPendingFrame(frame);
-                }) || !backend_->FinishFrame(frame, false)) {
-                    SetError(backend_->LastError());
-                    fatal = true;
-                }
-                continue;
-            }
-
-            {
-                const diagnostics::ScopedStage publish_timer(diagnostics::Stage::Publish);
-                std::lock_guard lock(published_mutex_);
-                // First person renders at life-size scale, third person at the
-                // configured diorama scale. Head translation and IPD are the
-                // only things this multiplies, so a one-frame disagreement with
-                // the camera's own switch is not observable.
-                BuildPublishedFrame(frame, immersive, policy);
-                diagnostics::OnPacketPublished();
-                published_.store(&published_frame_, std::memory_order_release);
-            }
-            aurora_notify_stereo_frame();
-
-            OpenXRSubmissionStatus submission = OpenXRSubmissionStatus::Timeout;
-            bool canceled_before_encode = false;
-            const auto cancel_after =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-            while (!stop_.load(std::memory_order_acquire) &&
-                   submission == OpenXRSubmissionStatus::Timeout) {
-                // Fresh rendering wakes us immediately. A 50 ms keep-alive
-                // protects stalls without issuing eager repeats during GPU work.
-                submission = diagnostics::Measure(diagnostics::Stage::SubmissionWait, [&] {
-                    return backend_->WaitForSubmission(frame, 50);
-                });
-                if (submission == OpenXRSubmissionStatus::Timeout) {
-                    // A pause, minimized window, or guest stall may leave no GX
-                    // frame to consume this packet. Withdraw it, then cancel the
-                    // matching bridge target only if Encode has not taken ownership.
-                    if (std::chrono::steady_clock::now() >= cancel_after) {
-                        diagnostics::Measure(diagnostics::Stage::Withdraw, [&] { WithdrawPublishedFrame(); });
-                        canceled_before_encode = diagnostics::Measure(diagnostics::Stage::Cancel, [&] {
-                            return backend_->TryCancelPendingFrame(frame);
-                        });
-                        if (canceled_before_encode) {
-                            diagnostics::OnPacketCanceled();
-                            break;
-                        }
-                    }
-                    diagnostics::OnKeepaliveRepeat();
-                    if (!backend_->RepeatFrame(frame)) {
-                        SetError(backend_->LastError());
-                        fatal = true;
-                        break;
-                    }
-                }
-            }
-            diagnostics::Measure(diagnostics::Stage::Withdraw, [&] { WithdrawPublishedFrame(); });
-            if (stop_.load(std::memory_order_acquire)) {
-                // Aurora has been drained by Shutdown(); backend shutdown below
-                // cancels its pending target, then either safely releases the
-                // XR image or retains the entire graph if GPU completion is unknown.
-                break;
-            }
-            if (canceled_before_encode) {
-                if (!backend_->FinishFrame(frame, false)) {
-                    SetError(backend_->LastError());
-                    fatal = true;
-                }
-                continue;
-            }
-            if (fatal) {
-                break;
-            }
-            const bool submit = submission == OpenXRSubmissionStatus::Success;
-            diagnostics::OnSubmission(submit);
-            if (!backend_->FinishFrame(frame, submit)) {
-                SetError(backend_->LastError());
-                fatal = true;
-            } else if (submission == OpenXRSubmissionStatus::Skipped) {
-                // No GPU work touched the compositor image or the shared buffers, so the frame
-                // ended on the retained layer and the next one is tried normally. A long run of
-                // skips means the copy path is broken for good.
-                ++consecutive_skips;
-                if (consecutive_skips == 1 || consecutive_skips % 60 == 0) {
-                    RT_LOG(RT_TAG_RUNTIME) << "OpenXR: eye copy skipped (" << consecutive_skips
-                                           << " in a row): " << backend_->LastError() << std::endl;
-                }
-                if (consecutive_skips >= kMaxConsecutiveSkips) {
-                    SetError(std::string("Aurora's ") + kGraphicsBackendName +
-                             " stereo copy keeps failing; continuing on the mirror output");
-                    fatal = true;
-                }
-            } else if (!submit) {
-                SetError(std::string("Aurora's ") + kGraphicsBackendName +
-                         " stereo copy failed; continuing on the mirror output");
-                fatal = true;
-            } else {
-                consecutive_skips = 0;
-                ++timing_submissions_;
-            }
-            if (submit && !fatal && immersive && !immersive_submission_logged) {
-                immersive_submission_logged = true;
-                RT_LOG(RT_TAG_RUNTIME)
-                    << "[mkw-vr] first immersive packet consumed and submitted as "
-                       "an OpenXR projection layer"
-                    << std::endl;
             }
         }
 
+        pacing::Totals();
         SetInterpolationActive(false);
         aurora_set_pipeline_cache_idle_store(false);
         aurora_set_stereo_panel_layer(false);
@@ -1141,6 +1063,284 @@ private:
             stop_cv_.wait(lock, [this] { return stop_.load(std::memory_order_acquire); });
         }
         ShutdownOrRetainGraphicsObjects();
+    }
+
+    // ---- VR interpolation: an eye set every refresh (plan 1.3) ----
+    //
+    // Every compositor cycle: xrWaitFrame and xrBeginFrame; one xrLocateViews for the time the
+    // set will be displayed; both eyes, the menu/HUD screen, the panel and the pointer from those
+    // poses; xrEndFrame with exactly those poses, the images released only after the GPU
+    // finished them. Inline: the set is located for this cycle's display time, rendered, waited
+    // for and shown in the same cycle. Pipelined: located for the next cycle's display time,
+    // published after this cycle ended, and shown by the next cycle, so the GPU and the CPU
+    // overlap by one refresh (one refresh more latency). A set not finished by its deadline is
+    // never released early: the cycle repeats the retained layer with its own poses (late), and
+    // the set is shown by a later cycle. Only real misses (more than 12 of the last 240 sets
+    // late) drop the loop to a set every second refresh; it returns after 10 s once 6 or fewer
+    // of the last 600 were late. Both changes are logged.
+    enum class CycleResult { Continue, Break, Fatal };
+    enum class PacingMode { Inline, Pipelined };
+
+    struct SetPacingState {
+        OpenXRBackendFrame set{};
+        bool pending = false;
+        uint32_t timeouts = 0;
+        std::chrono::steady_clock::time_point published_at{};
+        bool half_rate = false;
+        bool odd_tick = false;
+        std::chrono::steady_clock::time_point half_since{};
+        std::deque<uint8_t> results;  // 1: the set was not finished by its first deadline
+        XrTime last_display_time = 0;
+    };
+
+    static const char* PacingModeName(PacingMode mode) noexcept {
+        return mode == PacingMode::Pipelined ? "pipelined" : "inline";
+    }
+
+    // A [vr] key of Config.toml that runtime_config.h does not know (read here so that header,
+    // which every translated file includes, stays untouched). Strings, or numbers as text.
+    static std::string ReadVrConfigText(const char* key) {
+        try {
+            std::ifstream file(RuntimeConfigFile::ResolveConfigPath(), std::ios::binary);
+            if (!file) return {};
+            const auto document = toml::parse(file, "Config.toml");
+            if (auto text = RuntimeConfigFile::FindConfigValue<std::string>(document, "vr", key)) return *text;
+            if (auto number = RuntimeConfigFile::FindConfigFloat(document, "vr", key)) {
+                std::ostringstream out;
+                out << *number;
+                return out.str();
+            }
+        } catch (const std::exception&) {
+        }
+        return {};
+    }
+
+    // [vr] frame_pacing = auto | inline | pipelined in Config.toml, KARTFRAME_PACING in the
+    // environment (wins). Auto is inline until measurements say otherwise.
+    void ReadPacingMode() {
+        std::string value;
+        if (const char* env = std::getenv("KARTFRAME_PACING"); env != nullptr && *env != '\0') {
+            value = env;
+            pacing_mode_source_ = std::string("KARTFRAME_PACING=") + env;
+        } else {
+            value = ReadVrConfigText("frame_pacing");
+            pacing_mode_source_ = value.empty() ? std::string("auto") : value;
+        }
+        pacing_mode_ = value == "pipelined" ? PacingMode::Pipelined : PacingMode::Inline;
+        if (!value.empty() && value != "auto" && value != "inline" && value != "pipelined") {
+            RT_LOG(RT_TAG_RUNTIME) << "OpenXR: unknown frame_pacing \"" << value << "\"; using inline" << std::endl;
+        }
+        // Time kept free between the deadline and the next xrWaitFrame wake-up for the release
+        // and xrEndFrame (KARTFRAME_PACING_MARGIN_US, default 1000).
+        long margin_us = 1000;
+        if (const char* env = std::getenv("KARTFRAME_PACING_MARGIN_US"); env != nullptr && *env != '\0') {
+            margin_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
+        }
+        pacing_margin_ = std::chrono::microseconds(margin_us);
+    }
+
+    // The session stopped or the loop is leaving the set path: a set still acquired is
+    // released once the GPU finished it, never shown.
+    bool DropPendingSet() {
+        auto& st = set_pacing_;
+        if (!st.pending) return true;
+        WithdrawPublishedFrame();
+        st.pending = false;
+        if (!backend_->DropSet(st.set)) {
+            SetError(backend_->LastError());
+            return false;
+        }
+        return true;
+    }
+
+    void NoteSetResult(bool late) {
+        auto& st = set_pacing_;
+        st.results.push_back(late ? 1 : 0);
+        while (st.results.size() > 600) st.results.pop_front();
+    }
+
+    void UpdateHalfRate() {
+        auto& st = set_pacing_;
+        const auto late_in_last = [&](size_t count) {
+            const size_t n = std::min(count, st.results.size());
+            return static_cast<size_t>(std::count(st.results.end() - static_cast<std::ptrdiff_t>(n), st.results.end(), 1));
+        };
+        const auto now = std::chrono::steady_clock::now();
+        if (!st.half_rate) {
+            const size_t window = std::min<size_t>(240, st.results.size());
+            const size_t late = late_in_last(240);
+            if (late > 12) {
+                st.half_rate = true;
+                st.half_since = now;
+                st.results.clear();
+                RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last " << window
+                                       << " eye sets late; rendering every second refresh" << std::endl;
+                pacing::SetMode(std::string(PacingModeName(pacing_mode_)) + "/2");
+            }
+        } else if (now - st.half_since >= std::chrono::seconds(10) && st.results.size() >= 600) {
+            const size_t late = late_in_last(600);
+            if (late <= 6) {
+                st.half_rate = false;
+                st.results.clear();
+                RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last 600 eye sets late; rendering every refresh again"
+                                       << std::endl;
+                pacing::SetMode(PacingModeName(pacing_mode_));
+            }
+        }
+    }
+
+    // Locates the set for display_time, places the screens and the pointer from its poses,
+    // and publishes it to Aurora.
+    CycleResult StartSet(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
+                         XrTime display_time, const OpenXRFrame& cycle) {
+        auto& st = set_pacing_;
+        OpenXRBackendFrame set{};
+        const OpenXRBeginStatus prepared = backend_->PrepareSet(presentation, display_time, cycle, set);
+        if (prepared == OpenXRBeginStatus::SessionNotRunning) {
+            return CycleResult::Continue;
+        }
+        if (prepared == OpenXRBeginStatus::ExitRequested) {
+            SetError("OpenXR runtime requested session exit; continuing on the mirror output");
+            return CycleResult::Break;
+        }
+        if (prepared == OpenXRBeginStatus::Error) {
+            SetError(backend_->LastError());
+            return CycleResult::Fatal;
+        }
+        if (diagnostics::Enabled()) {
+            NoteFrameDiagnostics(set, immersive);
+        }
+        // All of these read this set's located head pose.
+        ServiceRecenterRequest();
+        ApplyPendingReferenceSpaceChange(set.xr_frame);
+        UpdateVirtualScreenPose(set);
+        const OpenXRPointerScreen panel_screen = SettingsPanelScreen(set, policy, immersive);
+        PlacePanelLayer(set, panel_screen);
+        if (input_ != nullptr) {
+            const diagnostics::ScopedStage input_timer(diagnostics::Stage::InputSync);
+            input_->Sync(set.xr_frame.predicted_display_time, PointerScreen(set, policy, immersive), panel_screen,
+                         InputSeatFrame(immersive));
+        }
+        if (!set.expects_gpu_submission) {
+            return CycleResult::Continue;  // nothing to render: no tracking, or should_render off
+        }
+        st.set = set;
+        st.pending = true;
+        st.timeouts = 0;
+        st.published_at = std::chrono::steady_clock::now();
+        {
+            const diagnostics::ScopedStage publish_timer(diagnostics::Stage::Publish);
+            std::lock_guard lock(published_mutex_);
+            BuildPublishedFrame(st.set, immersive, policy);
+            diagnostics::OnPacketPublished();
+            published_.store(&published_frame_, std::memory_order_release);
+        }
+        aurora_notify_stereo_frame();
+        return CycleResult::Continue;
+    }
+
+    CycleResult SetCycle(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
+                         uint32_t interpolation_target, bool& immersive_submission_logged) {
+        auto& st = set_pacing_;
+        OpenXRFrame cycle{};
+        const OpenXRBeginStatus begin = backend_->BeginCycle(cycle);
+        if (begin == OpenXRBeginStatus::SessionNotRunning) {
+            MkwVRPolicySetSessionActive(false);
+            return DropPendingSet() ? CycleResult::Continue : CycleResult::Fatal;
+        }
+        if (begin == OpenXRBeginStatus::ExitRequested) {
+            SetError("OpenXR runtime requested session exit; continuing on the mirror output");
+            return CycleResult::Break;
+        }
+        if (begin == OpenXRBeginStatus::Error) {
+            SetError(backend_->LastError());
+            return CycleResult::Fatal;
+        }
+        UpdateFrameTiming(cycle);
+        const XrDuration period = cycle.predicted_display_period > 0 ? cycle.predicted_display_period : 8'333'333;
+        uint32_t missed = 0;
+        if (st.last_display_time != 0 && cycle.predicted_display_time > st.last_display_time) {
+            const double steps = static_cast<double>(cycle.predicted_display_time - st.last_display_time) /
+                                 static_cast<double>(period);
+            if (steps > 1.5) missed = static_cast<uint32_t>(std::lround(steps)) - 1;
+        }
+        st.last_display_time = cycle.predicted_display_time;
+        pacing::OnTick(headset_hz_.load(std::memory_order_relaxed), missed);
+        const auto deadline = backend_->CycleWakeTime() + std::chrono::nanoseconds(period) - pacing_margin_;
+        const bool pipelined = pacing_mode_ == PacingMode::Pipelined;
+        st.odd_tick = !st.odd_tick;
+        const XrTime set_time = cycle.predicted_display_time + (pipelined ? period : 0);
+        const bool render_tick = (!st.half_rate || st.odd_tick) &&
+                                 interpolation_pacing_.ShouldRender(set_time, interpolation_target);
+        if (!pipelined && !st.pending && render_tick) {
+            const CycleResult started = StartSet(presentation, policy, immersive, set_time, cycle);
+            if (started != CycleResult::Continue) return started;
+        }
+        bool shown = false;
+        if (st.pending) {
+            const OpenXRSubmissionStatus status = diagnostics::Measure(diagnostics::Stage::SubmissionWait, [&] {
+                return backend_->WaitForSubmissionUntil(st.set, deadline);
+            });
+            if (status == OpenXRSubmissionStatus::Success) {
+                if (!backend_->EndCycleWithSet(st.set)) {
+                    SetError(backend_->LastError());
+                    return CycleResult::Fatal;
+                }
+                shown = true;
+                st.pending = false;
+                WithdrawPublishedFrame();
+                if (st.timeouts == 0) NoteSetResult(false);
+                pacing::OnRendered();
+                diagnostics::OnSubmission(true);
+                ++timing_submissions_;
+                if (immersive && !immersive_submission_logged) {
+                    immersive_submission_logged = true;
+                    RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] first immersive packet consumed and submitted as "
+                                              "an OpenXR projection layer"
+                                           << std::endl;
+                }
+            } else if (status == OpenXRSubmissionStatus::Timeout) {
+                ++st.timeouts;
+                if (st.timeouts == 1) NoteSetResult(true);
+                // Late: due this cycle (half rate: by the cycle after).
+                if (st.timeouts == (st.half_rate ? 2u : 1u)) pacing::OnLate();
+                // A stalled game (nothing to replay) leaves the packet unconsumed: withdraw it
+                // after 50 ms and cancel the set if Aurora has not started encoding it.
+                if (std::chrono::steady_clock::now() - st.published_at >= std::chrono::milliseconds(50)) {
+                    diagnostics::Measure(diagnostics::Stage::Withdraw, [&] { WithdrawPublishedFrame(); });
+                    if (diagnostics::Measure(diagnostics::Stage::Cancel, [&] { return backend_->CancelSet(st.set); })) {
+                        st.pending = false;
+                        diagnostics::OnPacketCanceled();
+                    }
+                }
+            } else if (status == OpenXRSubmissionStatus::ShuttingDown) {
+                backend_->EndCycleRetained();
+                return CycleResult::Break;
+            } else {
+                // Aurora failed after GPU work may have been queued: those images stay
+                // acquired (never shown unfinished) and the session ends.
+                diagnostics::OnSubmission(false);
+                backend_->EndCycleRetained();
+                SetError(std::string("Aurora's ") + kGraphicsBackendName +
+                         " stereo copy failed; continuing on the mirror output");
+                return CycleResult::Fatal;
+            }
+        }
+        if (!shown) {
+            if (!backend_->EndCycleRetained()) {
+                SetError(backend_->LastError());
+                return CycleResult::Fatal;
+            }
+            pacing::OnRepeat();
+            diagnostics::OnKeepaliveRepeat();
+        }
+        if (pipelined && !st.pending && render_tick) {
+            const CycleResult started = StartSet(presentation, policy, immersive, set_time, cycle);
+            if (started != CycleResult::Continue) return started;
+        }
+        UpdateHalfRate();
+        pacing::Flush();
+        return CycleResult::Continue;
     }
 
     // One compositor cycle on the retained layer, with no frame left active. False on a fatal
@@ -1588,7 +1788,7 @@ private:
             XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
         // Initial valid poses may precede focus and positional tracking. Do
         // not retain those startup/floor-origin samples as the user's seat.
-        const bool tracked = runtime_->IsSessionFocused() && frame.xr_frame.views_valid &&
+        const bool tracked = FocusHeld() && frame.xr_frame.views_valid &&
             (frame.xr_frame.view_state_flags & (kPoseUsable | XR_VIEW_STATE_POSITION_TRACKED_BIT |
              XR_VIEW_STATE_ORIENTATION_TRACKED_BIT)) == (kPoseUsable | XR_VIEW_STATE_POSITION_TRACKED_BIT |
              XR_VIEW_STATE_ORIENTATION_TRACKED_BIT);
@@ -1883,6 +2083,19 @@ private:
         }
     }
 
+    // SteamVR takes focus for a few milliseconds now and then (VISIBLE, then FOCUSED again).
+    // A loss shorter than a second is not a pause: the screen placement and the frame loop
+    // carry on as if focused.
+    bool FocusHeld() noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        if (runtime_->IsSessionFocused()) {
+            last_focused_ = now;
+            return true;
+        }
+        return runtime_->IsSessionVisible() && last_focused_ != std::chrono::steady_clock::time_point{} &&
+               now - last_focused_ < std::chrono::seconds(1);
+    }
+
     void ResetTrackingOrigin() noexcept {
         base_position_ = {};
         base_position_valid_ = false;
@@ -1906,6 +2119,10 @@ private:
                 hz = static_cast<float>(1.0e9 / static_cast<double>(frame.predicted_display_period));
         }
         headset_hz_.store(hz, std::memory_order_relaxed);
+        if (hz > 0.0f && std::fabs(hz - logged_refresh_hz_) > 0.5f) {
+            logged_refresh_hz_ = hz;
+            RT_LOG(RT_TAG_RUNTIME) << "display refresh rate now " << hz << " Hz" << std::endl;
+        }
         const auto now = std::chrono::steady_clock::now();
         const float elapsed = std::chrono::duration<float>(now - timing_start_).count();
         if (elapsed >= 1.0f) {
@@ -1988,7 +2205,7 @@ private:
     // Converts the compositor's predicted display time onto the runtime's
     // steady clock, which is what Aurora's interpolation deadlines are paced by.
     uint64_t DisplayTimeNanos(XrTime display_time) noexcept {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MKW_OPENXR_LINUX_DESKTOP)
         if (convert_display_time_ == nullptr) {
             timespec now_spec{};
             if (clock_gettime(CLOCK_MONOTONIC, &now_spec) != 0) return 0;
@@ -2024,7 +2241,7 @@ private:
         return now_ns + delta > 0 ? static_cast<uint64_t>(now_ns + delta) : 0;
     }
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(MKW_OPENXR_LINUX_DESKTOP)
     // SteamVR's XrTime is CLOCK_MONOTONIC in nanoseconds and Waydroid shares the host's clock, so a
     // predicted display time normally lies a few frames ahead of now. If it does not, the runtime
     // uses another epoch: anchor it to the first frame seen, assuming that frame shows ~2 frames out.
@@ -2102,16 +2319,23 @@ private:
         return NormalizeFrameInterpolationFps(RuntimeConfigFile::Get().vrFrameInterpolationFps.value_or(1));
     }
     std::atomic_uint32_t frame_interpolation_fps_{AndroidFrameInterpolationFps()};
+#else
+    std::atomic_uint32_t frame_interpolation_fps_{RuntimeConfigFile::VrFrameInterpolationFps()};
+#endif
+#if defined(__ANDROID__) || defined(MKW_OPENXR_LINUX_DESKTOP)
     bool clock_fallback_logged_ = false;
     bool clock_offset_valid_ = false;
     int64_t clock_offset_ = 0;
-#else
-    std::atomic_uint32_t frame_interpolation_fps_{RuntimeConfigFile::VrFrameInterpolationFps()};
 #endif
     std::atomic_bool interpolation_available_{false};
     std::mutex interpolation_mutex_;
     bool interpolation_stopping_ = true;
     FrameInterpolationPacing interpolation_pacing_;
+    SetPacingState set_pacing_;
+    std::chrono::steady_clock::time_point last_focused_{};
+    PacingMode pacing_mode_ = PacingMode::Inline;
+    std::string pacing_mode_source_ = "auto";
+    std::chrono::microseconds pacing_margin_{1000};
     std::atomic<float> headset_hz_{0};
     std::atomic<float> rendered_fps_{0};
     std::chrono::steady_clock::time_point timing_start_ = std::chrono::steady_clock::now();
@@ -2119,6 +2343,9 @@ private:
     AdaptiveResolution adaptive_resolution_;
     float adaptive_scale_=1.f;
     PFN_xrGetDisplayRefreshRateFB get_display_refresh_rate_ = nullptr;
+    PFN_xrEnumerateDisplayRefreshRatesFB enumerate_display_refresh_rates_ = nullptr;
+    PFN_xrRequestDisplayRefreshRateFB request_display_refresh_rate_ = nullptr;
+    float logged_refresh_hz_ = 0.0f;
     PFN_xrPerfSettingsSetPerformanceLevelEXT set_performance_level_ = nullptr;
 #if defined(_WIN32)
     using ConvertDisplayTime = XrResult (XRAPI_PTR*)(XrInstance, XrTime, LARGE_INTEGER*);

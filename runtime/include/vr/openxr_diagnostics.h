@@ -345,3 +345,41 @@ inline void Info(std::string_view text) {
 }
 
 } // namespace mkw::vr::diagnostics
+
+// Always-on frame pacing counters: one line a second on the runtime log, in this
+// fixed format (frame/tools/session-report.py reads it; keep them in step):
+//
+//   vr pacing: t=<s> hz=<display Hz> mode=<pacing> ticks=<n> rendered=<n> interpolated=<n>
+//              late=<n> missed=<n> repeats=<n> gpu_ms=<p50>/<p99> encode_ms=<p50>/<p99>
+//
+// (one line). t: seconds since the session started running. hz: the display refresh rate.
+// mode: inline or pipelined, "/2" appended while the loop renders every second refresh only.
+// ticks: compositor cycles (xrWaitFrame) in the second. rendered: cycles ended with a newly
+// rendered eye set. interpolated: eye sets Aurora rendered from a retained game frame (VR
+// frame interpolation and the projected menu) rather than a new one. late: sets not finished
+// on the GPU by their display deadline. missed: refreshes the frame loop lost (display time
+// jumped by more than one period). repeats: cycles ended with the retained layer again.
+// gpu_ms: a set's time from Aurora's queue.Submit to its completion on the GPU, median and
+// 99th percentile. encode_ms: Aurora's frame worker from taking the packet to that submit.
+// A "vr pacing totals:" line in the same key=value form follows each session.
+namespace mkw::vr::pacing {
+void SetSink(std::function<void(std::string_view line)> sink);
+// A session started running (resets the counters and t).
+void Reset();
+void SetMode(std::string_view mode);
+// Pacing thread: one compositor cycle.
+void OnTick(float display_hz, uint32_t missed_refreshes);
+void OnRendered();
+void OnLate();
+void OnRepeat();
+// Aurora's frame worker took a packet (any thread).
+void NoteSetConsumed();
+// A set reached Dawn's queue; retained: rendered from a retained game frame.
+void OnSetSubmitted(int64_t now_ns, bool retained);
+// GPU submit-to-completion of one set (the GPU watcher thread).
+void OnSetGpu(double ms);
+// Pacing thread: writes the line once a second has passed since the last one.
+void Flush();
+// Writes the session's totals line (and resets nothing).
+void Totals();
+} // namespace mkw::vr::pacing

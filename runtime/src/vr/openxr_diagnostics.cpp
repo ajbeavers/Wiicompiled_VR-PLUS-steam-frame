@@ -607,3 +607,131 @@ void Info(std::string_view text) {
 
 } // namespace detail
 } // namespace mkw::vr::diagnostics
+
+namespace mkw::vr::pacing {
+namespace {
+struct Window {
+    uint32_t ticks = 0, rendered = 0, interpolated = 0, late = 0, missed = 0, repeats = 0;
+    std::vector<float> gpu, encode;
+    void Clear() { *this = {}; }
+};
+struct State {
+    std::mutex mutex;
+    std::function<void(std::string_view)> sink;
+    std::string mode = "inline";
+    float hz = 0.0f;
+    int64_t session_start_ns = 0;
+    int64_t window_start_ns = 0;
+    Window window;
+    Window total;  // gpu/encode samples are kept for the totals' percentiles
+    std::atomic_int64_t consumed_ns{0};
+};
+State& S() {
+    static State state;
+    return state;
+}
+float Percentile(std::vector<float>& values, double p) {
+    if (values.empty()) return 0.0f;
+    const size_t k = std::min(values.size() - 1, static_cast<size_t>(p * static_cast<double>(values.size() - 1) + 0.5));
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(k), values.end());
+    return values[k];
+}
+std::string Format(const char* head, double t, float hz, const std::string& mode, Window& w) {
+    char line[384];
+    const float g50 = Percentile(w.gpu, 0.50), g99 = Percentile(w.gpu, 0.99);
+    const float e50 = Percentile(w.encode, 0.50), e99 = Percentile(w.encode, 0.99);
+    std::snprintf(line, sizeof(line),
+                  "%s t=%.0f hz=%.0f mode=%s ticks=%u rendered=%u interpolated=%u late=%u missed=%u repeats=%u "
+                  "gpu_ms=%.2f/%.2f encode_ms=%.2f/%.2f",
+                  head, t, static_cast<double>(hz), mode.c_str(), w.ticks, w.rendered, w.interpolated, w.late, w.missed,
+                  w.repeats, static_cast<double>(g50), static_cast<double>(g99), static_cast<double>(e50),
+                  static_cast<double>(e99));
+    return line;
+}
+} // namespace
+
+void SetSink(std::function<void(std::string_view line)> sink) {
+    std::lock_guard lock(S().mutex);
+    S().sink = std::move(sink);
+}
+void Reset() {
+    auto& s = S();
+    std::lock_guard lock(s.mutex);
+    s.session_start_ns = s.window_start_ns = diagnostics::detail::NowNs();
+    s.window.Clear();
+    s.total.Clear();
+}
+void SetMode(std::string_view mode) {
+    std::lock_guard lock(S().mutex);
+    S().mode = std::string(mode);
+}
+void OnTick(float display_hz, uint32_t missed_refreshes) {
+    auto& s = S();
+    std::lock_guard lock(s.mutex);
+    s.hz = display_hz;
+    ++s.window.ticks;
+    s.window.missed += missed_refreshes;
+}
+void OnRendered() {
+    std::lock_guard lock(S().mutex);
+    ++S().window.rendered;
+}
+void OnLate() {
+    std::lock_guard lock(S().mutex);
+    ++S().window.late;
+}
+void OnRepeat() {
+    std::lock_guard lock(S().mutex);
+    ++S().window.repeats;
+}
+void NoteSetConsumed() { S().consumed_ns.store(diagnostics::detail::NowNs(), std::memory_order_relaxed); }
+void OnSetSubmitted(int64_t now_ns, bool retained) {
+    auto& s = S();
+    const int64_t consumed = s.consumed_ns.exchange(0, std::memory_order_relaxed);
+    std::lock_guard lock(s.mutex);
+    if (retained) ++s.window.interpolated;
+    if (consumed != 0 && now_ns > consumed) {
+        s.window.encode.push_back(static_cast<float>(static_cast<double>(now_ns - consumed) / 1.0e6));
+    }
+}
+void OnSetGpu(double ms) {
+    std::lock_guard lock(S().mutex);
+    S().window.gpu.push_back(static_cast<float>(ms));
+}
+void Flush() {
+    auto& s = S();
+    std::string line;
+    std::function<void(std::string_view)> sink;
+    {
+        std::lock_guard lock(s.mutex);
+        const int64_t now = diagnostics::detail::NowNs();
+        if (s.window_start_ns == 0) s.session_start_ns = s.window_start_ns = now;
+        if (now - s.window_start_ns < 1'000'000'000) return;
+        auto& w = s.window;
+        auto& t = s.total;
+        t.ticks += w.ticks; t.rendered += w.rendered; t.interpolated += w.interpolated;
+        t.late += w.late; t.missed += w.missed; t.repeats += w.repeats;
+        t.gpu.insert(t.gpu.end(), w.gpu.begin(), w.gpu.end());
+        t.encode.insert(t.encode.end(), w.encode.begin(), w.encode.end());
+        line = Format("vr pacing:", static_cast<double>(now - s.session_start_ns) / 1.0e9, s.hz, s.mode, w);
+        w.Clear();
+        s.window_start_ns = now;
+        sink = s.sink;
+    }
+    if (sink) sink(line);
+}
+void Totals() {
+    auto& s = S();
+    std::string line;
+    std::function<void(std::string_view)> sink;
+    {
+        std::lock_guard lock(s.mutex);
+        if (s.total.ticks == 0) return;
+        line = Format("vr pacing totals:", static_cast<double>(diagnostics::detail::NowNs() - s.session_start_ns) / 1.0e9,
+                      s.hz, s.mode, s.total);
+        sink = s.sink;
+        s.total.Clear();
+    }
+    if (sink) sink(line);
+}
+} // namespace mkw::vr::pacing
