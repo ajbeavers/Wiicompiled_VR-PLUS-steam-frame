@@ -749,7 +749,7 @@ else()
 endif()
 
 if(MKW_BUILD_TESTS)
-foreach(port_test IN ITEMS quest_input openxr_controller_profiles adaptive_resolution body_ik hand_workshop)
+foreach(port_test IN ITEMS quest_input openxr_controller_profiles adaptive_resolution body_ik hand_workshop frame_controls)
   add_executable(mkw_${port_test}_tests tests/${port_test}_tests.cpp)
   target_include_directories(mkw_${port_test}_tests PRIVATE include ../aurora-main/include)
   target_compile_features(mkw_${port_test}_tests PRIVATE cxx_std_20)
