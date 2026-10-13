@@ -7,7 +7,7 @@
 # the frames it got (reused, mispresented, dropped, reprojected), and the
 # compositor's GPU time.  tools/session-report.py reads both logs.
 # Usage: env -u LD_LIBRARY_PATH python3 -I vrtiming.py SECONDS [out.txt]
-# steam-frame/galaxyframe.sh runs it for the length of a session into
+# frame/kartframe.sh runs it for the length of a session into
 # ~/.local/share/GalaxyFrame/vrtiming.log (GQ_VRTIMING=0 turns that off).
 # Origin: tools/vrtiming.py of Moonlight XR Native (GPLv3).
 import ctypes, os, sys, time
