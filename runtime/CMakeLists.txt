@@ -247,6 +247,11 @@ else()
         set(SDL_STATIC ON CACHE BOOL "" FORCE)
     endif()
     set(SDL_TEST OFF CACHE BOOL "" FORCE)
+    if(MKW_PLATFORM_LINUX)
+        # SteamOS has no libXss headers; the screensaver extension is not needed (SDL falls back to
+        # the freedesktop and Wayland inhibitors).
+        set(SDL_X11_XSCRNSAVER OFF CACHE BOOL "" FORCE)
+    endif()
 
     # MinGW/WSL can choke on SDL precompiled headers; disable PCH for aurora/SDL.
     set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
@@ -330,6 +335,11 @@ if(MKW_ENABLE_OPENXR)
             set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
             set(BUILD_SDK_TESTS OFF CACHE BOOL "" FORCE)
             set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+            if(MKW_PLATFORM_LINUX)
+                # The SDK defaults to a system jsoncpp when one is installed, which cannot be exported
+                # with the static loader and would add a runtime dependency; use its vendored copy.
+                set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
+            endif()
             if(MKW_OPENXR_SDK_DIR)
                 if(NOT EXISTS "${MKW_OPENXR_SDK_DIR}/CMakeLists.txt")
                     message(FATAL_ERROR
