@@ -34,6 +34,15 @@ typedef struct MockGfx {
     // At a release: how long the app's GPU work took to finish (ms; 0 when it
     // already had).  Null: not checked.
     double (*release_wait_ms)(void);
+    // Exact check (MOCK_XR_BUSY_MS, Vulkan): at a release, sample the released image's memory
+    // and mark the queue; once the GPU passed the mark, sample again: a difference means the
+    // GPU was still writing the image when it was released.  Null: not available.
+    void (*release_snapshot)(void* images, int index);
+    // Compares the snapshots whose marks the GPU passed (wait != 0: all of them, waiting);
+    // returns how many changed after their release.
+    int (*poll_snapshots)(int wait);
+    // How many releases the exact check covered.
+    int (*snapshots_checked)(void);
 } MockGfx;
 
 extern const MockGfx kMockGfxGles;

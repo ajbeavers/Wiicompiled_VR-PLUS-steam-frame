@@ -62,6 +62,9 @@ required = $([ $FLAT = 1 ] && echo false || echo true)
 render_scale = 1.0
 frame_interpolation_fps = 1
 menu_shader_quality = 0
+# No first-run welcome or tutorial: the attract-mode demo race starts on its own.
+welcome_complete = true
+tutorial_completed = 3
 ${KF_MOCKRUN_VR:-}
 TOML
 LOG=$OUT/logs/$(date +%Y%m%d-%H%M%S)-$([ $FLAT = 1 ] && echo flat || echo mock).log
@@ -106,7 +109,7 @@ WATCH=$!
 wait $PID; RC=$?
 kill $WATCH 2>/dev/null
 echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
-grep -a 'xrmock: summary\|xrmock: frames\|xrmock: queue drain\|vr pacing totals' "$LOG" || true
+grep -a 'xrmock: summary\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|vr pacing totals' "$LOG" || true
 echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
 FATAL=$(grep -a -c 'fatal dialog\|Signal 11' "$LOG")
 echo "mockrun: fatal lines: $FATAL"

@@ -1091,7 +1091,7 @@ private:
         bool half_rate = false;
         bool odd_tick = false;
         std::chrono::steady_clock::time_point half_since{};
-        std::deque<uint8_t> results;  // 1: the set was not finished by its first deadline
+        std::deque<uint8_t> results;  // 1: the set was late (not finished by its deadline)
         XrTime last_display_time = 0;
         std::chrono::steady_clock::time_point first_set{};
     };
@@ -1321,7 +1321,8 @@ private:
                         << " ms, submitted " << ms(submitted) << " ms, GPU done " << ms(complete) << " ms" << std::endl;
                 }
                 WithdrawPublishedFrame();
-                if (st.timeouts == 0) NoteSetResult(false);
+                // On time: by its refresh (half rate: by the one after).
+                if (st.timeouts < (st.half_rate ? 2u : 1u)) NoteSetResult(false);
                 pacing::OnRendered();
                 diagnostics::OnSubmission(true);
                 ++timing_submissions_;
@@ -1333,7 +1334,7 @@ private:
                 }
             } else if (status == OpenXRSubmissionStatus::Timeout) {
                 ++st.timeouts;
-                if (st.timeouts == 1) NoteSetResult(true);
+                if (st.timeouts == (st.half_rate ? 2u : 1u)) NoteSetResult(true);
                 if (pacing_debug_ > 0 && st.timeouts == 1) {
                     --pacing_debug_;
                     RT_LOG(RT_TAG_RUNTIME) << "vr pacing debug: late set " << st.set.xr_frame.serial << " published "
@@ -1342,7 +1343,9 @@ private:
                         << ", deadline was " << std::chrono::duration<double, std::milli>(deadline - st.published_at).count()
                         << " ms after publish" << std::endl;
                 }
-                // Late: due this cycle (half rate: by the cycle after).
+                // Late: due this cycle (half rate: by the cycle after). Half rate is judged by
+                // its own deadline: the GPU clocks down at the lower load, so sets that would
+                // fit at full rate miss the first refresh there.
                 if (st.timeouts == (st.half_rate ? 2u : 1u)) pacing::OnLate();
                 // A stalled game (nothing to replay) leaves the packet unconsumed: withdraw it
                 // after 50 ms and cancel the set if Aurora has not started encoding it.

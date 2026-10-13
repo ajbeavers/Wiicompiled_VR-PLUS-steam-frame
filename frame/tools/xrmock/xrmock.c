@@ -21,10 +21,13 @@
 //   MOCK_XR_EXTENSIONS=a,b    replace the list of extensions offered
 //   MOCK_XR_SKIP=1            a frame begun late loses refreshes (the display
 //                             times jump), as on a headset
-//   MOCK_XR_BUSY_MS=<ms>      Vulkan: a release that waits longer than this
-//                             for the app's queue to go idle is an error
-//                             (off unless set: the app submits its next set
-//                             before releasing the last)
+//   MOCK_XR_BUSY_MS=<ms>      Vulkan: check that each released image was finished.
+//                             Exact where the images can be host visible (the
+//                             Frame): the image's bytes at the release against
+//                             its bytes once all work queued before the release
+//                             completed (other queued work does not count). Else
+//                             a release that waits longer than <ms> for the
+//                             app's queue to go idle is an error.
 //   MOCK_XR_EYE=<w>x<h>       recommended eye size (1728x1728, SteamVR's on
 //                             the Frame)
 //   MOCK_XR_TIME_OFFSET_S=<s> XrTime runs this far ahead of CLOCK_MONOTONIC
@@ -364,7 +367,13 @@ static XrResult XRAPI_CALL mRelease(XrSwapchain sc, const XrSwapchainImageReleas
     // set before it releases the last, so the queue is rarely idle here.
     static int busyCheck = -1;
     if (busyCheck < 0) busyCheck = getenv("MOCK_XR_BUSY_MS") != NULL;
-    if (busyCheck && gGfx && gGfx->release_wait_ms) {
+    if (busyCheck && gGfx && gGfx->release_snapshot) {
+        // Exact: the image's bytes at the release against its bytes once all work queued
+        // before the release completed (xrmock_vk.c).  Other work in the queue does not count.
+        int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
+        gGfx->release_snapshot(c->images, idx);
+        gReleases++;
+    } else if (busyCheck && gGfx && gGfx->release_wait_ms) {
         // The wait includes other processes' GPU work (the desktop's
         // compositor) ahead of the mock's own check: up to 4 ms seen
         // with the app's work all done.  The eyes' work takes 10 ms and more.
@@ -400,6 +409,14 @@ static XrResult XRAPI_CALL mBeginSession(XrSession s, const XrSessionBeginInfo* 
 }
 static XrResult XRAPI_CALL mEndSession(XrSession s) {
     (void)s;
+    if (gGfx && gGfx->poll_snapshots) {
+        int changed = gGfx->poll_snapshots(1);
+        gErrors += changed;
+        gBusyReleases += changed;
+    }
+    if (gGfx && gGfx->snapshots_checked)
+        fprintf(stderr, "xrmock: exact release check: %d releases compared after the GPU passed them, %d changed after release\n",
+                gGfx->snapshots_checked(), gBusyReleases);
     fprintf(stderr,
             "xrmock: summary: %d errors; %d releases checked for finished GPU work, %d before it finished (worst %.1f ms); "
             "%d projection layers: eyes from one locate for the display time submitted %d, for an earlier one %d, a later one %d; eyes from "
@@ -495,6 +512,14 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
     }
     gFrame++;
     trace("waitFrame");
+    if (gGfx && gGfx->poll_snapshots) {
+        int changed = gGfx->poll_snapshots(0);
+        for (int k = 0; k < changed; k++) {
+            trace("ERROR an image changed after its release: released before the GPU finished");
+            gErrors++;
+            gBusyReleases++;
+        }
+    }
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mBeginFrame(XrSession s, const XrFrameBeginInfo* bi) {

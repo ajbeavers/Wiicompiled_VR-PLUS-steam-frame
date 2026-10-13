@@ -27,7 +27,12 @@ the session (`xrmock: summary ...`):
 - acquire, wait and release in order per swapchain (both APIs);
 - Vulkan: no swapchain with mip levels (SteamVR on the Frame allocates
   memory for level 0 only; writing the others corrupted other images);
-- Vulkan, with `MOCK_XR_BUSY_MS=<ms>`: at each release the mock waits for the
+- Vulkan, with `MOCK_XR_BUSY_MS=<ms>`: exact where the swapchain memory can be
+  host visible (the Frame): a sample of the released image's bytes is taken at
+  the release, an empty submission marks the queue, and once the GPU passed the
+  mark the sample is taken again; a change means the GPU was still writing the
+  image when it was released. Unrelated work in the queue does not count.
+  Elsewhere, at each release the mock waits for the
   app's queue to go idle; longer than that means work was still queued. Off
   by default: the app records and submits the next set before it releases
   the last (its own check, per image against the timeline, logs

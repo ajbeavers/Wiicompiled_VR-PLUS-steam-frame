@@ -26,6 +26,16 @@ static VkQueue gQueue;
 static uint32_t gQueueFamily;
 static PFN_vkGetDeviceProcAddr gGdpa;
 
+// Memory of every swapchain image, mapped when it is host visible (the exact release check).
+#define MAX_IMAGES 256
+static struct {
+    VkImage image;
+    VkDeviceMemory memory;
+    unsigned char* map;
+    VkDeviceSize size;
+} gImages[MAX_IMAGES];
+static int gImageCount = 0;
+
 #define DEV(name) ((PFN_##name)gGdpa(gDevice, #name))
 #define INST(name) ((PFN_##name)gGipa(gInstance, #name))
 
@@ -149,12 +159,18 @@ static void* createImages(int64_t format, uint64_t usage, int width, int height,
         }
         VkMemoryRequirements req;
         DEV(vkGetImageMemoryRequirements)(gDevice, images[i], &req);
-        uint32_t type = 0;
-        for (uint32_t t = 0; t < mp.memoryTypeCount; t++) {
-            if (req.memoryTypeBits & (1u << t)) {
+        // Host visible where the device allows it (unified memory on the Frame): the exact
+        // release check reads the image's bytes.
+        uint32_t type = UINT32_MAX;
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t t = 0; t < mp.memoryTypeCount && getenv("MOCK_XR_BUSY_MS"); t++) {
+            if ((req.memoryTypeBits & (1u << t)) && (mp.memoryTypes[t].propertyFlags & want) == want) {
                 type = t;
                 break;
             }
+        }
+        for (uint32_t t = 0; t < mp.memoryTypeCount && type == UINT32_MAX; t++) {
+            if (req.memoryTypeBits & (1u << t)) type = t;
         }
         VkMemoryAllocateInfo ai;
         memset(&ai, 0, sizeof(ai));
@@ -162,7 +178,19 @@ static void* createImages(int64_t format, uint64_t usage, int width, int height,
         ai.allocationSize = req.size;
         ai.memoryTypeIndex = type;
         VkDeviceMemory mem;
-        if (DEV(vkAllocateMemory)(gDevice, &ai, NULL, &mem) == VK_SUCCESS) DEV(vkBindImageMemory)(gDevice, images[i], mem, 0);
+        if (DEV(vkAllocateMemory)(gDevice, &ai, NULL, &mem) == VK_SUCCESS) {
+            DEV(vkBindImageMemory)(gDevice, images[i], mem, 0);
+            if (gImageCount < MAX_IMAGES) {
+                gImages[gImageCount].image = images[i];
+                gImages[gImageCount].memory = mem;
+                gImages[gImageCount].size = req.size;
+                void* map = NULL;
+                if ((mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                    DEV(vkMapMemory)(gDevice, mem, 0, VK_WHOLE_SIZE, 0, &map) == VK_SUCCESS)
+                    gImages[gImageCount].map = (unsigned char*)map;
+                gImageCount++;
+            }
+        }
     }
     // As a runtime hands them out: color images in COLOR_ATTACHMENT_OPTIMAL,
     // depth in DEPTH_STENCIL_ATTACHMENT_OPTIMAL (XR_KHR_vulkan_enable2).
@@ -233,4 +261,76 @@ static double releaseWaitMs(void) {
     return (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
 }
 
-const MockGfx kMockGfxVk = {"vk", ownsBinding, describeBinding, getProc, formats, formatOf, createImages, fillImages, releaseWaitMs};
+// The exact check: SAMPLES chunks of the image's memory at its release, compared again once
+// an empty submission made at the release (so after all work queued before it) completed.
+#define SAMPLES 512
+#define CHUNK 64
+#define PENDING 32
+static struct {
+    int image;
+    VkFence fence;
+    unsigned char bytes[SAMPLES * CHUNK];
+} gPending[PENDING];
+static int gPendingCount = 0, gChecked = 0;
+static VkFence gFreeFences[PENDING];
+static int gFreeFenceCount = 0;
+
+static void sample(int image, unsigned char* out) {
+    VkDeviceSize step = gImages[image].size / SAMPLES;
+    for (int k = 0; k < SAMPLES; k++) memcpy(out + k * CHUNK, gImages[image].map + (VkDeviceSize)k * step, CHUNK);
+}
+
+static int pollSnapshots(int wait) {
+    int changed = 0;
+    unsigned char now[SAMPLES * CHUNK];
+    for (int i = 0; i < gPendingCount;) {
+        VkResult r = wait ? DEV(vkWaitForFences)(gDevice, 1, &gPending[i].fence, VK_TRUE, 2000000000ull)
+                          : DEV(vkGetFenceStatus)(gDevice, gPending[i].fence);
+        if (r != VK_SUCCESS) {
+            i++;
+            continue;
+        }
+        sample(gPending[i].image, now);
+        if (memcmp(now, gPending[i].bytes, sizeof(now)) != 0) changed++;
+        gChecked++;
+        DEV(vkResetFences)(gDevice, 1, &gPending[i].fence);
+        gFreeFences[gFreeFenceCount++] = gPending[i].fence;
+        gPending[i] = gPending[--gPendingCount];
+    }
+    return changed;
+}
+
+// At a release, inside xrReleaseSwapchainImage: the app holds its queue lock (SteamVR's client
+// submits there too).
+static void releaseSnapshot(void* images, int index) {
+    if (!gQueue) return;
+    VkImage image = ((VkImage*)images)[index];
+    int found = -1;
+    for (int k = 0; k < gImageCount; k++)
+        if (gImages[k].image == image && gImages[k].map && gImages[k].size >= SAMPLES * CHUNK) found = k;
+    if (found < 0 || gPendingCount == PENDING) return;
+    VkFence fence;
+    if (gFreeFenceCount) fence = gFreeFences[--gFreeFenceCount];
+    else {
+        VkFenceCreateInfo fi;
+        memset(&fi, 0, sizeof(fi));
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (DEV(vkCreateFence)(gDevice, &fi, NULL, &fence) != VK_SUCCESS) return;
+    }
+    sample(found, gPending[gPendingCount].bytes);
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    if (DEV(vkQueueSubmit)(gQueue, 1, &si, fence) != VK_SUCCESS) {
+        gFreeFences[gFreeFenceCount++] = fence;
+        return;
+    }
+    gPending[gPendingCount].image = found;
+    gPending[gPendingCount].fence = fence;
+    gPendingCount++;
+}
+
+static int snapshotsChecked(void) { return gChecked; }
+
+const MockGfx kMockGfxVk = {"vk", ownsBinding, describeBinding, getProc, formats, formatOf, createImages, fillImages, releaseWaitMs,
+                            releaseSnapshot, pollSnapshots, snapshotsChecked};
