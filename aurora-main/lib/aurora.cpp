@@ -2064,6 +2064,7 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
           stereo_overlay::composite_flat(encoder,output.view,output.size,0);
         } else {
           encode_menu_environment(encoder,mono,*input);
+          vrui::screen_marks(encoder,mono,*input);
         }
       } else if(input->ui.anchored) {
         auto frame=*input;webgpu::PresentSource panel{};
@@ -2403,6 +2404,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
           stereo_overlay::composite_flat(encoder, output.view, output.size, 0);
         } else {
           encode_menu_environment(encoder, completedMono, *ctx.stereoInput);
+          vrui::screen_marks(encoder, completedMono, *ctx.stereoInput);
         }
       } else if (ctx.stereoInput && ctx.stereoInput->ui.anchored) {
         auto frame=*ctx.stereoInput;
