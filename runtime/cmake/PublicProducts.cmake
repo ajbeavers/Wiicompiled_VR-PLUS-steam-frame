@@ -175,11 +175,10 @@ set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
     SKIP_UNITY_BUILD_INCLUSION ON
     SKIP_PRECOMPILE_HEADERS ON
     COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
-if(MKW_PLATFORM_ANDROID)
-    # The Quest app ships the runtime prebuilt and builds only the game from the player's disc
-    # (android/app/src/main/cpp/CMakeLists.txt, the game kit). These two are generated from that
-    # disc, so they must stay objects of their own rather than disappear into a unity batch the
-    # kit has to ship.
+if(MKW_PLATFORM_ANDROID OR MKW_PLATFORM_LINUX)
+    # The Quest app and the Linux kit (frame/export-kit.py) ship the runtime prebuilt and build only
+    # the game from the player's disc. These two are generated from that disc, so they must stay
+    # objects of their own rather than disappear into a unity batch the kit has to ship.
     set_source_files_properties("${DATA_INIT_FILE}" "${GUEST_SYMBOL_TABLE_FILE}" PROPERTIES
         SKIP_UNITY_BUILD_INCLUSION ON)
 endif()
@@ -421,6 +420,16 @@ if(MKW_PLATFORM_ANDROID)
     target_link_options(mkw_quest_kit_probe PRIVATE "-Wl,--unresolved-symbols=ignore-all")
 endif()
 
+if(MKW_PLATFORM_LINUX)
+    # The Linux game kit: WiiCompiled without any translated code, its undefined game symbols
+    # ignored. Building it builds every input the kit ships; frame/export-kit.py reads its link
+    # line out of build.ninja (the same scheme as the Quest probe above).
+    add_executable(kartframe_kit_probe EXCLUDE_FROM_ALL "${MKW_BASE_PRODUCT_SOURCE}")
+    mkw_configure_product(kartframe_kit_probe WITHOUT_GAME)
+    target_precompile_headers(kartframe_kit_probe REUSE_FROM WiiCompiled)
+    target_link_options(kartframe_kit_probe PRIVATE "-Wl,--unresolved-symbols=ignore-all")
+endif()
+
 if(MKW_HAVE_RETRO_REWIND)
     if(MKW_PLATFORM_ANDROID)
         add_library(RetroRewind SHARED "${MKW_RETRO_REWIND_PRODUCT_SOURCE}" ${MKW_RETRO_REGISTRATION_SOURCES})
@@ -470,7 +479,8 @@ endif()
 
 set(MKW_ALL_BUILD_TARGETS
     mkw_runtime_common mkw_base_shared mkw_base_sensitive mkw_retro_sensitive
-    mkw_retro_rewind_functions WiiCompiled RetroRewind mkw_quest_kit_probe mkw_quest_kit_probe_retro)
+    mkw_retro_rewind_functions WiiCompiled RetroRewind mkw_quest_kit_probe mkw_quest_kit_probe_retro
+    kartframe_kit_probe)
 foreach(target IN LISTS MKW_ALL_BUILD_TARGETS)
     if(TARGET ${target} AND MKW_BASELINE_ARCH_FLAG)
         target_compile_options(${target} PRIVATE ${MKW_BASELINE_ARCH_FLAG})

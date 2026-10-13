@@ -9,7 +9,24 @@ else ()
   set(_USE_SHARED OFF)
 endif ()
 
+# KartFrame: a shipped Linux binary must not depend on libraries that are not part of the stock
+# SteamOS image (abseil, libpng, freetype and their dependency chains were installed by hand on the
+# development machine). With this on, the four packages below are built from the pinned sources
+# below, as static libraries, instead of being found on the system.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(_AURORA_VENDOR_DEFAULT ON)
+else ()
+  set(_AURORA_VENDOR_DEFAULT OFF)
+endif ()
+option(AURORA_VENDOR_THIRD_PARTY "Build abseil, zlib, libpng and freetype from source (static) instead of using system copies" ${_AURORA_VENDOR_DEFAULT})
+if (AURORA_VENDOR_THIRD_PARTY)
+  set(_USE_SHARED OFF)
+endif ()
+
 function(aurora_find_package_global)
+  if (AURORA_VENDOR_THIRD_PARTY AND ARGV0 MATCHES "^(absl|ZLIB|PNG|Freetype)$")
+    return()
+  endif ()
   set(_PREV_FIND_PACKAGE_TARGETS_GLOBAL ${CMAKE_FIND_PACKAGE_TARGETS_GLOBAL})
   set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
   find_package(${ARGV})
