@@ -16,12 +16,14 @@ export KARTFRAME_SKIP_STEAM= HOME=$T/home XDG_DATA_HOME=$T/home/xdg   # XDG must
 mkdir -p "$HOME"
 
 # ---- Config.frame.toml: every key is one the parser reads, every value valid ----
-python3 -I - "$HERE/Config.frame.toml" "$REPO/runtime/include/runtime_config.h" << 'PY' && ok "Config.frame.toml keys and values" || bad "Config.frame.toml keys and values"
+python3 -I - "$HERE/Config.frame.toml" "$REPO/runtime/include/runtime_config.h" "$REPO/runtime/src/vr/openxr_integration.cpp" << 'PY' && ok "Config.frame.toml keys and values" || bad "Config.frame.toml keys and values"
 import re, sys, tomllib
 cfg = tomllib.load(open(sys.argv[1], "rb"))
 src = open(sys.argv[2]).read()
 known = set(re.findall(r'FindConfig\w*(?:<[^>]*>)?\(\s*document,\s*"(\w+)",\s*"(\w+)"', src))
 known |= set(re.findall(r'readRangedFloat\("(\w+)"', src)) and {("vr", k) for k in re.findall(r'readRangedFloat\("(\w+)"', src)}
+# [vr] keys the pacing code reads itself (openxr_integration.cpp ReadVrConfigText).
+known |= {("vr", k) for k in re.findall(r'ReadVrConfigText\("(\w+)"', open(sys.argv[3]).read())} if len(sys.argv) > 3 else set()
 errs = []
 for sec, kv in cfg.items():
     for k, v in kv.items():
@@ -138,7 +140,10 @@ check "portable.txt made" test -f "$KARTFRAME_HOME/portable.txt"
 check "wrapper never uses WiiCompiled/XDG" test ! -e "$XDG_DATA_HOME/WiiCompiled"
 check "Config.toml seeded with the game path" has "$KARTFRAME_HOME/UserData/Config.toml" "dvd_root = \"$KARTFRAME_HOME/game/DATA\""
 check "vrtiming logger stopped at exit" test -z "$(pgrep -f "$W/app/tools/vrtiming.py")"
-check "no switches set by default" has "$S/game.log" "env FDM= TU= PACING="
+check "defaults: sysmem on, no other switches" has "$S/game.log" "env FDM= TU=sysmem PACING="
+sleep 1
+run KARTFRAME_SYSMEM=0
+check "KARTFRAME_SYSMEM=0 turns sysmem off" has "$S/game.log" "env FDM= TU= PACING="
 sleep 1
 # mismatch logged
 echo '{"steam.app.4242": {"preferredRefreshRate": 72, "framesToThrottle": 0}}' > "$KARTFRAME_VRSETTINGS"; run FAKE_VRCMD_NOWRITE=1
