@@ -39,7 +39,12 @@
 
 // Aurora's Vulkan bridge (aurora-main/lib/webgpu/vulkan_win32_interop.cpp): whether the next sets' eyes
 // may render straight into their swapchain images. Not in the bridge's public header yet (lane I).
+// Weak: test binaries that stub the bridge's API need not stub this one (it is then null).
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" __attribute__((weak)) void aurora_vulkan_win32_allow_direct(bool allowed);
+#else
 extern "C" void aurora_vulkan_win32_allow_direct(bool allowed);
+#endif
 
 namespace mkw::vr {
 namespace {
@@ -747,7 +752,7 @@ public:
         const int direct_mode = !virtual_screen && target_count == kOpenXREyeCount
                                     ? (DirectEyes().NextImmersiveSet() ? 1 : 0)
                                     : -1;
-        aurora_vulkan_win32_allow_direct(direct_mode == 1);
+        if (&aurora_vulkan_win32_allow_direct != nullptr) aurora_vulkan_win32_allow_direct(direct_mode == 1);
         if (const std::string report = DirectEyes().TakeReport(); !report.empty()) Log(OpenXRLogLevel::Info, report);
         {
             std::lock_guard lock(submission_mutex_);

@@ -1649,6 +1649,38 @@ static void log_replay_quad(const gx::DrawData& draw, bool fullView) noexcept {
            (s >> 10) & 2047, (s >> 21) & 2047, ((s >> 32) & 1) != 0 ? " (EFB copy)" : "");
 }
 
+// Each class of full-frame 2D draw in an immersive frame, once, with where it goes: across the whole
+// eye (an untextured constant-colour fade) or not (a textured composite keeps the virtual screen or,
+// sampling a fresh EFB copy, the framebuffer-effect path).
+static void log_full_frame_class(const gx::DrawData& draw, bool fullView, const ClipRect& display) noexcept {
+  if (!draw.screenRect || draw.uniformReplayLayout.perspective || display.width <= 0 || display.height <= 0) {
+    return;
+  }
+  const auto& r = *draw.screenRect;
+  const float w = static_cast<float>(display.width), h = static_cast<float>(display.height);
+  if (!(r.left <= display.x + 0.02f * w && r.top <= display.y + 0.02f * h && r.left + r.width >= display.x + 0.98f * w &&
+        r.top + r.height >= display.y + 0.98f * h)) {
+    return;
+  }
+  static std::mutex mutex;
+  static std::vector<uint64_t> seen;
+  const uint64_t s = draw.quadSignature;
+  const uint64_t key = (s & 0x1'0000'03ffull) | (uint64_t(fullView) << 40) | (uint64_t(draw.fadeCandidate) << 41) |
+                       (uint64_t(draw.uniformReplayLayout.nativeEfbEffect) << 42);
+  std::lock_guard lock(mutex);
+  if (seen.size() >= 48 || std::ranges::find(seen, key) != seen.end()) {
+    return;
+  }
+  seen.push_back(key);
+  const uint32_t texgens = (s >> 6) & 15;
+  Log.info("Full-frame 2D draw class: blend {} logic {} texgens {}{}{} -> {}", s & 3, (s >> 2) & 15, texgens,
+           ((s >> 32) & 1) != 0 ? " (EFB copy)" : "", draw.invisible ? " (transparent)" : "",
+           fullView ? "across the whole eye (fade)"
+           : draw.uniformReplayLayout.nativeEfbEffect ? "framebuffer-effect path (recorded transforms, each eye)"
+           : texgens != 0 ? "virtual screen (textured composite, not a fade)"
+                          : "virtual screen");
+}
+
 static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
                                            LateStereoData* history = nullptr) noexcept {
   const StereoDisplaySource displaySource = stereo_display_source(g_renderPasses);
@@ -1719,6 +1751,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
         continue;
       }
       passSawScene = passSawScene || command.data.draw.gx.uniformReplayLayout.perspective;
+      log_full_frame_class(command.data.draw.gx, pass.efbTarget && fullView(command.data.draw.gx), displayRegion);
       if (pass.efbTarget && fullView(command.data.draw.gx)) {
         ++fullViewDrawCount;
         fullViewInvisibleCount += command.data.draw.gx.invisible ? 1 : 0;
