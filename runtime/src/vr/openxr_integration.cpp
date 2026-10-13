@@ -1119,7 +1119,9 @@ private:
     }
 
     // [vr] frame_pacing = auto | inline | pipelined in Config.toml, KARTFRAME_PACING in the
-    // environment (wins). Auto is inline until measurements say otherwise.
+    // environment (wins). Auto is pipelined: in the mock at 120 Hz with 1728 eyes, inline held
+    // 96 % of refreshes in menus and none in a race (Aurora's encode, ~3 ms, plus the GPU,
+    // ~6.5 ms, do not fit one refresh), pipelined 99.9 % in menus and ~93 % in a race.
     void ReadPacingMode() {
         std::string value;
         if (const char* env = std::getenv("KARTFRAME_PACING"); env != nullptr && *env != '\0') {
@@ -1129,9 +1131,9 @@ private:
             value = ReadVrConfigText("frame_pacing");
             pacing_mode_source_ = value.empty() ? std::string("auto") : value;
         }
-        pacing_mode_ = value == "pipelined" ? PacingMode::Pipelined : PacingMode::Inline;
+        pacing_mode_ = value == "inline" ? PacingMode::Inline : PacingMode::Pipelined;
         if (!value.empty() && value != "auto" && value != "inline" && value != "pipelined") {
-            RT_LOG(RT_TAG_RUNTIME) << "OpenXR: unknown frame_pacing \"" << value << "\"; using inline" << std::endl;
+            RT_LOG(RT_TAG_RUNTIME) << "OpenXR: unknown frame_pacing \"" << value << "\"; using pipelined" << std::endl;
         }
         // Time kept free between the deadline and the next xrWaitFrame wake-up for the release
         // and xrEndFrame (KARTFRAME_PACING_MARGIN_US, default 1000).
@@ -2376,7 +2378,7 @@ private:
     FrameInterpolationPacing interpolation_pacing_;
     SetPacingState set_pacing_;
     std::chrono::steady_clock::time_point last_focused_{};
-    PacingMode pacing_mode_ = PacingMode::Inline;
+    PacingMode pacing_mode_ = PacingMode::Pipelined;
     HalfRatePolicy half_rate_policy_ = HalfRatePolicy::Auto;
     int pacing_debug_ = std::getenv("KARTFRAME_PACING_DEBUG") ? 60 : 0;
     std::string pacing_mode_source_ = "auto";

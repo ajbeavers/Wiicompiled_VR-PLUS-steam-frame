@@ -8,6 +8,8 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <chrono>
+#include <thread>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -307,9 +309,43 @@ void TestGlobalSwitchAndConfig() {
     Require(RuntimeConfigFile::ParseConfig(off).diagnosticsOpenXRLogging == false);
 }
 
+// The always-on pacing line: fixed format (frame/tools/session-report.py parses it).
+void TestPacingLineFormat() {
+    using namespace mkw::vr;
+    std::vector<std::string> lines;
+    pacing::SetSink([&](std::string_view line) { lines.emplace_back(line); });
+    pacing::Reset();
+    pacing::SetMode("pipelined");
+    for (int i = 0; i < 120; ++i) {
+        pacing::OnTick(120.0f, i == 7 ? 2u : 0u);
+        pacing::OnRendered();
+        pacing::NoteSetConsumed();
+        pacing::OnSetSubmitted(diagnostics::detail::NowNs() + 3'000'000, i % 2 == 0);
+        pacing::OnSetGpu(2.5 + (i == 50 ? 10.0 : 0.0));
+    }
+    pacing::OnLate();
+    pacing::OnRepeat();
+    pacing::Totals();  // totals only count flushed seconds: nothing yet
+    Require(lines.empty());
+    pacing::Flush();  // less than a second since Reset: no line
+    Require(lines.empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1010));
+    pacing::Flush();
+    Require(lines.size() == 1);
+    const std::string& line = lines[0];
+    Require(line.rfind("vr pacing: t=1 hz=120 mode=pipelined ticks=120 rendered=120 interpolated=60 late=1 missed=2 repeats=1 ", 0) == 0);
+    Require(line.find(" gpu_ms=2.50/2.50 encode_ms=3.00/3.00") != std::string::npos);
+    pacing::Totals();
+    Require(lines.size() == 2 && lines[1].rfind("vr pacing totals: t=1 ", 0) == 0);
+    pacing::Totals();  // printed once per session
+    Require(lines.size() == 2);
+    pacing::SetSink({});
+}
+
 } // namespace
 
 int main() {
+    TestPacingLineFormat();
     TestSteadyWindow();
     TestLateSkippedAndStalledFrames();
     TestEventsAreRateLimited();
