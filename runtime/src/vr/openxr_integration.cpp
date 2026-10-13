@@ -525,7 +525,7 @@ public:
             input_.reset();
         }
 
-#if defined(__ANDROID__)
+#if defined(__linux__)
         // The producer: SDL's main thread, which also carries every guest fiber.
         game_thread_id_ = static_cast<uint32_t>(gettid());
 #endif
@@ -872,6 +872,36 @@ private:
             gx_registered = RegisterGxThread();
         }
 #endif
+#if defined(__linux__) && !defined(__ANDROID__)
+        // Raised priority for the threads a headset frame waits on, so other work on the machine
+        // (a build, SteamVR's own threads) cannot starve them. Aurora's frame worker and the GPU
+        // watcher may start later: raised once they publish their ids.
+        bool worker_raised = false;
+        bool watcher_raised = false;
+        {
+            std::ostringstream raised;
+            raised << "thread priority: pacing " << RaiseThreadPriority(0);
+            if (game_thread_id_ != 0) raised << "; game " << RaiseThreadPriority(game_thread_id_);
+            if (const uint32_t gx = GxThread::NativeThreadId(); gx > 1) raised << "; GX " << RaiseThreadPriority(gx);
+            RT_LOG(RT_TAG_RUNTIME) << raised.str() << std::endl;
+        }
+        const auto raise_late_threads = [&] {
+            if (!worker_raised) {
+                if (const uint32_t tid = aurora_get_frame_worker_native_thread_id(); tid != 0) {
+                    worker_raised = true;
+                    const std::string result = RaiseThreadPriority(tid);
+                    RT_LOG(RT_TAG_RUNTIME) << "thread priority: Aurora frame worker (tid " << tid << ") " << result << std::endl;
+                }
+            }
+            if (!watcher_raised) {
+                if (const uint32_t tid = OpenXRVulkanGpuWatcherThreadId(); tid != 0) {
+                    watcher_raised = true;
+                    const std::string result = RaiseThreadPriority(tid);
+                    RT_LOG(RT_TAG_RUNTIME) << "thread priority: GPU watcher (tid " << tid << ") " << result << std::endl;
+                }
+            }
+        };
+#endif
         ApplyPerformanceLevel();
         RequestDisplayRefreshRate();
         bool fatal = false;
@@ -884,6 +914,9 @@ private:
         bool immersive_submission_logged = false;
         int last_pacing_mode = -1;
         while (!stop_.load(std::memory_order_acquire) && !fatal) {
+#if defined(__linux__) && !defined(__ANDROID__)
+            if (!worker_raised || !watcher_raised) raise_late_threads();
+#endif
 #if defined(__ANDROID__)
             if (!worker_registered) {
                 worker_registered = RegisterAuroraFrameWorkerThread();

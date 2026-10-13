@@ -25,12 +25,16 @@ EXE=${KF_BUILD:-$(cd "$HERE/../.." && pwd)/build-linux}/kartframe
 # A game process (the binary itself, a Steam launch, Lepton/Waydroid), not a shell whose command line
 # merely mentions one (an agent's "kfbuild.sh . kartframe" kept this waiting forever).
 busy() { pgrep -x kartframe || pgrep -f '^[^ ]*reaper SteamLaunch' || pgrep -x waydroid || pgrep -f '^/bin/bash [^ ]*/lepton '; }
+# Timing runs hold KartFrame's build lock and PrimeFrame's (another project shares this machine's CPU
+# and GPU), the PrimeFrame one first, as `flock PrimeFrame flock KartFrame` does.
+PF_LOCK=$HOME/Games/PrimeFrame/.build.lock
+[ -e "$PF_LOCK" ] && exec 8>"$PF_LOCK" || exec 8>/dev/null
 exec 9>"$HOME/Games/KartFrame/.build.lock"
 while :; do
   while busy >/dev/null; do echo "perf: $NAME: a game is running, retrying in 5 min"; sleep 300; done
-  echo "perf: $NAME waiting for the build lock"; flock 9
+  echo "perf: $NAME waiting for the build locks"; [ -e "$PF_LOCK" ] && flock 8; flock 9
   busy >/dev/null || break
-  flock -u 9
+  flock -u 9; flock -u 8 2>/dev/null || true
 done
 echo "perf: $NAME running ${SECS}s ($*)"
 KF_IOSAMPLE_EXE=$EXE python3 -I "$HERE/iosample.py" "$D/io.tsv" &

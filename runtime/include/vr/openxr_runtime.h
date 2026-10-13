@@ -299,4 +299,12 @@ private:
     std::vector<OpenXRReferenceSpaceChange> m_pending_app_space_changes;
 };
 
+// Raises the scheduling priority of a thread of this process (tid 0: the calling one) a headset
+// frame depends on: the game thread, Aurora's frame worker, the pacing thread, the GPU watcher. On
+// the Frame the game shares five cores with SteamVR and anything else running (a build during the
+// third headset session starved the game thread: 2095 slow game frames). KARTFRAME_THREADPRIO:
+// high (default) the lowest nice RealtimeKit grants, at most -15 (else as nice); nice: what
+// RLIMIT_NICE allows; off: unchanged. Linux only; returns what was done, for the log.
+std::string RaiseThreadPriority(uint32_t tid);
+
 } // namespace mkw::vr

@@ -361,8 +361,12 @@ void frame_worker_main() noexcept {
     std::lock_guard lock(g_frameWorker.mutex);
     g_frameWorker.threadId = std::this_thread::get_id();
   }
-#if defined(__ANDROID__)
+#if defined(__linux__)
+  // Published for the host's scheduling (Android hints; Linux: the raised priority of the threads a
+  // headset frame depends on).
   g_frameWorkerNativeThreadId.store(static_cast<uint32_t>(gettid()), std::memory_order_release);
+#endif
+#if defined(__linux__)
   // A thread inherits its creator's name, and the producer that starts this
   // worker may itself be a named thread; profiles should tell the two apart.
   pthread_setname_np(pthread_self(), "aurora worker");

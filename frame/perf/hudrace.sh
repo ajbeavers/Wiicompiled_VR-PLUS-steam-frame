@@ -12,9 +12,9 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 NAME=${1:?name}; SECS=${2:-80}; shift; [ $# -gt 0 ] && shift
-OUT=${KF_PERF_OUT:-$HOME/.cache/kf-laneG/runs}
+OUT=${KF_PERF_OUT:-$HOME/.cache/kf-laneH/runs}
 DUMP=$OUT/$NAME/dump
-export KF_PERF_OUT=$OUT KF_PERF_HOME=${KF_PERF_HOME:-$HOME/.cache/kf-laneG/home-race}
+export KF_PERF_OUT=$OUT KF_PERF_HOME=${KF_PERF_HOME:-$HOME/.cache/kf-laneH/home-race}
 TMP=$OUT/.$NAME-dump; rm -rf "$TMP"; mkdir -p "$TMP"   # run.sh empties the run directory first
 bash "$HERE/run.sh" "$NAME" "$SECS" MOCK_XR_SKIP=1 TU_DEBUG=sysmem "KF_MOCKRUN_VR=hud_virtual_screen = true
 hand_hud = false" "MOCK_XR_PRESS=/user/hand/right/input/a/click@12/1.5" MOCK_XR_HANDS=1 \

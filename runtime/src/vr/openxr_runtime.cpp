@@ -12,11 +12,20 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
 #include <thread>
 #include <utility>
+#include <mutex>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <cerrno>
+#include <dlfcn.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace mkw::vr {
 namespace {
@@ -1050,6 +1059,119 @@ std::string OpenXRRuntime::ResultString(XrResult result) const {
     }
     return std::to_string(static_cast<int32_t>(result));
 }
+
+#if defined(__linux__) && !defined(__ANDROID__)
+namespace {
+// RealtimeKit (org.freedesktop.RealtimeKit1 on the system bus) through sd-bus, loaded at run time
+// (libsystemd is not linked).
+struct RealtimeKit {
+    struct Error {
+        const char* name;
+        const char* message;
+        int need_free;
+    };
+    using CallFn = int (*)(void*, const char*, const char*, const char*, const char*, Error*, void**, const char*, ...);
+    using PropFn = int (*)(void*, const char*, const char*, const char*, const char*, Error*, char, void*);
+    using UnrefFn = void* (*)(void*);
+    using ErrorFreeFn = void (*)(Error*);
+    bool tried = false, ok = false;
+    void* bus = nullptr;
+    CallFn call = nullptr;
+    PropFn prop = nullptr;
+    UnrefFn unref = nullptr;
+    ErrorFreeFn error_free = nullptr;
+    int32_t min_nice = 0;
+    std::string why;
+};
+constexpr const char* kRtkit = "org.freedesktop.RealtimeKit1";
+constexpr const char* kRtkitPath = "/org/freedesktop/RealtimeKit1";
+std::mutex g_rtkit_mutex;  // sd-bus objects are not thread-safe
+RealtimeKit g_rtkit;
+
+RealtimeKit* OpenRealtimeKit() {
+    RealtimeKit& r = g_rtkit;
+    if (r.tried) return r.ok ? &r : nullptr;
+    r.tried = true;
+    void* lib = dlopen("libsystemd.so.0", RTLD_NOW | RTLD_LOCAL);
+    if (lib == nullptr) {
+        r.why = "no libsystemd";
+        return nullptr;
+    }
+    using OpenFn = int (*)(void**);
+    const auto open = reinterpret_cast<OpenFn>(dlsym(lib, "sd_bus_open_system"));
+    r.call = reinterpret_cast<RealtimeKit::CallFn>(dlsym(lib, "sd_bus_call_method"));
+    r.prop = reinterpret_cast<RealtimeKit::PropFn>(dlsym(lib, "sd_bus_get_property_trivial"));
+    r.unref = reinterpret_cast<RealtimeKit::UnrefFn>(dlsym(lib, "sd_bus_message_unref"));
+    r.error_free = reinterpret_cast<RealtimeKit::ErrorFreeFn>(dlsym(lib, "sd_bus_error_free"));
+    const int rc = open && r.call && r.prop && r.unref && r.error_free ? open(&r.bus) : -ENOSYS;
+    if (rc < 0 || r.bus == nullptr) {
+        r.why = std::string("system bus: ") + std::strerror(-rc);
+        return nullptr;
+    }
+    RealtimeKit::Error error{};
+    const int got = r.prop(r.bus, kRtkit, kRtkitPath, kRtkit, "MinNiceLevel", &error, 'i', &r.min_nice);
+    r.error_free(&error);
+    if (got < 0) {
+        r.why = "RealtimeKit not available";
+        return nullptr;
+    }
+    r.ok = true;
+    return &r;
+}
+
+// The lowest nice RLIMIT_NICE lets this process set itself (0: none).
+int RlimitNice() {
+    rlimit limit{};
+    if (getrlimit(RLIMIT_NICE, &limit) != 0) return 0;
+    if (limit.rlim_cur == RLIM_INFINITY) return -20;
+    return std::min(0, 20 - static_cast<int>(std::min<rlim_t>(limit.rlim_cur, 40)));
+}
+} // namespace
+
+std::string RaiseThreadPriority(uint32_t tid) {
+    static const std::string mode = [] {
+        const char* env = std::getenv("KARTFRAME_THREADPRIO");
+        return std::string(env != nullptr && *env != '\0' ? env : "high");
+    }();
+    if (mode == "off" || mode == "0") return "unchanged (KARTFRAME_THREADPRIO=off)";
+    const pid_t thread = tid != 0 ? static_cast<pid_t>(tid) : static_cast<pid_t>(syscall(SYS_gettid));
+    constexpr int kWanted = -15;
+    std::string via, why;
+    if (mode != "nice") {
+        std::lock_guard lock(g_rtkit_mutex);
+        if (RealtimeKit* r = OpenRealtimeKit()) {
+            const int32_t nice = std::max(kWanted, r->min_nice);
+            RealtimeKit::Error error{};
+            void* reply = nullptr;
+            const int rc = r->call(r->bus, kRtkit, kRtkitPath, kRtkit, "MakeThreadHighPriority", &error, &reply, "ti",
+                                   static_cast<uint64_t>(thread), nice);
+            if (rc >= 0) via = "RealtimeKit";
+            else why = std::string("RealtimeKit refused: ") + (error.message ? error.message : std::strerror(-rc));
+            if (reply != nullptr) r->unref(reply);
+            r->error_free(&error);
+        } else {
+            why = g_rtkit.why;
+        }
+    }
+    if (via.empty()) {
+        const int nice = std::max(kWanted, RlimitNice());
+        if (nice < 0 && setpriority(PRIO_PROCESS, static_cast<id_t>(thread), nice) == 0) {
+            via = "RLIMIT_NICE";
+        } else if (why.empty()) {
+            why = nice < 0 ? std::string("setpriority: ") + std::strerror(errno) : "RLIMIT_NICE allows none";
+        }
+    }
+    errno = 0;
+    const int now = getpriority(PRIO_PROCESS, static_cast<id_t>(thread));
+    std::ostringstream out;
+    out << "nice " << (errno == 0 ? now : 99);
+    if (!via.empty()) out << " (" << via << ")";
+    else out << ", unchanged (" << why << ")";
+    return out.str();
+}
+#else
+std::string RaiseThreadPriority(uint32_t) { return "unchanged (not Linux)"; }
+#endif
 
 } // namespace mkw::vr
 
