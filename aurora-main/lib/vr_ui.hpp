@@ -288,4 +288,47 @@ void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,co
   }
   pass.End();
 }
+// The pointer's target marks drawn into the menus' screen image itself (eye target 0, the screen quad's
+// picture): a mark on the quad's own surface is visible and stereo-correct whatever order the runtime
+// composites the layers in (SteamVR on the Frame hid the environment layer's mark under the quad, H4.md).
+// Call after render() built the pipeline for this format; `source` is the picture placed in the image.
+void screen_marks(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,const AuroraStereoFrame& frame) {
+  const auto& output=g_stereoEyeTargets[0].output();
+  if(!pipeline || format!=output.format || !source.bindGroup || !source.size.width || !source.size.height) return;
+  const auto vp=webgpu::calculate_present_viewport(output.size.width,output.size.height,source.size.width,source.size.height);
+  const float width=std::max(.25f,frame.ui.width),height=width*float(source.size.height)/float(source.size.width);
+  std::vector<Vertex> vertices;
+  const auto at=[&](float x,float y,V color) {
+    const float px=vp.left+(x/width+.5f)*vp.width,py=vp.top+(.5f-y/height)*vp.height;
+    return Vertex{{px/float(output.size.width)*2-1,1-py/float(output.size.height)*2,0,1},{0,0},{color[0],color[1],color[2]},0};
+  };
+  for(int hand=0;hand<2;++hand) if(frame.ui.pointerTracked[hand]) {
+    const auto* ray=frame.ui.pointerRay[hand];
+    if(ray[5]>=-.001f) continue;
+    const float distance=(-frame.ui.distance-ray[2])/ray[5];
+    if(distance<=0 || distance>10) continue;
+    const float x=ray[0]+ray[3]*distance,y=ray[1]+ray[4]*distance;
+    if(std::abs(x)>width*.5f || std::abs(y)>height*.5f) continue;
+    const V color=hand?V{.96f,.74f,.31f}:V{.15f,.88f,.82f};
+    // A coloured ring with a dark edge and a white centre: readable on bright and dark menus alike.
+    const auto disc=[&](float radius,V inner,V outer) {
+      for(int segment=0;segment<20;++segment) {
+        const float angle=segment*6.2831853f/20,next=(segment+1)*6.2831853f/20;
+        vertices.push_back(at(x,y,inner));
+        vertices.push_back(at(x+radius*std::cos(angle),y+radius*std::sin(angle),outer));
+        vertices.push_back(at(x+radius*std::cos(next),y+radius*std::sin(next),outer));
+      }
+    };
+    disc(.018f,{.02f,.02f,.02f},{.02f,.02f,.02f});
+    disc(.015f,color,color);
+    disc(.006f,{1,1,1},{1,1,1});
+  }
+  if(vertices.empty()) return;
+  const wgpu::BufferDescriptor bd{.label="VR menu pointer marks",.usage=wgpu::BufferUsage::Vertex|wgpu::BufferUsage::CopyDst,.size=vertices.size()*sizeof(Vertex)};
+  auto buffer=g_device.CreateBuffer(&bd);g_queue.WriteBuffer(buffer,0,vertices.data(),vertices.size()*sizeof(Vertex));
+  const wgpu::RenderPassColorAttachment ca{.view=output.view,.loadOp=wgpu::LoadOp::Load,.storeOp=wgpu::StoreOp::Store};
+  const wgpu::RenderPassDescriptor rd{.label="VR menu pointer marks",.colorAttachmentCount=1,.colorAttachments=&ca};
+  auto pass=encoder.BeginRenderPass(&rd);pass.SetPipeline(pipeline);pass.SetBindGroup(0,source.bindGroup);
+  pass.SetVertexBuffer(0,buffer);pass.Draw(static_cast<uint32_t>(vertices.size()));pass.End();
+}
 }

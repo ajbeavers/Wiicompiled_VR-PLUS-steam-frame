@@ -126,9 +126,11 @@ DirectEyesChoice& DirectEyes() {
     return choice;
 }
 
-// KARTFRAME_MENU_ENV: unset (or "over") the menus' environment layer goes over the screen's quad, blended
-// by its alpha; "under" puts it under the quad (lane G's first order: the quad then hid the pointer's ray
-// and target mark on the screen, third headset session); "0" there is none.
+// KARTFRAME_MENU_ENV: unset (or "under") the menus' environment layer goes under the screen's quad; "over"
+// puts it over the quad, blended by its alpha (lane H's default); "0" there is none. The fourth headset
+// session showed the ray still hidden on the screen with "over": SteamVR on the Frame evidently draws the
+// projection layer before the quad whatever the submission order (H4.md). The pointer's target mark is
+// drawn into the screen's own image instead (Aurora), which needs no layer order at all.
 const char* MenuEnvironmentSetting() {
     const char* env = std::getenv("KARTFRAME_MENU_ENV");
     return env != nullptr ? env : "";
@@ -1296,11 +1298,9 @@ public:
             quad.size.height = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.height);
             // The room around the screen (controllers, pointer, plain background): one projection
             // layer from the packed environment image, with the set's own poses, the frame's only
-            // projection layer. Over the quad by default, blended by its alpha: the screen's area is
-            // transparent (0,0,0,0) except where the ray, its target mark or a controller is drawn
-            // (opaque, alpha 1, so premultiplied and straight alpha agree), so the pointer shows on the
-            // screen and a controller held in front of it stays in front. KARTFRAME_MENU_ENV=under puts
-            // it under the quad (the pointer is then hidden where the screen is).
+            // projection layer. Under the quad by default (the screen's area of it is transparent; the
+            // pointer's mark is in the screen's own image). KARTFRAME_MENU_ENV=over puts it over the quad,
+            // blended by its alpha, which SteamVR on the Frame did not honour (H4.md).
             const bool position_valid = (frame.xr_frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
             if (retained_env_valid_ && frame.presentation.menu_environment && frame.xr_frame.views_valid &&
                 position_valid && retained_env_swapchain_.handle != XR_NULL_HANDLE) {
@@ -1696,7 +1696,7 @@ private:
     }
 
     static bool MenuEnvironmentOver() {
-        static const bool over = std::string_view(MenuEnvironmentSetting()) != "under";
+        static const bool over = std::string_view(MenuEnvironmentSetting()) == "over";
         return over;
     }
 
