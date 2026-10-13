@@ -70,3 +70,17 @@ Lane G additions:
   (several separated by `;`): scripted presses on the Frame controller profile (mockrun sets
   MOCK_XR_PROFILE for it), e.g. `/user/hand/right/input/a/click@20/1.5` to walk through menus.
 
+
+Lane H additions:
+
+- Defaults that match SteamVR on the Frame (third headset session): the Frame's own per-eye fields of
+  view (`MOCK_XR_FOV` still sets a mirrored pair), `predictedDisplayTime` 3 refreshes after the
+  wake-up (`MOCK_XR_LEAD`; SteamVR's lead was 25 to 27 ms at 120 Hz) and 0.02 ms prediction jitter
+  (`MOCK_XR_PREDICT_JITTER=0` turns it off).
+- End-time check: every `xrEndFrame` must carry the `predictedDisplayTime` of the `xrWaitFrame` its
+  `xrBeginFrame` followed; anything else is an ERROR ("xrmock: end times" line).
+- The head rises 0.1 mm a second, so no two locates share a pose (the sway alone repeats about its
+  peaks, and the pose check then matched a twin locate: false "image rendered for a display time
+  183 ms after" errors).
+- `MOCK_XR_DUMP_STEP` (1: full-resolution dumps); dump files are named by the dump time to a tenth of
+  a second.

@@ -479,7 +479,7 @@ static void maybeDump(Chain* c, XrSwapchain sc) {
     if (c->dumped >= frames || t - at[mark - 1] > 5.0) return;
     int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
     char path[512];
-    snprintf(path, sizeof(path), "%s/t%03d-sc%d-%02d.ppm", dir, (int)at[mark - 1], chainId(sc), c->dumped);
+    snprintf(path, sizeof(path), "%s/t%05.1f-sc%d-%02d.ppm", dir, at[mark - 1], chainId(sc), c->dumped);
     if (gGfx->dump_image(c->images, idx, c->w, c->h, c->format, step, path)) trace("dump sc%d %s", chainId(sc), path);
     c->dumped++;
 }
@@ -793,7 +793,10 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
     for (uint32_t e = 0; e < 2 && e < cap; e++) {
         float x = e ? 0.032f : -0.032f;
         v[e].pose.orientation = (XrQuaternionf){0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)};
-        v[e].pose.position = (XrVector3f){x * c, 1.6f, -x * sn};
+        // The head also rises 0.1 mm a second, so no two locates share a pose: the sway alone repeats
+        // (yaw at t and at a time mirrored about a sine peak), and the pose check matched such a twin
+        // locate now and then ("image rendered for a display time 183 ms after...").
+        v[e].pose.position = (XrVector3f){x * c, 1.6f + 0.0001f * (float)t, -x * sn};
         const float rad = 3.14159265f / 180.0f;
         v[e].fov = (XrFovf){gFovDeg[e][0] * rad, gFovDeg[e][1] * rad, gFovDeg[e][2] * rad, gFovDeg[e][3] * rad};
         gLocates[gLocateNext].pose[e] = v[e].pose;
