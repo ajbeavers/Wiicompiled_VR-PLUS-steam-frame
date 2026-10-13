@@ -758,4 +758,5 @@ endforeach()
 
 target_compile_definitions(mkw_vr_settings_panel_tests PRIVATE TARGET_PC=1)
 target_compile_definitions(mkw_quest_input_tests PRIVATE TARGET_PC=1)
+target_compile_definitions(mkw_frame_controls_tests PRIVATE TARGET_PC=1)
 endif()
