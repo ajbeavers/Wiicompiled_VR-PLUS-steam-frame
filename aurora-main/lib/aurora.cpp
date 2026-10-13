@@ -888,6 +888,23 @@ gfx::StereoReplayFrame make_stereo_replay_frame(const AuroraStereoFrame& input, 
 
 #include "vr_ui.hpp"
 
+// The Frame's menus (AuroraStereoFrame::window on a virtual-screen packet with ui.anchored): eye target
+// 0 is the screen's image as usual, eye target 1 (both eyes side by side) the room around it, with the
+// controller models and the pointer, for the backend's environment projection layer.
+bool menu_environment_requested(const AuroraStereoFrame& frame) noexcept {
+  return frame.mode == AURORA_STEREO_FRAME_VIRTUAL_SCREEN && frame.ui.anchored && frame.window;
+}
+void encode_menu_environment(wgpu::CommandEncoder& encoder, const webgpu::PresentSource& mono,
+                             const AuroraStereoFrame& frame) {
+  const auto& target = g_stereoEyeTargets[1].output();
+  const uint32_t eyeWidth = target.size.width / AURORA_STEREO_EYE_COUNT;
+  for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
+    const vrui::Environment env{.view = target.view, .x = eye * eyeWidth, .width = eyeWidth,
+                                .height = target.size.height, .clear = eye == 0};
+    vrui::render(encoder, mono, frame, AuroraVRUiGuide{}, eye, &env);
+  }
+}
+
 void encode_virtual_screen_eye(wgpu::CommandEncoder& encoder, const webgpu::PresentSource& source, uint32_t eyeIndex) {
   const auto& output = g_stereoEyeTargets[eyeIndex].output();
   const std::array attachments{
@@ -2036,7 +2053,15 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
       .size=image.texture.size,.format=image.texture.format};
     for(uint32_t eye=0;eye<AURORA_STEREO_EYE_COUNT;++eye) {
       ensure_stereo_eye_target(eye,input->eyes[eye].width,input->eyes[eye].height);
-      if(input->ui.anchored) {
+      if(menu_environment_requested(*input)) {
+        if(eye==0) {
+          encode_virtual_screen_eye(encoder,mono,0);
+          const auto& output=g_stereoEyeTargets[0].output();
+          stereo_overlay::composite_flat(encoder,output.view,output.size,0);
+        } else {
+          encode_menu_environment(encoder,mono,*input);
+        }
+      } else if(input->ui.anchored) {
         auto frame=*input;webgpu::PresentSource panel{};
         const bool guide=g_retainedMenuGuide.active && stereo_overlay::prepared_source(panel);
         if(guide) frame.ui.width*=.75f;
@@ -2368,7 +2393,14 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     };
     for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
       const auto& output = g_stereoEyeTargets[eye].output();
-      if (ctx.stereoInput && ctx.stereoInput->ui.anchored) {
+      if (ctx.stereoInput && menu_environment_requested(*ctx.stereoInput)) {
+        if (eye == 0) {
+          encode_virtual_screen_eye(encoder, completedMono, 0);
+          stereo_overlay::composite_flat(encoder, output.view, output.size, 0);
+        } else {
+          encode_menu_environment(encoder, completedMono, *ctx.stereoInput);
+        }
+      } else if (ctx.stereoInput && ctx.stereoInput->ui.anchored) {
         auto frame=*ctx.stereoInput;
         webgpu::PresentSource panelSource{};
         const bool guide=ctx.uiGuide.active && stereo_overlay::prepared_source(panelSource);

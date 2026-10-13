@@ -147,6 +147,12 @@ struct OpenXRPresentation {
     // without one ignores it.
     bool passthrough = false;
 
+    // Used only by VirtualScreen (the Frame's menus): Aurora renders, besides the screen's image, a
+    // second target holding both eyes side by side (left half, right half) with the room around the
+    // screen: a plain background, the controller models and the pointer. The backend shows it as
+    // one projection layer together with the screen's quad.
+    bool menu_environment = false;
+
     OpenXRPanelLayer panel;
 };
 

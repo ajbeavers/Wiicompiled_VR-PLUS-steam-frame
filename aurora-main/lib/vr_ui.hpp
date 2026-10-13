@@ -30,9 +30,16 @@ std::atomic<int> requestedQuality{3};
 std::atomic<float> panelAspect{16.f/9.f};
 int activeQuality=-1;
 V point(const float* m,V p) { return {m[0]*p[0]+m[1]*p[1]+m[2]*p[2]+m[3],m[4]*p[0]+m[5]*p[1]+m[6]*p[2]+m[7],m[8]*p[0]+m[9]*p[1]+m[10]*p[2]+m[11]}; }
+// The menus' environment layer (the Frame): one eye's room around the screen drawn into its part of a
+// packed two-eye target. The screen itself is a separate quad layer, so its area stays transparent.
+struct Environment { wgpu::TextureView view; uint32_t x=0,width=0,height=0; bool clear=false; };
 void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,const AuroraStereoFrame& frame,
-            const AuroraVRUiGuide& layout,uint32_t eye) {
-  const auto& output=g_stereoEyeTargets[eye].output();
+            const AuroraVRUiGuide& layout,uint32_t eye,const Environment* env=nullptr) {
+  const auto& output=g_stereoEyeTargets[env?1:eye].output();
+  const wgpu::TextureView targetView=env?env->view:output.view;
+  const auto setViewport=[&](const wgpu::RenderPassEncoder& pass) {
+    if(env) pass.SetViewport(float(env->x),0,float(env->width),float(env->height),0,1);
+  };
   panelAspect.store(float(source.size.width)/std::max(1u,source.size.height),std::memory_order_relaxed);
   // Apply changes between stereo pairs, so both eyes use the same quality.
   const int quality=(eye==0 || activeQuality<0)?requestedQuality.load(std::memory_order_relaxed):activeQuality;
@@ -58,6 +65,7 @@ void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,co
         return vec4f(tanh(light.xyz+vec3f(0.1*length(light)))*0.65,1);
       }
       @fragment fn fs(i:O)->@location(0) vec4f {
+        if(i.t > 2.5) { return vec4f(0.0); }
         if(i.t < -1.5) {
           return dielectric(normalize(i.c),i.origin,-i.t-2.0);
         }
@@ -101,6 +109,7 @@ void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,co
     const wgpu::RenderPassColorAttachment ca{.view=view,.loadOp=load,.storeOp=wgpu::StoreOp::Store};
     const wgpu::RenderPassDescriptor rd{.label="VR menu environment",.colorAttachmentCount=1,.colorAttachments=&ca};
     auto pass=encoder.BeginRenderPass(&rd);pass.SetPipeline(pipeline);pass.SetBindGroup(0,binding);
+    if(view.Get()==targetView.Get()) setViewport(pass);
     pass.SetVertexBuffer(0,buffer);pass.Draw(count);pass.End();
   };
   static const auto start=std::chrono::steady_clock::now();
@@ -117,13 +126,13 @@ void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,co
        -(m[1]*m[3]+m[5]*m[7]+m[9]*m[11])/6,
        -(m[2]*m[3]+m[6]*m[7]+m[10]*m[11])/6}};
   }
-  if(quality) {
+  if(quality && !env) {
     drawVertices(panoramaView,source.bindGroup,sky,3,wgpu::LoadOp::Clear);
     for(auto& v:sky) v.textured=-1;
-    drawVertices(output.view,panoramaBinding,sky,3,wgpu::LoadOp::Clear);
+    drawVertices(targetView,panoramaBinding,sky,3,wgpu::LoadOp::Clear);
   } else {
     for(auto& v:sky) { v.textured=0;v.color[0]=.012f;v.color[1]=.018f;v.color[2]=.027f; }
-    drawVertices(output.view,source.bindGroup,sky,3,wgpu::LoadOp::Clear);
+    drawVertices(targetView,source.bindGroup,sky,3,!env || env->clear?wgpu::LoadOp::Clear:wgpu::LoadOp::Load);
   }
   std::vector<Vertex> vertices;
   bool workshop=false;
@@ -144,7 +153,11 @@ void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,co
   };
   const float width=std::max(.25f,frame.ui.width),height=width*float(source.size.height)/std::max(1u,source.size.width);
   const auto panelSlice=[&](float top,float bottom) { quad({0,(.5f-(top+bottom)/2)*height,-frame.ui.distance},width,(bottom-top)*height,0,top,1,bottom); };
-  if(!layout.active) panelSlice(0,1);
+  if(env) {
+    // The screen's own quad layer shows the picture: leave its area transparent black.
+    quad({0,0,-frame.ui.distance},width,height,0,0,1,1);
+    for(size_t i=vertices.size()-6;i<vertices.size();++i) vertices[i].textured=3;
+  } else if(!layout.active) panelSlice(0,1);
   else {
     panelSlice(0,layout.headerEnd);panelSlice(layout.footerStart,1);
   }
@@ -267,9 +280,9 @@ void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,co
   }
   const wgpu::BufferDescriptor bd{.label="Anchored VR UI vertices",.usage=wgpu::BufferUsage::Vertex|wgpu::BufferUsage::CopyDst,.size=std::max(size_t(4),vertices.size()*sizeof(Vertex))};
   auto buffer=g_device.CreateBuffer(&bd);if(!vertices.empty()) g_queue.WriteBuffer(buffer,0,vertices.data(),vertices.size()*sizeof(Vertex));
-  const wgpu::RenderPassColorAttachment ca{.view=output.view,.loadOp=wgpu::LoadOp::Load,.storeOp=wgpu::StoreOp::Store};
+  const wgpu::RenderPassColorAttachment ca{.view=targetView,.loadOp=wgpu::LoadOp::Load,.storeOp=wgpu::StoreOp::Store};
   const wgpu::RenderPassDescriptor rd{.label="Anchored VR UI stereo",.colorAttachmentCount=1,.colorAttachments=&ca};
-  auto pass=encoder.BeginRenderPass(&rd);pass.SetPipeline(pipeline);pass.SetVertexBuffer(0,buffer);
+  auto pass=encoder.BeginRenderPass(&rd);pass.SetPipeline(pipeline);setViewport(pass);pass.SetVertexBuffer(0,buffer);
   for(const auto& range:materialRanges) if(range.count) {
     pass.SetBindGroup(0,range.binding);pass.Draw(range.count,1,range.first);
   }

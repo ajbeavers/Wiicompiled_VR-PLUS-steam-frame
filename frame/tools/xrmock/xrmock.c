@@ -688,7 +688,9 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
                 else gRepeatSets++;
             }
             int located = checkPoses(p, ei->displayTime, fresh);
-            if (gStampOn && gGfx && gGfx->stamp_read && p->viewCount == 2) {
+            // A layer whose eyes share one image (packed side by side) carries no stamp.
+            if (gStampOn && gGfx && gGfx->stamp_read && p->viewCount == 2 &&
+                p->views[0].subImage.swapchain != p->views[1].subImage.swapchain) {
                 for (int v = 0; v < 2; v++) {
                     Chain* ch = chainOf(p->views[v].subImage.swapchain);
                     if (located < 0) gStampUnknownPose++;

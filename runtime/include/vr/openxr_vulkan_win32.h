@@ -120,6 +120,9 @@ public:
     // False once the settings panel's own layer could not be set up; the panel
     // is then drawn into the eyes again.
     bool PanelLayerAvailable() const;
+    // The menus' environment layer (OpenXRPresentation::menu_environment): on unless
+    // KARTFRAME_MENU_ENV=0 or its swapchains could not be made.
+    bool MenuEnvironmentAvailable() const;
     const OpenXRWindowsVulkanGraphicsRequirements& GraphicsRequirements() const;
     int64_t SwapchainFormat() const;
     const std::string& LastError() const;

@@ -985,6 +985,9 @@ private:
             const bool immersive = policy.presentation == VRPresentationMode::ImmersiveRace;
             presentation.mode = (immersive || OpenXRProjectedMenus()) ? OpenXRFrameMode::ImmersiveProjection
                                            : OpenXRFrameMode::VirtualScreen;
+            // The Frame's menus: the controllers and the pointer around the screen's quad.
+            presentation.menu_environment =
+                presentation.mode == OpenXRFrameMode::VirtualScreen && MenuEnvironmentAvailable();
             presentation.quad_distance_meters = policy.config.hud_distance_meters;
             presentation.quad_width_meters = policy.config.hud_width_meters;
             if (float picture_aspect = 0.0f, snapshot_aspect = 0.0f;
@@ -1665,9 +1668,15 @@ private:
     }
     void BuildMenuUi(const OpenXRBackendFrame& source, AuroraStereoFrame& destination) noexcept {
         XrPosef panel{};
-        if (!OpenXRProjectedMenus() || !MenuScreenPose(source,panel)) {
+        const bool environment = source.presentation.mode == OpenXRFrameMode::VirtualScreen &&
+                                 source.presentation.menu_environment;
+        if (!(OpenXRProjectedMenus() || environment) || !MenuScreenPose(source,panel)) {
             OpenXRPublishHandWorkshopTracking({});return;
         }
+        // A virtual-screen packet with `window` set asks Aurora for the menu environment: target 0
+        // the screen's image as usual, target 1 both eyes side by side with the controllers and the
+        // pointer around the screen (the flag has no other meaning outside immersive replay).
+        destination.window = environment;
         destination.ui.anchored=true;
         destination.ui.distance=source.presentation.quad_distance_meters;
         destination.ui.width=source.presentation.quad_width_meters;
@@ -1987,6 +1996,16 @@ private:
     // Android: `adb shell setprop debug.wiicompiled.panel_layer 0` draws the settings panel into
     // the eyes again, to compare the two ways or to rule out a runtime's quad layers. Read about
     // once a second.
+    // The menus' environment layer (controllers and pointer around the screen's quad): the Frame's
+    // Vulkan backend only.
+    bool MenuEnvironmentAvailable() const noexcept {
+#if defined(MKW_OPENXR_LINUX_DESKTOP)
+        return backend_ != nullptr && backend_->MenuEnvironmentAvailable();
+#else
+        return false;
+#endif
+    }
+
     bool PanelLayerForcedOff() noexcept {
 #if defined(__ANDROID__)
         if (panel_layer_poll_ == 0) {

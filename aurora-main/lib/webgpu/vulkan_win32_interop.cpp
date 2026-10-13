@@ -222,7 +222,8 @@ public:
       destination.texture = active[i];
       wgpu::Extent3D size{targets[i].width, targets[i].height, 1};
       encoder.CopyTextureToTexture(&source, &destination, &size);
-      if (StampEnabled() && i < count && count == 2 && targets[i].width >= 64 * kStampCell &&
+      if (StampEnabled() && frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && i < count && count == 2 &&
+          targets[i].width >= 64 * kStampCell &&
           targets[i].height >= 3 * kStampCell)
         WriteStamp(encoder, active[i], sources[i].format, frame.displayTimeNanos, i);
     }

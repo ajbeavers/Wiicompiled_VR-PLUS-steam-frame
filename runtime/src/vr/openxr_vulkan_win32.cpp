@@ -33,6 +33,14 @@
 
 namespace mkw::vr {
 namespace {
+// KARTFRAME_MENU_ENV: unset the menus' environment layer goes under the screen's quad, "over" over it,
+// "0" there is none.
+const char* MenuEnvironmentSetting() {
+    const char* env = std::getenv("KARTFRAME_MENU_ENV");
+    return env != nullptr ? env : "";
+}
+} // namespace
+namespace {
 
 // When the GPU finished each eye set. SteamVR shows a swapchain image the moment it is
 // released, finished or not, so the pacing thread releases a set only after this says so.
@@ -587,17 +595,23 @@ public:
 
     // Both pacing paths retain ownership until completion or cancellation.
     OpenXRWindowsVulkanBeginStatus PrepareTargets(OpenXRWindowsVulkanFrame& frame) {
-        const uint32_t target_count =
-            frame.presentation.mode == OpenXRWindowsVulkanFrameMode::VirtualScreen ? 1u : kOpenXREyeCount;
+        const bool virtual_screen = frame.presentation.mode == OpenXRWindowsVulkanFrameMode::VirtualScreen;
+        // The menus' environment: target 1 is the packed two-eye environment image, not the right eye.
+        const bool environment = virtual_screen && frame.presentation.menu_environment && EnsureEnvSwapchains();
+        frame.presentation.menu_environment = environment;
+        const uint32_t target_count = virtual_screen && !environment ? 1u : kOpenXREyeCount;
         if (target_count == 1) {
             frame.render_width[1] = frame.render_width[0];
             frame.render_height[1] = frame.render_height[0];
+        } else if (environment) {
+            frame.render_width[1] = env_swapchain_.width;
+            frame.render_height[1] = env_swapchain_.height;
         }
 
         std::array<AuroraD3D12StereoTarget, kOpenXREyeCount> targets{};
         const diagnostics::Stopwatch acquire_timer;
         for (uint32_t eye = 0; eye < target_count; ++eye) {
-            auto& swapchain = eye_swapchains_[eye];
+            auto& swapchain = environment && eye == 1 ? env_swapchain_ : eye_swapchains_[eye];
             // A canceled set leaves its images acquired and waited (nothing wrote them); reuse them.
             if (!(swapchain.acquired && swapchain.waited) && !AcquireSwapchain(swapchain)) {
                 ReleaseAcquiredSwapchains();
@@ -1058,6 +1072,10 @@ public:
                 std::swap(panel_swapchain_, retained_panel_swapchain_);
             }
             retained_panel_valid_ = frame.presentation.panel.requested;
+            if (frame.presentation.menu_environment) {
+                std::swap(env_swapchain_, retained_env_swapchain_);
+            }
+            retained_env_valid_ = frame.presentation.menu_environment;
             retained_frame_ = frame;
             retained_locate_time_ = next_layer_locate_time_;
             retained_session_serial_ = render_session_serial_;
@@ -1165,6 +1183,38 @@ public:
                 std::max(0.25f, frame.presentation.quad_width_meters) / static_cast<float>(image_width);
             quad.size.width = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.width);
             quad.size.height = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.height);
+            // The room around the screen (controllers, pointer, plain background): one projection
+            // layer from the packed environment image, with the set's own poses. Under the quad by
+            // default; KARTFRAME_MENU_ENV=over puts it over the quad, blended by its alpha (the
+            // screen's area is transparent there), so a controller in front of the screen stays in
+            // front of it on a compositor that keeps the layer order.
+            const bool position_valid = (frame.xr_frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+            if (retained_env_valid_ && frame.presentation.menu_environment && frame.xr_frame.views_valid &&
+                position_valid && retained_env_swapchain_.handle != XR_NULL_HANDLE) {
+                std::array<XrCompositionLayerProjectionView, kOpenXREyeCount> views{};
+                const int32_t eye_width = static_cast<int32_t>(retained_env_swapchain_.width / kOpenXREyeCount);
+                for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+                    views[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                    views[eye].pose = frame.xr_frame.views[eye].pose;
+                    views[eye].fov = frame.xr_frame.views[eye].fov;
+                    views[eye].subImage.swapchain = retained_env_swapchain_.handle;
+                    views[eye].subImage.imageRect = {{static_cast<int32_t>(eye) * eye_width, 0},
+                                                     {eye_width, static_cast<int32_t>(retained_env_swapchain_.height)}};
+                    views[eye].subImage.imageArrayIndex = 0;
+                }
+                XrCompositionLayerProjection environment{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+                environment.space = runtime_->AppSpace();
+                environment.viewCount = kOpenXREyeCount;
+                environment.views = views.data();
+                const bool over = MenuEnvironmentOver();
+                environment.layerFlags = over ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0;
+                const XrCompositionLayerBaseHeader* scene[2] = {
+                    reinterpret_cast<const XrCompositionLayerBaseHeader*>(over ? static_cast<const void*>(&quad)
+                                                                               : static_cast<const void*>(&environment)),
+                    reinterpret_cast<const XrCompositionLayerBaseHeader*>(over ? static_cast<const void*>(&environment)
+                                                                               : static_cast<const void*>(&quad))};
+                return EndFrameWithPanel(frame, scene, 2);
+            }
             return EndFrameWithPanel(frame, reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad));
         } else {
             std::array<XrCompositionLayerProjectionView, kOpenXREyeCount> views{};
@@ -1192,10 +1242,14 @@ public:
     // Ends the compositor frame with the scene's layer and, while the retained
     // frame rendered it, the settings panel's layer over it.
     bool EndFrameWithPanel(const OpenXRBackendFrame& frame, const XrCompositionLayerBaseHeader* scene) {
+        return EndFrameWithPanel(frame, &scene, 1);
+    }
+    bool EndFrameWithPanel(const OpenXRBackendFrame& frame, const XrCompositionLayerBaseHeader* const* scene,
+                           uint32_t scene_count) {
         const auto& panel = frame.presentation.panel;
         XrCompositionLayerQuad panel_quad{};
-        const XrCompositionLayerBaseHeader* layers[2] = {scene, nullptr};
-        uint32_t count = 1;
+        const XrCompositionLayerBaseHeader* layers[3] = {scene[0], scene_count > 1 ? scene[1] : nullptr, nullptr};
+        uint32_t count = std::min(scene_count, 2u);
         if (retained_panel_valid_ && panel.requested && panel.placed) {
             panel_quad = OpenXRPanelQuadLayer(panel, runtime_->AppSpace(), retained_panel_swapchain_.handle);
             layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel_quad);
@@ -1281,6 +1335,10 @@ public:
 
     bool IsBound() const { return bound_; }
     bool PanelLayerAvailable() const { return !panel_layer_failed_; }
+    bool MenuEnvironmentAvailable() const {
+        static const bool off = std::string_view(MenuEnvironmentSetting()) == "0";
+        return !off && !env_layer_failed_;
+    }
     const OpenXRWindowsVulkanGraphicsRequirements& GraphicsRequirements() const { return requirements_; }
     int64_t SwapchainFormat() const { return static_cast<int64_t>(swapchain_format_); }
     const std::string& LastError() const { return last_error_; }
@@ -1414,6 +1472,7 @@ private:
         for (auto& swapchain : eye_swapchains_) {
             success = ReleaseSwapchain(swapchain) && success;
         }
+        success = ReleaseSwapchain(env_swapchain_) && success;
         return ReleaseSwapchain(panel_swapchain_) && success;
     }
 
@@ -1446,7 +1505,7 @@ private:
     }
 
     void AbandonAcquiredSwapchains() noexcept {
-        for (auto* swapchain : {&eye_swapchains_[0], &eye_swapchains_[1], &panel_swapchain_}) {
+        for (auto* swapchain : {&eye_swapchains_[0], &eye_swapchains_[1], &env_swapchain_, &panel_swapchain_}) {
             if (swapchain->acquired) {
                 swapchain->release_forbidden = true;
             }
@@ -1454,7 +1513,7 @@ private:
     }
 
     void AllowAcquiredSwapchainsAfterGpuDrain() noexcept {
-        for (auto* swapchain : {&eye_swapchains_[0], &eye_swapchains_[1], &panel_swapchain_}) {
+        for (auto* swapchain : {&eye_swapchains_[0], &eye_swapchains_[1], &env_swapchain_, &panel_swapchain_}) {
             if (swapchain->acquired) {
                 swapchain->release_forbidden = false;
             }
@@ -1483,6 +1542,47 @@ private:
         return false;
     }
 
+    // The menus' environment swapchain pair (both eyes side by side), made the first time a menu set
+    // asks for it. A failure is logged once and the menus show the screen alone.
+    bool EnsureEnvSwapchains() {
+        if (env_swapchains_ready_) return true;
+        if (env_layer_failed_ || !MenuEnvironmentAvailable()) return false;
+        const auto& view = runtime_->ViewConfiguration()[0];
+        const uint32_t width = view.render_width * kOpenXREyeCount, height = view.render_height;
+        if (CreateSwapchain(env_swapchain_, width, height, "menu environment") &&
+            CreateSwapchain(retained_env_swapchain_, width, height, "menu environment")) {
+            env_swapchains_ready_ = true;
+            std::ostringstream message;
+            message << "OpenXR menu environment layer ready (" << width << 'x' << height << ", "
+                    << (MenuEnvironmentOver() ? "over" : "under") << " the screen)";
+            Log(OpenXRLogLevel::Info, message.str());
+            return true;
+        }
+        DestroyEnvSwapchains();
+        env_layer_failed_ = true;
+        Log(OpenXRLogLevel::Warning, "the menu environment layer could not be made; menus show the screen alone");
+        return false;
+    }
+
+    void DestroyEnvSwapchains() {
+        for (auto* swapchain : {&env_swapchain_, &retained_env_swapchain_}) {
+            if (swapchain->handle != XR_NULL_HANDLE && !swapchain->acquired) {
+                xrDestroySwapchain(swapchain->handle);
+            } else if (swapchain->acquired) {
+                Log(OpenXRLogLevel::Warning,
+                    "Vulkan environment swapchain still owns an acquired image; deferring its destruction to xrDestroySession");
+            }
+            *swapchain = {};
+        }
+        env_swapchains_ready_ = false;
+        retained_env_valid_ = false;
+    }
+
+    static bool MenuEnvironmentOver() {
+        static const bool over = std::string_view(MenuEnvironmentSetting()) == "over";
+        return over;
+    }
+
     void DestroyPanelSwapchains() {
         for (auto* swapchain : {&panel_swapchain_, &retained_panel_swapchain_}) {
             if (swapchain->handle != XR_NULL_HANDLE && !swapchain->acquired) {
@@ -1499,6 +1599,7 @@ private:
 
     void DestroySwapchains() {
         DestroyPanelSwapchains();
+        DestroyEnvSwapchains();
         DestroySwapchainPair(eye_swapchains_);
         DestroySwapchainPair(retained_swapchains_);
         have_retained_frame_ = false;
@@ -1601,6 +1702,11 @@ private:
     std::array<EyeSwapchain, kOpenXREyeCount> retained_swapchains_{};
     // The settings panel's layer: written like the eyes into panel_swapchain_,
     // shown from retained_panel_swapchain_ (see FinishFrame).
+    EyeSwapchain env_swapchain_{};
+    EyeSwapchain retained_env_swapchain_{};
+    bool env_swapchains_ready_ = false;
+    bool env_layer_failed_ = false;
+    bool retained_env_valid_ = false;
     EyeSwapchain panel_swapchain_{};
     EyeSwapchain retained_panel_swapchain_{};
     bool panel_swapchains_ready_ = false;
@@ -1712,6 +1818,7 @@ OpenXRBeginStatus OpenXRWindowsVulkanBackend::PrepareSet(const OpenXRPresentatio
     return m_impl->PrepareSet(presentation, display_time, cycle, set);
 }
 bool OpenXRWindowsVulkanBackend::EndCycleWithSet(OpenXRBackendFrame& set) { return m_impl->EndCycleWithSet(set); }
+bool OpenXRWindowsVulkanBackend::MenuEnvironmentAvailable() const { return m_impl->MenuEnvironmentAvailable(); }
 bool OpenXRWindowsVulkanBackend::EndCycleRetained() { return m_impl->EndCycleRetained(); }
 bool OpenXRWindowsVulkanBackend::CancelSet(OpenXRBackendFrame& set) { return m_impl->CancelSet(set); }
 bool OpenXRWindowsVulkanBackend::DropSet(OpenXRBackendFrame& set) { return m_impl->DropSet(set); }
