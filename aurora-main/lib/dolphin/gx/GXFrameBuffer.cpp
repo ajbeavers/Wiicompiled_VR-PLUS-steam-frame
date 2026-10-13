@@ -529,9 +529,27 @@ void GXCopyTex(void* dest, GXBool clear) {
     handle.handle->isEfbCopy = true;
     handle.handle->lastEfbCopyFrame = currentFrame;
   }
+  // R2 (lane H): at the internal resolution the minimap's half-scale bake copy (440x440 logical -> 220x220
+  // IA4) carries a faint white stripe (alpha 1/15) in its last two or three logical columns, which the
+  // race HUD shows as a thin vertical line along the map's right edge; trimming the last 4 render pixels
+  // of the sampled source removed it, 3 did not (eye dumps; what in the bake draws it is not known).
+  // Half-scale copies at a fractional scale are sampled without their last 3 logical columns (a 0.7 %
+  // stretch of a 440 px bake). KARTFRAME_COPY_TRIM=0 restores the full source; =<n> trims n columns.
+  static const float copyTrimLogical = [] {
+    const char* env = std::getenv("KARTFRAME_COPY_TRIM");
+    return env != nullptr ? std::max(0.0f, static_cast<float>(std::atof(env))) : 3.0f;
+  }();
+  auto sampleRect = sourceRect.sampleRect;
+  if (copyTrimLogical > 0.f && g_gxState.texCopyHalfScale && !aurora::gx::is_depth_format(texCopyFmt) &&
+      g_gxState.texCopySrc.width > 0) {
+    const float scale = sampleRect.z() / static_cast<float>(g_gxState.texCopySrc.width);
+    if (std::fabs(scale - std::round(scale)) > 0.01f && g_gxState.texCopySrc.width > 8.f * copyTrimLogical) {
+      sampleRect = {sampleRect.x(), sampleRect.y(), sampleRect.z() - copyTrimLogical * scale, sampleRect.w()};
+    }
+  }
   aurora::gfx::resolve_pass(handle.handle, rect, clearState.clearColor, clearState.clearAlpha, clearState.clearDepth,
                             clearState.clearColorValue, aurora::gx::clear_depth_value(), resolveFmt,
-                            &sourceRect.sampleRect, g_gxState.texCopyHalfScale, &copyFilter, forceOpaqueAlpha,
+                            &sampleRect, g_gxState.texCopyHalfScale, &copyFilter, forceOpaqueAlpha,
                             sourceRect.sampleRect.w() / std::max<float>(g_gxState.texCopySrc.height, 1.0f),
                             (g_gxState.copyClamp & GX_CLAMP_TOP) != 0, (g_gxState.copyClamp & GX_CLAMP_BOTTOM) != 0,
                             persistentCopy);
