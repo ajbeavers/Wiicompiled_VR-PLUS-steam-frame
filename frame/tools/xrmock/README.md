@@ -6,11 +6,9 @@ headset, and a script that compares what two builds do against it.
 - `build.sh [out dir]` builds `libxrmock.so` and `runtime.json` (select it with
   `XR_RUNTIME_JSON=<out>/runtime.json`). Needs clang and the OpenXR headers of
   `third_party/openxr`.
-- `trace-compare.sh <build A> <build B> [paired|unpaired|warp ...]` runs the
-  real `galaxyframe` launcher of each build against the mock in a scratch
-  `GALAXYFRAME_HOME` and diffs the traces (swapchain acquire / release, frame
-  begin / end with their layers). Use `IGNORE_EXT=XR_KHR_vulkan_enable2` when
-  comparing a build from before the extension was enabled.
+- `trace-compare.sh <trace A> <trace B>` compares two traces of `frame/tools/mockrun.sh` runs
+  (`MOCK_XR_TRACE`): the setup line by line, the frames as the share of compositor cycles
+  following each call pattern (a game run's timing differs from run to run).
 - `xrmock.c` is the runtime (frame clock, call-order checks, trace, settings
   by `MOCK_XR_*` environment variables, listed in its header comment).
 - `xrmock_gfx.h` is the seam to the graphics API; `xrmock_gles.c` is the GLES
@@ -21,7 +19,7 @@ headset, and a script that compares what two builds do against it.
 `xrmock_vk.c` is the Vulkan side (`XR_KHR_vulkan_enable2`): the app's instance
 and device are made through the mock with the app's own loader, swapchain
 images are VkImages on the app's device, handed out in
-`COLOR_ATTACHMENT_OPTIMAL`. Run the launcher with `PETARI_GFX=vk`.
+`COLOR_ATTACHMENT_OPTIMAL`. KartFrame always binds Vulkan.
 
 Checks, as `ERROR` lines in the trace and a summary on stderr at the end of
 the session (`xrmock: summary ...`):
@@ -42,3 +40,10 @@ the session (`xrmock: summary ...`):
 A Vulkan session makes one set of eye swapchains (three with GLES) and
 transfer usage on the UI layers, so its setup trace differs from a GLES one;
 `trace-compare.sh` stays a GLES-against-GLES check.
+
+KartFrame additions: `XR_KHR_convert_timespec_time` (with `MOCK_XR_TIME_OFFSET_S` XrTime is
+not CLOCK_MONOTONIC), the recommended eye size of the Frame (1728x1728, `MOCK_XR_EYE`),
+`xrRequestDisplayRefreshRateFB` honoured before the session begins unless `MOCK_XR_HZ` is set,
+focus blips (`MOCK_XR_FOCUS_BLIP=<ms>[@<s>]`), a current interaction profile
+(`MOCK_XR_PROFILE`), and a second summary line counting frames that showed newly released eyes
+(and for which display time their one locate was made) apart from repeated layers.

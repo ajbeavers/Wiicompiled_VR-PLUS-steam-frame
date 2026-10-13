@@ -6,9 +6,12 @@
 # Needs Xvfb (a virtual X server; nothing is shown anywhere). --flat runs without the mock: VR off, desktop renderer (title screen check).
 # Environment: MOCK_XR_* settings of xrmock (MOCK_XR_SECONDS, MOCK_XR_HZ, MOCK_XR_TRACE, ...),
 # KF_BUILD (build dir, default <repo>/build-linux), KF_MOCKRUN_HOME (scratch user dir, default
-# ~/.cache/kf-mockrun). The game reads its user state from $XDG_DATA_HOME/WiiCompiled (Config.toml,
-# NAND, Cache), which this script points at the scratch dir and seeds with a Config.toml naming the
-# extracted game (~/Games/KartFrame/data/game or --game).
+# ~/.cache/kf-mockrun), KF_XRMOCK_DIR (where the mock is built; default one per checkout under
+# ~/.cache/kf-xrmock, rebuilt when its sources change), KF_MOCKRUN_VR (extra lines for the [vr]
+# section, e.g. 'frame_pacing = "pipelined"'). The game reads its user state from
+# $XDG_DATA_HOME/WiiCompiled (Config.toml, NAND, Cache), which this script points at the scratch dir
+# and seeds with a Config.toml naming the extracted game (~/Games/KartFrame/data/game or --game) and
+# the Frame's VR defaults (render_scale 1.0, VR interpolation auto, plain menu background).
 #
 # Safety: XR_RUNTIME_JSON must name an existing, non-empty mock runtime, else the script aborts. An
 # empty XR_RUNTIME_JSON once fell through to the real SteamVR in the headset.
@@ -34,8 +37,11 @@ DATA=$GAME; [ -f "$GAME/sys/fst.bin" ] || DATA=$GAME/DATA
 [ -f "$DATA/sys/fst.bin" ] && [ -d "$DATA/files" ] || die "$GAME is not an extracted DATA directory (sys/fst.bin, files/)"
 
 # Never next to a running game or the owner's session.
-if pgrep -af 'SteamLaunch|kartframe|lepton|waydroid' | grep -v "pgrep\|mockrun" >/dev/null; then
-  pgrep -af 'SteamLaunch|kartframe|lepton|waydroid' | grep -v "pgrep\|mockrun" >&2
+# The game binary only (bin/kartframe, build-linux/kartframe, a bare kartframe), not toolchain
+# or build processes under ~/.cache/kartframe.
+RUNNING='SteamLaunch|lepton|waydroid|(^|[ /])kartframe( |$)'
+if pgrep -af "$RUNNING" | grep -Ev "pgrep|mockrun" >/dev/null; then
+  pgrep -af "$RUNNING" | grep -Ev "pgrep|mockrun" >&2
   die "a game is running; wait for it"
 fi
 
@@ -53,6 +59,10 @@ display_mode = "windowed"
 mirror_view = "none"
 enabled = $([ $FLAT = 1 ] && echo false || echo true)
 required = $([ $FLAT = 1 ] && echo false || echo true)
+render_scale = 1.0
+frame_interpolation_fps = 1
+menu_shader_quality = 0
+${KF_MOCKRUN_VR:-}
 TOML
 LOG=$OUT/logs/$(date +%Y%m%d-%H%M%S)-$([ $FLAT = 1 ] && echo flat || echo mock).log
 
@@ -71,8 +81,10 @@ export SDL_VIDEO_DRIVER=x11 SDL_AUDIO_DRIVER=dummy KARTFRAME_HEADLESS=1
 export XDG_DATA_HOME=$OUT/data
 
 if [ $FLAT = 0 ]; then
-  MOCK_DIR=${KF_XRMOCK_DIR:-$HOME/.cache/kf-xrmock}
-  [ -s "$MOCK_DIR/libxrmock.so" ] || bash "$HERE/xrmock/build.sh" "$MOCK_DIR" >/dev/null
+  MOCK_DIR=${KF_XRMOCK_DIR:-$HOME/.cache/kf-xrmock/$(printf %s "$REPO" | md5sum | cut -c1-8)}
+  if [ ! -s "$MOCK_DIR/libxrmock.so" ] || [ -n "$(find "$HERE/xrmock" -newer "$MOCK_DIR/libxrmock.so" -name '*.[ch]' 2>/dev/null)" ]; then
+    bash "$HERE/xrmock/build.sh" "$MOCK_DIR" >/dev/null || die "the mock runtime did not build"
+  fi
   export XR_RUNTIME_JSON=$MOCK_DIR/runtime.json
   [ -n "${XR_RUNTIME_JSON}" ] && [ -s "$XR_RUNTIME_JSON" ] || die "XR_RUNTIME_JSON is empty or missing: $XR_RUNTIME_JSON"
   LIBPATH=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["library_path"])' "$XR_RUNTIME_JSON")
@@ -94,7 +106,7 @@ WATCH=$!
 wait $PID; RC=$?
 kill $WATCH 2>/dev/null
 echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
-grep -a 'xrmock: summary' "$LOG" || true
+grep -a 'xrmock: summary\|xrmock: frames\|xrmock: queue drain\|vr pacing totals' "$LOG" || true
 echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
 FATAL=$(grep -a -c 'fatal dialog\|Signal 11' "$LOG")
 echo "mockrun: fatal lines: $FATAL"

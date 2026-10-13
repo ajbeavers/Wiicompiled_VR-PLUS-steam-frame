@@ -25,6 +25,18 @@
 //                             for the app's queue to go idle is an error
 //                             (off unless set: the app submits its next set
 //                             before releasing the last)
+//   MOCK_XR_EYE=<w>x<h>       recommended eye size (1728x1728, SteamVR's on
+//                             the Frame)
+//   MOCK_XR_TIME_OFFSET_S=<s> XrTime runs this far ahead of CLOCK_MONOTONIC
+//                             (0); XR_KHR_convert_timespec_time converts
+//   MOCK_XR_FOCUS_BLIP=<ms>[@<s>]  every <s> seconds (7) the session loses
+//                             focus for <ms> ms (VISIBLE, then FOCUSED again),
+//                             as SteamVR does now and then
+//   MOCK_XR_PROFILE=<path>    the current interaction profile of both hands
+//                             (e.g. /interaction_profiles/valve/frame_controller;
+//                             default none); an INTERACTION_PROFILE_CHANGED
+//                             event follows the first FOCUSED, and suggested
+//                             bindings for it are traced
 // The graphics API is chosen by the app's binding (xrmock_gfx.h).
 //
 // Checks (ERROR lines in the trace, and a summary on stderr when the session
@@ -66,6 +78,8 @@ static int64_t nowNs(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
+// XrTime = CLOCK_MONOTONIC + gTimeOffset (MOCK_XR_TIME_OFFSET_S).
+static int64_t gTimeOffset = 0;
 
 // The graphics tables, tried in order for the session's binding.  Lane D2
 // adds the Vulkan one here.
@@ -79,6 +93,7 @@ typedef struct {
     void* images;
     int acquired, next;
     int waited;  // of the images acquired, how many were waited for
+    int released;  // an image was released since the last xrEndFrame
 } Chain;
 static Chain gChains[MAXSC];
 static int gErrors = 0;  // ERROR lines in the trace
@@ -92,6 +107,13 @@ static char gPathStr[512][128];
 static int gPathCount = 0;
 
 static int gEventQueue[16], gEventCount = 0;
+static int gEyeW = 1728, gEyeH = 1728;
+// Focus blips (MOCK_XR_FOCUS_BLIP) and the interaction profile (MOCK_XR_PROFILE).
+#define EVENT_PROFILE_CHANGED (-2)
+static double gBlipMs = 0.0, gBlipEvery = 7.0;
+static int64_t gNextBlip = 0, gRefocusAt = 0;
+static int gFocused = 0, gBlips = 0, gProfileSent = 0;
+static const char* gProfile = NULL;
 static int64_t gT0 = 0, gPeriod = 8333333, gEndAt = 0;
 static int gQuitSent = 0;
 
@@ -231,8 +253,8 @@ static XrResult XRAPI_CALL mEnumViewConfigViews(XrInstance i, XrSystemId s, XrVi
     *count = 2;
     if (cap == 0) return XR_SUCCESS;
     for (int e = 0; e < 2; e++) {
-        v[e].recommendedImageRectWidth = 1680;
-        v[e].recommendedImageRectHeight = 1760;
+        v[e].recommendedImageRectWidth = (uint32_t)gEyeW;
+        v[e].recommendedImageRectHeight = (uint32_t)gEyeH;
         v[e].maxImageRectWidth = 4096;
         v[e].maxImageRectHeight = 4096;
         v[e].recommendedSwapchainSampleCount = 1;
@@ -301,7 +323,10 @@ static double gBusyMaxMs = 0.0;
 static int gWaitHist[5];
 static int gPoseAge[6];  // display time minus locate time in refreshes: <0, 0, 1, 2, 3, more
 static int gPoseSets = 0, gPoseSameTime = 0, gPoseEarlier = 0, gPoseLater = 0, gPoseSplit = 0, gPoseUnknown = 0;
-static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime);
+static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh);
+// Frames by what they showed: a projection layer whose eye images were both released since
+// the last xrEndFrame (fresh), one shown again (repeat), none.
+static int gEnds = 0, gFreshSets = 0, gFreshSame = 0, gFreshEarlier = 0, gFreshLater = 0, gRepeatSets = 0, gQuadEnds = 0, gEmptyEnds = 0;
 static XrResult XRAPI_CALL mWaitImage(XrSwapchain sc, const XrSwapchainImageWaitInfo* wi) {
     (void)wi;
     Chain* c = chainOf(sc);
@@ -357,6 +382,7 @@ static XrResult XRAPI_CALL mRelease(XrSwapchain sc, const XrSwapchainImageReleas
     }
     c->acquired--;
     c->waited--;
+    c->released = 1;
     trace("release sc%d", chainId(sc));
     return XR_SUCCESS;
 }
@@ -381,6 +407,10 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
             gErrors, gReleases, gBusyReleases, gBusyMaxMs, gPoseSets, gPoseSameTime, gPoseEarlier, gPoseLater, gPoseSplit, gPoseUnknown);
     fprintf(stderr, "xrmock: projection layers by refreshes from the locate to the display time: later %d, 0: %d, 1: %d, 2: %d, 3: %d, more %d\n", gPoseAge[0],
             gPoseAge[1], gPoseAge[2], gPoseAge[3], gPoseAge[4], gPoseAge[5]);
+    fprintf(stderr,
+            "xrmock: frames: %d ended; %d showed newly released eyes (from one locate for the display time submitted %d, for an earlier one %d, "
+            "a later one %d), %d repeated a projection layer, %d a quad, %d no layer; focus blips %d\n",
+            gEnds, gFreshSets, gFreshSame, gFreshEarlier, gFreshLater, gRepeatSets, gQuadEnds, gEmptyEnds, gBlips);
     if (gReleases) {
         fprintf(stderr, "xrmock: queue drain time at the releases: <0.5 ms %d, 0.5-1 %d, 1-2 %d, 2-4 %d, >4 %d\n", gWaitHist[0], gWaitHist[1], gWaitHist[2],
                 gWaitHist[3], gWaitHist[4]);
@@ -396,9 +426,38 @@ static XrResult XRAPI_CALL mRequestExit(XrSession s) {
 }
 static XrResult XRAPI_CALL mPollEvent(XrInstance i, XrEventDataBuffer* ev) {
     (void)i;
+    if (gBlipMs > 0.0 && gFocused && !gQuitSent) {
+        int64_t now = nowNs();
+        if (!gNextBlip) gNextBlip = now + (int64_t)(gBlipEvery * 1e9);
+        if (!gRefocusAt && now >= gNextBlip) {
+            pushState(XR_SESSION_STATE_VISIBLE);
+            gRefocusAt = now + (int64_t)(gBlipMs * 1e6);
+            gBlips++;
+            trace("focus blip %.0f ms", gBlipMs);
+        } else if (gRefocusAt && now >= gRefocusAt) {
+            pushState(XR_SESSION_STATE_FOCUSED);
+            gRefocusAt = 0;
+            gNextBlip = now + (int64_t)(gBlipEvery * 1e9);
+        }
+    }
     if (gEventCount == 0) return XR_EVENT_UNAVAILABLE;
     int st = gEventQueue[0];
     memmove(gEventQueue, gEventQueue + 1, (size_t)(--gEventCount) * sizeof(int));
+    if (st == EVENT_PROFILE_CHANGED) {
+        XrEventDataInteractionProfileChanged* p = (XrEventDataInteractionProfileChanged*)ev;
+        p->type = XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED;
+        p->next = NULL;
+        p->session = (XrSession)(uintptr_t)2;
+        trace("event interactionProfileChanged");
+        return XR_SUCCESS;
+    }
+    if (st == XR_SESSION_STATE_FOCUSED && !gFocused) {
+        gFocused = 1;
+        if (gProfile && !gProfileSent) {
+            gProfileSent = 1;
+            if (gEventCount < 16) gEventQueue[gEventCount++] = EVENT_PROFILE_CHANGED;
+        }
+    }
     XrEventDataSessionStateChanged* e = (XrEventDataSessionStateChanged*)ev;
     e->type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED;
     e->next = NULL;
@@ -426,7 +485,7 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
         struct timespec ts = {(time_t)((wake - now) / 1000000000ll), (long)((wake - now) % 1000000000ll)};
         nanosleep(&ts, NULL);
     }
-    fs->predictedDisplayTime = wake + 2 * gPeriod;
+    fs->predictedDisplayTime = wake + 2 * gPeriod + gTimeOffset;
     fs->predictedDisplayPeriod = gPeriod;
     fs->shouldRender = XR_TRUE;
     gWaits++;
@@ -452,7 +511,13 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
         char t[256];
         if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
             const XrCompositionLayerProjection* p = (const XrCompositionLayerProjection*)l;
-            checkPoses(p, ei->displayTime);
+            int fresh = p->viewCount == 2 && chainOf(p->views[0].subImage.swapchain)->released &&
+                        chainOf(p->views[1].subImage.swapchain)->released;
+            if (i == 0) {
+                if (fresh) gFreshSets++;
+                else gRepeatSets++;
+            }
+            checkPoses(p, ei->displayTime, fresh);
             snprintf(t, sizeof(t), " proj[flags=%llx", (unsigned long long)p->layerFlags);
             strcat(buf, t);
             for (uint32_t v = 0; v < p->viewCount; v++) {
@@ -475,6 +540,10 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
         }
     }
     trace("endFrame layers=%u%s", ei->layerCount, buf);
+    gEnds++;
+    if (ei->layerCount == 0) gEmptyEnds++;
+    else if (ei->layers[0]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) gQuadEnds++;
+    for (int k = 0; k < gChainCount; k++) gChains[k].released = 0;
     return XR_SUCCESS;
 }
 // The head turns slowly from side to side, so views located for different
@@ -490,7 +559,7 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
     vs->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT |
                          XR_VIEW_STATE_POSITION_TRACKED_BIT;
     *count = 2;
-    double t = (double)(li->displayTime - gT0) / 1e9;
+    double t = (double)(li->displayTime - gTimeOffset - gT0) / 1e9;
     float yaw = (float)(0.3 * sin(t * 2.0 * 3.14159265 * 0.5));
     float c = cosf(yaw), sn = sinf(yaw);
     for (uint32_t e = 0; e < 2 && e < cap; e++) {
@@ -508,7 +577,7 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
 static int samePose(const XrPosef* a, const XrPosef* b) { return !memcmp(a, b, sizeof(XrPosef)); }
 
 // Both eyes of a projection layer: from one locate, and for which time.
-static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime) {
+static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh) {
     if (p->viewCount != 2) return;
     gPoseSets++;
     int left = -1, both = -1;
@@ -533,6 +602,11 @@ static void checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime
     if (t == displayTime) gPoseSameTime++;
     else if (t < displayTime) gPoseEarlier++;
     else gPoseLater++;
+    if (fresh) {
+        if (t == displayTime) gFreshSame++;
+        else if (t < displayTime) gFreshEarlier++;
+        else gFreshLater++;
+    }
     long k = lround((double)(displayTime - t) / (double)gPeriod);
     gPoseAge[k < 0 ? 0 : k > 3 ? 5 : k + 1]++;
 }
@@ -571,9 +645,18 @@ static XrResult XRAPI_CALL mCreateAction(XrActionSet s, const XrActionCreateInfo
     *o = (XrAction)(uintptr_t)(200 + gActions++);
     return XR_SUCCESS;
 }
+static XrResult XRAPI_CALL mPathToString(XrInstance i, XrPath p, uint32_t cap, uint32_t* len, char* buf);
 static XrResult XRAPI_CALL mSuggest(XrInstance i, const XrInteractionProfileSuggestedBinding* b) {
     (void)i;
-    (void)b;
+    char profile[128] = "";
+    uint32_t len = 0;
+    if (gProfile && mPathToString(i, b->interactionProfile, sizeof(profile), &len, profile) == XR_SUCCESS && !strcmp(profile, gProfile)) {
+        trace("suggestBindings %s: %u bindings accepted", profile, b->countSuggestedBindings);
+        for (uint32_t k = 0; k < b->countSuggestedBindings; k++) {
+            char path[128] = "";
+            if (mPathToString(i, b->suggestedBindings[k].binding, sizeof(path), &len, path) == XR_SUCCESS) trace("  binding %s", path);
+        }
+    }
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mAttach(XrSession s, const XrSessionActionSetsAttachInfo* a) {
@@ -622,11 +705,17 @@ static XrResult XRAPI_CALL mGetProfile(XrSession s, XrPath p, XrInteractionProfi
     (void)s;
     (void)p;
     o->interactionProfile = XR_NULL_PATH;
+    if (gProfile && gProfileSent) mStringToPath((XrInstance)(uintptr_t)1, gProfile, &o->interactionProfile);
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mReqRefresh(XrSession s, float hz) {
     (void)s;
-    trace("requestRefreshRate %.0f", hz);
+    // Honoured before the session begins (the frame clock is fixed after that).
+    // Honoured before the session begins (the frame clock is fixed after that), unless
+    // MOCK_XR_HZ fixes the rate.
+    const char* fixed = getenv("MOCK_XR_HZ");
+    if (!gT0 && !fixed && (hz == 72.0f || hz == 90.0f || hz == 120.0f)) gPeriod = (int64_t)(1e9 / hz);
+    trace("requestRefreshRate %.0f%s", hz, fixed ? " (MOCK_XR_HZ fixes the rate)" : gT0 ? " (session running: ignored)" : "");
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mEnumRefresh(XrSession s, uint32_t cap, uint32_t* count, float* r) {
@@ -642,6 +731,19 @@ static XrResult XRAPI_CALL mEnumRefresh(XrSession s, uint32_t cap, uint32_t* cou
 static XrResult XRAPI_CALL mGetRefresh(XrSession s, float* hz) {
     (void)s;
     *hz = (float)(1e9 / (double)gPeriod);
+    return XR_SUCCESS;
+}
+struct timespec;
+static XrResult XRAPI_CALL mTimespecToTime(XrInstance i, const struct timespec* ts, XrTime* t) {
+    (void)i;
+    *t = (XrTime)ts->tv_sec * 1000000000ll + ts->tv_nsec + gTimeOffset;
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL mTimeToTimespec(XrInstance i, XrTime t, struct timespec* ts) {
+    (void)i;
+    int64_t ns = (int64_t)t - gTimeOffset;
+    ts->tv_sec = (time_t)(ns / 1000000000ll);
+    ts->tv_nsec = (long)(ns % 1000000000ll);
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mPerfLevel(XrSession s, XrPerfSettingsDomainEXT d, XrPerfSettingsLevelEXT l) {
@@ -671,6 +773,7 @@ static const Entry kTable[] = {
     E("xrApplyHapticFeedback", mHaptic), E("xrStopHapticFeedback", mHapticStop), E("xrGetCurrentInteractionProfile", mGetProfile),
     E("xrRequestDisplayRefreshRateFB", mReqRefresh), E("xrEnumerateDisplayRefreshRatesFB", mEnumRefresh), E("xrGetDisplayRefreshRateFB", mGetRefresh),
     E("xrPerfSettingsSetPerformanceLevelEXT", mPerfLevel),
+    E("xrConvertTimespecTimeToTimeKHR", mTimespecToTime), E("xrConvertTimeToTimespecTimeKHR", mTimeToTimespec),
 };
 
 static void init(void) {
@@ -681,6 +784,18 @@ static void init(void) {
     if (tp) gTrace = fopen(tp, "w");
     const char* hz = getenv("MOCK_XR_HZ");
     if (hz) gPeriod = (int64_t)(1e9 / atof(hz));
+    const char* eye = getenv("MOCK_XR_EYE");
+    if (eye) sscanf(eye, "%dx%d", &gEyeW, &gEyeH);
+    const char* off = getenv("MOCK_XR_TIME_OFFSET_S");
+    if (off) gTimeOffset = (int64_t)(atof(off) * 1e9);
+    const char* blip = getenv("MOCK_XR_FOCUS_BLIP");
+    if (blip) {
+        gBlipMs = atof(blip);
+        const char* at = strchr(blip, '@');
+        if (at) gBlipEvery = atof(at + 1);
+    }
+    gProfile = getenv("MOCK_XR_PROFILE");
+    if (gProfile && !*gProfile) gProfile = NULL;
     const char* list = getenv("MOCK_XR_EXTENSIONS");
     if (list) {
         char* copy = strdup(list);
@@ -688,7 +803,8 @@ static void init(void) {
         free(copy);
     } else {
         const char* exts[] = {"XR_KHR_opengl_es_enable", "XR_MNDX_egl_enable", "XR_KHR_vulkan_enable2", "XR_FB_display_refresh_rate",
-                              "XR_EXT_performance_settings", "XR_VALVE_frame_controller_interaction", "XR_KHR_composition_layer_depth", "XR_EXT_eye_gaze_interaction"};
+                              "XR_EXT_performance_settings", "XR_VALVE_frame_controller_interaction", "XR_KHR_composition_layer_depth", "XR_EXT_eye_gaze_interaction",
+                              "XR_KHR_convert_timespec_time"};
         for (unsigned i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) strcpy(gExtNames[gExtCount++], exts[i]);
         if (getenv("MOCK_XR_SPACEWARP")) strcpy(gExtNames[gExtCount++], "XR_FB_space_warp");
     }

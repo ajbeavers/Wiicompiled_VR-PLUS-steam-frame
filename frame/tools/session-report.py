@@ -1,112 +1,72 @@
 #!/usr/bin/env python3
-"""One table from a GalaxyFrame session's logs on the Steam Frame (standard library only).
+"""One table from KartFrame sessions' logs (standard library only).
 
-  tools/session-report.py                       current and previous session in ~/.local/share/GalaxyFrame
-  tools/session-report.py DIR                   the same for another data folder ($GALAXYFRAME_HOME)
-  tools/session-report.py LOG [VRTIMING] ...    named logs: petari_log.txt, then its vrtiming.log if any
+  frame/tools/session-report.py DIR [DIR ...]          session folders: the game's log and vrtiming.log
+  frame/tools/session-report.py LOG [VRTIMING] ...      named logs: the game's log, then its vrtiming.log if any
 
-A session is a petari_log.txt (the game's log) and, when present, the vrtiming.log of the
-same session (SteamVR's compositor timing, written by steam-frame/galaxyframe.sh through
-tools/vrtiming.py).  Folder mode pairs petari_log.txt with vrtiming.log and petari_log.txt.prev
-with vrtiming.log.prev.  Several sessions are columns of the same table, so a baseline and a
-later run line up.  Columns for logs that are missing are left out of the VR compositor rows.
+A session is the game's log (the runtime log, holding the "vr pacing:" lines) and, when present,
+the vrtiming.log of the same session (SteamVR's compositor timing, one line a second, written by
+frame/tools/vrtiming.py; its format is documented there). In a folder the game's log is the newest
+*.log that is not vrtiming.log. Several sessions are columns of the same table, so a baseline and
+a later run line up; a mock run (frame/tools/mockrun.sh) has no vrtiming.log.
 
-The game's own numbers come from lines it logs every 10 seconds ("vr: N of M game frames
-shown twice", "vr: the frame loop missed ...", "vr: render scale ...; eye GPU ...", "vr: late
-first step", "perf: game ... work ..."); the compositor's from vrtiming.log (one line a second).
-A hitch is a moment over 100 ms: a late first step, a game work maximum or an eye GPU maximum
-above 100 ms in the game's log, a client frame interval above 100 ms in the compositor's.
+The game's numbers come from the line it logs every second (runtime/include/vr/openxr_diagnostics.h
+documents it; keep the two in step):
+
+  vr pacing: t=<s> hz=<Hz> mode=<inline|pipelined>[/2] ticks=<n> rendered=<n> interpolated=<n>
+             late=<n> missed=<n> repeats=<n> gpu_ms=<p50>/<p99> encode_ms=<p50>/<p99>
+
+and from "vr pacing totals:" (same fields, the whole session; its percentiles are exact) and
+"vr pacing: ... rendering every second refresh" / "... every refresh again" (half-rate switches).
+A hitch is a second whose GPU p99 or encode p99 is above 100 ms, or a compositor client frame
+interval above 100 ms.
 """
 import os
 import re
 import sys
 
 HITCH_MS = 100.0
-
-
-def secs(stamp):
-    """HH:MM:SS.mmm to seconds."""
-    h, m, s = stamp.split(":")
-    return int(h) * 3600 + int(m) * 60 + float(s)
+PACING = re.compile(r"vr pacing(?P<tot> totals)?: t=(?P<t>[\d.]+) hz=(?P<hz>[\d.]+) mode=(?P<mode>\S+) ticks=(?P<ticks>\d+) "
+                    r"rendered=(?P<rendered>\d+) interpolated=(?P<interp>\d+) late=(?P<late>\d+) missed=(?P<missed>\d+) "
+                    r"repeats=(?P<repeats>\d+) gpu_ms=(?P<g50>[\d.]+)/(?P<g99>[\d.]+) encode_ms=(?P<e50>[\d.]+)/(?P<e99>[\d.]+)")
 
 
 def parse_game_log(path):
-    r = {"name": os.path.basename(path), "shown_twice": 0, "frames": 0, "worst_twice": (0, 0),
-         "missed": 0, "missed_own": 0, "sets_late": 0, "sets": 0, "first_step": [],
-         "eye_avg": [], "eye_max": 0.0, "eye_budget": None, "scale": None,
-         "app_gpu_avg": [], "app_gpu_max": 0.0, "game_work_max": 0.0, "game_fps": [],
-         "hitch": 0, "hitch_notes": [], "refresh": None, "refresh_note": None,
-         "first": None, "last": None, "scale_changes": 0, "refreshes_missed_scale": 0}
-    day = 0
-    prev = None
+    r = {"name": os.path.basename(path), "seconds": 0, "t_last": 0.0, "hz": None, "modes": set(), "ticks": 0, "rendered": 0,
+         "interp": 0, "late": 0, "missed": 0, "repeats": 0, "g50": [], "g99": [], "e50": [], "e99": [],
+         "totals": None, "half": 0, "full": 0, "hitch": 0, "hitch_notes": [], "refresh_note": None,
+         "worst_late": (0, 0), "race": None}
     with open(path, errors="replace") as f:
         for line in f:
-            m = re.match(r"(\d\d:\d\d:\d\d\.\d+) (.*)", line)
-            if not m:
-                continue
-            t = secs(m.group(1))
-            if prev is not None and t < prev - 3600:
-                day += 1
-            prev = t
-            t += day * 86400
-            if r["first"] is None:
-                r["first"] = t
-            r["last"] = t
-            msg = m.group(2)
-            g = re.match(r"vr: (\d+) of (\d+) game frames shown twice", msg)
-            if g:
-                a, b = int(g.group(1)), int(g.group(2))
-                r["shown_twice"] += a
-                r["frames"] += b
-                if b and a / b > r["worst_twice"][0] / max(r["worst_twice"][1], 1):
-                    r["worst_twice"] = (a, b)
-                continue
-            g = re.match(r"vr: the frame loop missed (\d+) refreshes in the last [\d.]+ s \((\d+) with its own work late\); "
-                         r"(\d+) of (\d+) sets not finished when due", msg)
-            if g:
-                r["missed"] += int(g.group(1))
-                r["missed_own"] += int(g.group(2))
-                r["sets_late"] += int(g.group(3))
-                r["sets"] += int(g.group(4))
-                continue
-            g = re.match(r"vr: late first step: ([\d.]+) ms", msg)
-            if g:
-                v = float(g.group(1))
-                r["first_step"].append(v)
-                if v > HITCH_MS:
+            if "entered RaceScene" in line and r["race"] is None:
+                r["race"] = r["t_last"]
+            m = PACING.search(line)
+            if m:
+                d = m.groupdict()
+                if d["tot"]:
+                    r["totals"] = d
+                    continue
+                r["seconds"] += 1
+                r["t_last"] = float(d["t"])
+                r["hz"] = d["hz"]
+                r["modes"].add(d["mode"])
+                for k in ("ticks", "rendered", "interp", "late", "missed", "repeats"):
+                    r[k] += int(d[k])
+                due = int(d["rendered"]) + int(d["late"])
+                if due and int(d["late"]) / due > r["worst_late"][0] / max(r["worst_late"][1], 1):
+                    r["worst_late"] = (int(d["late"]), due)
+                for k in ("g50", "g99", "e50", "e99"):
+                    r[k].append(float(d[k]))
+                worst = max(float(d["g99"]), float(d["e99"]))
+                if worst > HITCH_MS:
                     r["hitch"] += 1
-                    r["hitch_notes"].append("%s late first step %.0f ms" % (m.group(1)[:8], v))
+                    r["hitch_notes"].append("t=%s %.0f ms" % (d["t"], worst))
                 continue
-            g = re.match(r"vr: render scale ([\d.]+)-([\d.]+) \(now [\d.]+, (\d+) changes\); eye GPU ([\d.]+) ms avg ([\d.]+) max of ([\d.]+)", msg)
-            if g:
-                r["eye_avg"].append(float(g.group(4)))
-                mx = float(g.group(5))
-                r["eye_max"] = max(r["eye_max"], mx)
-                r["eye_budget"] = float(g.group(6))
-                r["scale_changes"] += int(g.group(3))
-                if mx > HITCH_MS:
-                    r["hitch"] += 1
-                    r["hitch_notes"].append("%s eye GPU max %.0f ms" % (m.group(1)[:8], mx))
-                continue
-            g = re.match(r"vr: runtime counters: app GPU ([\d.]+) ms a frame avg ([\d.]+) max", msg)
-            if g:
-                r["app_gpu_avg"].append(float(g.group(1)))
-                r["app_gpu_max"] = max(r["app_gpu_max"], float(g.group(2)))
-                continue
-            g = re.match(r"perf: game ([\d.]+) fps, work ([\d.]+) ms avg ([\d.]+) max", msg)
-            if g:
-                r["game_fps"].append(float(g.group(1)))
-                mx = float(g.group(3))
-                r["game_work_max"] = max(r["game_work_max"], mx)
-                if mx > HITCH_MS:
-                    r["hitch"] += 1
-                    r["hitch_notes"].append("%s game work max %.0f ms" % (m.group(1)[:8], mx))
-                continue
-            g = re.match(r"display refresh rate now ([\d.]+) Hz", msg)
-            if g:
-                r["refresh"] = g.group(1)
-                continue
-            g = re.match(r"display refresh rates: (.*?); requested ([\d.]+) Hz", msg)
+            if "rendering every second refresh" in line:
+                r["half"] += 1
+            elif "rendering every refresh again" in line:
+                r["full"] += 1
+            g = re.search(r"display refresh rates: (.*?); requested (.*)", line)
             if g:
                 r["refresh_note"] = "offered %s, asked %s" % (g.group(1), g.group(2))
     return r
@@ -150,6 +110,11 @@ def mean(xs):
     return sum(xs) / len(xs) if xs else None
 
 
+def median(xs):
+    xs = sorted(xs)
+    return xs[len(xs) // 2] if xs else None
+
+
 def fmt(v, spec="%.1f", unit=""):
     return "-" if v is None else (spec % v) + unit
 
@@ -171,20 +136,25 @@ def build(sessions):
                 cells.append("-")
         rows.append((label, cells))
 
-    add("duration (min)", lambda g, v: fmt((g["last"] - g["first"]) / 60.0, "%.1f") if g and g["first"] is not None else "-")
-    add("display refresh rate (Hz)", lambda g, v: (g["refresh"] or "-") if g else "-")
-    add("game frames logged", lambda g, v: str(g["frames"]) if g else "-")
-    add("frames shown twice", lambda g, v: "%d (%s)" % (g["shown_twice"], pct(g["shown_twice"], g["frames"])) if g else "-")
-    add("  worst 10 s window", lambda g, v: "%d of %d" % g["worst_twice"] if g and g["frames"] else "-")
-    add("missed refreshes", lambda g, v: "%d (%d own work late)" % (g["missed"], g["missed_own"]) if g else "-")
-    add("sets not finished when due", lambda g, v: "%d of %d (%s)" % (g["sets_late"], g["sets"], pct(g["sets_late"], g["sets"])) if g else "-")
-    add("late first step: count / avg / max ms", lambda g, v: "%d / %s / %s" % (len(g["first_step"]), fmt(mean(g["first_step"])),
-                                                                              fmt(max(g["first_step"]) if g["first_step"] else None)) if g else "-")
-    add("eye GPU ms: avg of 10 s avgs / max (budget)", lambda g, v: "%s / %s (%s)" % (fmt(mean(g["eye_avg"])), fmt(g["eye_max"] if g["eye_avg"] else None),
-                                                                                      fmt(g["eye_budget"])) if g else "-")
-    add("render scale changes", lambda g, v: str(g["scale_changes"]) if g else "-")
-    add("runtime app GPU ms/frame: avg / max", lambda g, v: "%s / %s" % (fmt(mean(g["app_gpu_avg"])), fmt(g["app_gpu_max"] if g["app_gpu_avg"] else None)) if g else "-")
-    add("game work max (ms)", lambda g, v: fmt(g["game_work_max"] if g["game_fps"] else None) if g else "-")
+    def tot(g, key):
+        return g["totals"][key] if g and g["totals"] else None
+
+    add("duration (min)", lambda g, v: fmt(g["t_last"] / 60.0, "%.1f") if g and g["seconds"] else "-")
+    add("display refresh rate (Hz)", lambda g, v: (g["hz"] or "-") if g else "-")
+    add("pacing mode(s)", lambda g, v: ",".join(sorted(g["modes"])) or "-" if g else "-")
+    add("compositor ticks / s", lambda g, v: fmt(g["ticks"] / g["seconds"]) if g and g["seconds"] else "-")
+    add("sets shown / s", lambda g, v: fmt(g["rendered"] / g["seconds"]) if g and g["seconds"] else "-")
+    add("  of them interpolated", lambda g, v: pct(g["interp"], g["rendered"]) if g else "-")
+    add("late sets", lambda g, v: "%d (%s)" % (g["late"], pct(g["late"], g["rendered"] + g["late"])) if g else "-")
+    add("  worst second", lambda g, v: "%d of %d" % g["worst_late"] if g and g["worst_late"][1] else "-")
+    add("missed refreshes", lambda g, v: str(g["missed"]) if g else "-")
+    add("retained repeats", lambda g, v: "%d (%s of ticks)" % (g["repeats"], pct(g["repeats"], g["ticks"])) if g else "-")
+    add("half-rate switches (down / up)", lambda g, v: "%d / %d" % (g["half"], g["full"]) if g else "-")
+    add("GPU ms per set p50 / p99 (session)", lambda g, v: "%s / %s" % (tot(g, "g50"), tot(g, "g99")) if tot(g, "g50") else
+        "%s / %s" % (fmt(median(g["g50"]), "%.2f"), fmt(max(g["g99"]) if g["g99"] else None, "%.2f")) if g else "-")
+    add("encode ms p50 / p99 (session)", lambda g, v: "%s / %s" % (tot(g, "e50"), tot(g, "e99")) if tot(g, "e50") else
+        "%s / %s" % (fmt(median(g["e50"]), "%.2f"), fmt(max(g["e99"]) if g["e99"] else None, "%.2f")) if g else "-")
+    add("first race at (s)", lambda g, v: fmt(g["race"], "%.0f") if g else "-")
     add("compositor seconds logged", lambda g, v: str(v["seconds"]) if v else "no vrtiming.log")
     add("compositor frames", lambda g, v: str(v["frames"]) if v else "-")
     add("  app frames reused", lambda g, v: "%d (%s)" % (v["reused"], pct(v["reused"], v["frames"])) if v else "-")
@@ -197,32 +167,30 @@ def build(sessions):
     return rows
 
 
+def game_log_in(d):
+    logs = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".log") and not f.startswith("vrtiming")]
+    return max(logs, key=os.path.getmtime) if logs else None
+
+
 def main(argv):
-    if argv and argv[0] in ("-h", "--help"):
+    if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
-        return 0
+        return 0 if argv else 1
     sessions = []
-    if not argv or (len(argv) == 1 and os.path.isdir(argv[0])):
-        d = argv[0] if argv else os.environ.get("GALAXYFRAME_HOME") or os.environ.get("GALAXYQUEST_HOME") or os.path.expanduser("~/.local/share/GalaxyFrame")
-        for label, lg, vt in (("current", "petari_log.txt", "vrtiming.log"), ("previous", "petari_log.txt.prev", "vrtiming.log.prev")):
-            lp, vp = os.path.join(d, lg), os.path.join(d, vt)
-            if os.path.exists(lp) or os.path.exists(vp):
-                sessions.append((label, lp if os.path.exists(lp) else None, vp if os.path.exists(vp) else None))
-        perf = os.path.join(d, "perfcriteria.txt")
-    else:
-        perf = None
-        i = 0
-        while i < len(argv):
-            lp = argv[i]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if os.path.isdir(a):
+            lp = game_log_in(a)
+            vp = os.path.join(a, "vrtiming.log")
+            sessions.append((os.path.basename(os.path.normpath(a)), lp, vp if os.path.exists(vp) else None))
+        else:
             vp = None
             if i + 1 < len(argv) and "vrt" in os.path.basename(argv[i + 1]):
                 vp = argv[i + 1]
                 i += 1
-            sessions.append((os.path.basename(lp), lp, vp))
-            i += 1
-    if not sessions:
-        print("no logs found", file=sys.stderr)
-        return 1
+            sessions.append((os.path.basename(a), a, vp))
+        i += 1
     parsed = [(label, parse_game_log(lp) if lp else None, parse_vrtiming(vp) if vp else None) for label, lp, vp in sessions]
     rows = build(parsed)
     w0 = max(len(r[0]) for r in rows)
@@ -237,8 +205,6 @@ def main(argv):
                 notes.append("%s (%s): %s" % (label, src, "; ".join(d["hitch_notes"][:8]) + (" ..." if len(d["hitch_notes"]) > 8 else "")))
         if g and g["refresh_note"]:
             notes.append("%s: refresh rates %s" % (label, g["refresh_note"]))
-    if perf and os.path.exists(perf):
-        notes.append("perfcriteria.txt is in the data folder (Steam's own log for the last session): %s" % perf)
     if notes:
         print()
         print("\n".join(notes))
