@@ -304,7 +304,11 @@ private:
 // the Frame the game shares five cores with SteamVR and anything else running (a build during the
 // third headset session starved the game thread: 2095 slow game frames). KARTFRAME_THREADPRIO:
 // high (default) the lowest nice RealtimeKit grants, at most -15 (else as nice); nice: what
-// RLIMIT_NICE allows; off: unchanged. Linux only; returns what was done, for the log.
-std::string RaiseThreadPriority(uint32_t tid);
+// RLIMIT_NICE allows; off: unchanged. util_min > 0 also sets the thread's utilization clamp (uclamp
+// minimum, 0..1024; an unprivileged process may), which makes the scheduler run it on a core of at least
+// that capacity at a matching clock: the game thread needs the Frame's one 1024 core (its logic takes 11
+// to 14 ms of each 16.7 ms frame in a race). KARTFRAME_UCLAMP=0 leaves the clamps alone. Linux only;
+// returns what was done, for the log.
+std::string RaiseThreadPriority(uint32_t tid, uint32_t util_min = 0);
 
 } // namespace mkw::vr

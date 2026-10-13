@@ -1128,7 +1128,32 @@ int RlimitNice() {
 }
 } // namespace
 
-std::string RaiseThreadPriority(uint32_t tid) {
+namespace {
+// sched_setattr with only the utilization clamp minimum (policy and nice kept).
+bool SetUtilClampMin(pid_t thread, uint32_t util_min, std::string& why) {
+    struct SchedAttr {
+        uint32_t size, sched_policy;
+        uint64_t sched_flags;
+        int32_t sched_nice;
+        uint32_t sched_priority;
+        uint64_t sched_runtime, sched_deadline, sched_period;
+        uint32_t sched_util_min, sched_util_max;
+    } attr{};
+    attr.size = sizeof(attr);
+    constexpr uint64_t kKeepPolicy = 0x08, kKeepParams = 0x10, kUtilClampMin = 0x20;
+    attr.sched_flags = kKeepPolicy | kKeepParams | kUtilClampMin;
+    attr.sched_util_min = std::min<uint32_t>(util_min, 1024);
+#if defined(SYS_sched_setattr)
+    if (syscall(SYS_sched_setattr, thread, &attr, 0) == 0) return true;
+    why = std::strerror(errno);
+#else
+    why = "no sched_setattr";
+#endif
+    return false;
+}
+} // namespace
+
+std::string RaiseThreadPriority(uint32_t tid, uint32_t util_min) {
     static const std::string mode = [] {
         const char* env = std::getenv("KARTFRAME_THREADPRIO");
         return std::string(env != nullptr && *env != '\0' ? env : "high");
@@ -1167,6 +1192,15 @@ std::string RaiseThreadPriority(uint32_t tid) {
     out << "nice " << (errno == 0 ? now : 99);
     if (!via.empty()) out << " (" << via << ")";
     else out << ", unchanged (" << why << ")";
+    static const bool uclamp = [] {
+        const char* env = std::getenv("KARTFRAME_UCLAMP");
+        return env == nullptr || env[0] != '0';
+    }();
+    if (util_min > 0 && uclamp) {
+        std::string clamp_why;
+        if (SetUtilClampMin(thread, util_min, clamp_why)) out << ", uclamp min " << std::min<uint32_t>(util_min, 1024);
+        else out << ", uclamp unchanged (" << clamp_why << ")";
+    }
     return out.str();
 }
 #else

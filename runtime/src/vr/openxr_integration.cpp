@@ -881,7 +881,8 @@ private:
         {
             std::ostringstream raised;
             raised << "thread priority: pacing " << RaiseThreadPriority(0);
-            if (game_thread_id_ != 0) raised << "; game " << RaiseThreadPriority(game_thread_id_);
+            // The game thread wants the 1024 core, the frame worker (2 to 3 ms of encode a set) a big one.
+            if (game_thread_id_ != 0) raised << "; game " << RaiseThreadPriority(game_thread_id_, 1024);
             if (const uint32_t gx = GxThread::NativeThreadId(); gx > 1) raised << "; GX " << RaiseThreadPriority(gx);
             RT_LOG(RT_TAG_RUNTIME) << raised.str() << std::endl;
         }
@@ -889,7 +890,7 @@ private:
             if (!worker_raised) {
                 if (const uint32_t tid = aurora_get_frame_worker_native_thread_id(); tid != 0) {
                     worker_raised = true;
-                    const std::string result = RaiseThreadPriority(tid);
+                    const std::string result = RaiseThreadPriority(tid, 800);
                     RT_LOG(RT_TAG_RUNTIME) << "thread priority: Aurora frame worker (tid " << tid << ") " << result << std::endl;
                 }
             }
