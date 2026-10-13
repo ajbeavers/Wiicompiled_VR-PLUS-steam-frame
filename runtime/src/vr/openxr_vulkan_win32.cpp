@@ -287,6 +287,40 @@ public:
         app.apiVersion = std::max({app.apiVersion, VkVersion(owner.requirements_.min_api_version), preferred});
         if (app.apiVersion > VkVersion(owner.requirements_.max_api_version)) return VK_ERROR_INCOMPATIBLE_DRIVER;
         vk_info.pApplicationInfo = &app;
+        // Dawn enables VK_EXT_swapchain_maintenance1 on the device whenever the device offers it, but
+        // that extension requires VK_EXT_surface_maintenance1 (and its dependency
+        // VK_KHR_get_surface_capabilities2) on the instance, which Dawn does not ask for here
+        // (VUID-vkCreateDevice-ppEnabledExtensionNames-01387). Add them when the loader offers them.
+        std::vector<const char*> extensions(vk_info.ppEnabledExtensionNames,
+                                            vk_info.ppEnabledExtensionNames + vk_info.enabledExtensionCount);
+        if (const auto enumerate_ext = get_proc ? reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                                                      get_proc(nullptr, "vkEnumerateInstanceExtensionProperties"))
+                                                : nullptr) {
+            uint32_t count = 0;
+            std::vector<VkExtensionProperties> offered;
+            if (enumerate_ext(nullptr, &count, nullptr) == VK_SUCCESS) {
+                offered.resize(count);
+                if (enumerate_ext(nullptr, &count, offered.data()) != VK_SUCCESS) offered.clear();
+                offered.resize(std::min<size_t>(offered.size(), count));
+            }
+            const auto is_offered = [&](const char* name) {
+                for (const auto& e : offered) if (std::strcmp(e.extensionName, name) == 0) return true;
+                return false;
+            };
+            const auto is_enabled = [&](const char* name) {
+                for (const char* e : extensions) if (std::strcmp(e, name) == 0) return true;
+                return false;
+            };
+            if (is_offered(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) &&
+                is_offered(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+                !is_enabled(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)) {
+                if (!is_enabled(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME))
+                    extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+                extensions.push_back(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+                vk_info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+                vk_info.ppEnabledExtensionNames = extensions.data();
+            }
+        }
         create.vulkanCreateInfo = &vk_info;
         create.vulkanAllocator = static_cast<const VkAllocationCallbacks*>(allocator);
         VkResult result = VK_ERROR_INITIALIZATION_FAILED;
