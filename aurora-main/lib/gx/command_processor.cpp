@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -2515,6 +2516,44 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   } else if (prim == GX_POINTS) {
     instanceCount = vtxCount;
   }
+  const auto drawScreenRect = screen_rect(prim, fmt, vertices, vtxCount, vtxStride);
+  // Fades are blended over the picture (the respawn's black filter, wipes, the scene fader). Opaque and
+  // logic-op full-frame quads are not: the race draws such quads every frame (backgrounds, a logic-op
+  // pass), and one shown across the eye blacked it out.
+  const bool fadeCandidate = g_gxState.colorUpdate && g_gxState.blendMode == GX_BM_BLEND;
+  const auto quad_signature = [] {
+    const auto& tex = get_texture(GX_TEXMAP0);
+    const uint32_t w = tex.ref ? std::min<uint32_t>(tex.texObj.width(), 2047) : 0;
+    const uint32_t h = tex.ref ? std::min<uint32_t>(tex.texObj.height(), 2047) : 0;
+    return uint64_t(g_gxState.blendMode & 3) | (uint64_t(g_gxState.blendOp & 15) << 2) |
+           (uint64_t(g_gxState.numTexGens & 15) << 6) | (uint64_t(w) << 10) | (uint64_t(h) << 21) |
+           (uint64_t(tex.ref && tex.ref->isEfbCopy) << 32);
+  };
+  // Large 2D rectangles in VR (lane H: which full-frame fades the game draws), a few distinct kinds a run.
+  if (drawScreenRect && stereo) {
+    const auto& vp = g_gxState.renderViewport;
+    if (drawScreenRect->width * drawScreenRect->height >= 0.5f * vp.width * vp.height) {
+      static std::mutex loggedMutex;
+      static std::vector<uint64_t> logged;
+      const auto& c = g_gxState.colorChannelState[0].matColor;
+      const uint64_t key = (uint64_t(g_gxState.blendMode) << 0) | (uint64_t(g_gxState.colorUpdate) << 4) |
+                           (uint64_t(g_gxState.alphaUpdate) << 5) | (uint64_t(g_gxState.depthUpdate) << 6) |
+                           (uint64_t(g_gxState.depthCompare) << 7) | (uint64_t(g_gxState.numTevStages) << 8) |
+                           (uint64_t(g_gxState.numTexGens) << 16) | (uint64_t(drawScreenRect->width) << 24) |
+                           (uint64_t(drawScreenRect->height) << 40);
+      std::lock_guard lock(loggedMutex);
+      if (logged.size() < 24 && std::find(logged.begin(), logged.end(), key) == logged.end()) {
+        logged.push_back(key);
+        Log.info("VR large 2D rectangle: {:.0f}x{:.0f} at ({:.0f}, {:.0f}) of a {:.0f}x{:.0f} viewport; blend {} colour "
+                 "{} alpha {} depth update {} compare {} func {}; {} TEV stages, {} texgens; material colour "
+                 "{:.2f} {:.2f} {:.2f} {:.2f}",
+                 drawScreenRect->width, drawScreenRect->height, drawScreenRect->left, drawScreenRect->top, vp.width,
+                 vp.height, int(g_gxState.blendMode), g_gxState.colorUpdate, g_gxState.alphaUpdate,
+                 g_gxState.depthUpdate, g_gxState.depthCompare, int(g_gxState.depthFunc), g_gxState.numTevStages,
+                 g_gxState.numTexGens, c[0], c[1], c[2], c[3]);
+      }
+    }
+  }
   gfx::push_draw_command(DrawData{
       .pipeline = pipeline,
       .exactScreenDepthPipeline = stereo && screen ? pipelineState.screenRef : 0,
@@ -2532,7 +2571,9 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
       .instanceCount = instanceCount,
       .bindGroups = bindGroups,
       .dstAlpha = pipelineState.dstAlpha,
-      .screenRect = screen_rect(prim, fmt, vertices, vtxCount, vtxStride),
+      .screenRect = drawScreenRect,
+      .fadeCandidate = fadeCandidate,
+      .quadSignature = drawScreenRect ? quad_signature() : uint64_t{0},
   });
   // What the next draw must match to be allowed to fold into this one.
   nativeWheelLastDrawCommand = gfx::get_last_draw_command<DrawData>();

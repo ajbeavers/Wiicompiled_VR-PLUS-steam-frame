@@ -30,6 +30,12 @@ struct DrawData {
   // Recorded before merging so VR can omit desktop split masks without
   // modifying GX.
   std::optional<gfx::stereo_replay::SubviewRect> screenRect;
+  // Writes colour, blended or opaque (not a logic-op or depth-only quad): a candidate for a full-frame
+  // fade shown across the whole eye.
+  bool fadeCandidate = false;
+  // Diagnostics (KARTFRAME_LOG_2D_QUADS): blend | logic << 2 | texgens << 6 | tex0 width << 10 | height << 21 |
+  // tex0 is an EFB copy << 32.
+  uint64_t quadSignature = 0;
 };
 
 constexpr uint32_t GXPipelineConfigVersion = 22;

@@ -1610,6 +1610,45 @@ static void write_stereo_uniform(std::span<uint8_t> uniform, const gx::UniformRe
   }
 }
 
+// KARTFRAME_LOG_2D_QUADS=1 (diagnostics): the distinct 2D quads of the immersive replay, once each, with
+// whether they went across the eye (full view) or onto the virtual screen.
+static void log_replay_quad(const gx::DrawData& draw, bool fullView) noexcept {
+  // =1: full-view draws and quads sampling an EFB copy (menus draw thousands of others); =x<n>: quads with
+  // an edge within 4 px of frame x = n.
+  static const float edgeX = [] {
+    const char* env = std::getenv("KARTFRAME_LOG_2D_QUADS");
+    return env != nullptr && env[0] == 'x' ? static_cast<float>(std::atof(env + 1)) : -1.f;
+  }();
+  static const bool enabled = [] {
+    const char* env = std::getenv("KARTFRAME_LOG_2D_QUADS");
+    return env != nullptr && (env[0] == '1' || env[0] == 'x');
+  }();
+  if (!enabled || !draw.screenRect) {
+    return;
+  }
+  if (edgeX >= 0.f) {
+    const auto& q = *draw.screenRect;
+    if (std::fabs(q.left - edgeX) > 4.f && std::fabs(q.left + q.width - edgeX) > 4.f) {
+      return;
+    }
+  } else if (!fullView && ((draw.quadSignature >> 32) & 1) == 0) {
+    return;
+  }
+  static std::vector<std::pair<uint64_t, uint64_t>> seen;
+  const auto& r = *draw.screenRect;
+  const uint64_t rect = uint64_t(int(r.left) + 4096) | (uint64_t(int(r.top) + 4096) << 13) | (uint64_t(int(r.width)) << 26) |
+                        (uint64_t(int(r.height)) << 39) | (uint64_t(fullView) << 52);
+  const std::pair<uint64_t, uint64_t> key{rect, draw.quadSignature};
+  if (seen.size() >= 600 || std::find(seen.begin(), seen.end(), key) != seen.end()) {
+    return;
+  }
+  seen.push_back(key);
+  const uint64_t s = draw.quadSignature;
+  Log.info("Immersive 2D quad{}: {:.1f}x{:.1f} at ({:.1f}, {:.1f}); blend {} logic {} texgens {} tex0 {}x{}{}",
+           fullView ? " (full view)" : "", r.width, r.height, r.left, r.top, s & 3, (s >> 2) & 15, (s >> 6) & 15,
+           (s >> 10) & 2047, (s >> 21) & 2047, ((s >> 32) & 1) != 0 ? " (EFB copy)" : "");
+}
+
 static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
                                            LateStereoData* history = nullptr) noexcept {
   const StereoDisplaySource displaySource = stereo_display_source(g_renderPasses);
@@ -1630,6 +1669,33 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
     return (!multiplayer || !layout.nativeEfbEffect) &&
            (layout.perspective || (hudScreen.valid() && !layout.nativeEfbEffect));
   };
+  // A 2D rectangle covering the whole frame is one of the game's fades (the black of a respawn, the race
+  // start and end wipes, the scene fader, a white flash): on a TV it covers the picture, so in the
+  // headset it covers the view. It is not claimed by the virtual screen and keeps its recorded
+  // transforms, which the eye replay maps from the frame onto the whole eye (head-locked, like a 2D
+  // draw with the virtual screen off). Not in the immersive window, nor split screen.
+  // KARTFRAME_FULL_VIEW_FADES=0 leaves them on the screen.
+  static const bool fullViewFadesEnabled = [] {
+    const char* env = std::getenv("KARTFRAME_FULL_VIEW_FADES");
+    return env == nullptr || env[0] != '0';
+  }();
+  const bool fullViewFades = fullViewFadesEnabled && !stereoFrame.window && !multiplayer && hudScreen.valid() &&
+                             displayRegion.width > 0 && displayRegion.height > 0;
+  // Only over the scene: a full-frame quad before the pass's first perspective draw is a background (the race
+  // draws an opaque one every frame), which stays where it was.
+  bool passSawScene = false;
+  const auto fullView = [&](const gx::DrawData& draw) noexcept {
+    if (!fullViewFades || !passSawScene || draw.uniformReplayLayout.perspective || !draw.screenRect ||
+        !draw.fadeCandidate) {
+      return false;
+    }
+    const auto& r = *draw.screenRect;
+    const float w = static_cast<float>(displayRegion.width), h = static_cast<float>(displayRegion.height);
+    const float x = static_cast<float>(displayRegion.x), y = static_cast<float>(displayRegion.y);
+    return r.left <= x + 0.02f * w && r.top <= y + 0.02f * h && r.left + r.width >= x + 0.98f * w &&
+           r.top + r.height >= y + 0.98f * h;
+  };
+  size_t fullViewDrawCount = 0;
   size_t requiredBytes = 0;
   size_t efbPassCount = 0;
   size_t perspectiveDrawCount = 0;
@@ -1641,6 +1707,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
     if (pass.efbTarget) {
       ++efbPassCount;
     }
+    passSawScene = false;
     for (const auto& command : pass.commands) {
       if (pass.efbTarget && command.type == CommandType::SetViewport) {
         const auto& vp = command.data.setViewport;
@@ -1649,6 +1716,15 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
       if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GX ||
           !replayed(command.data.draw.gx.uniformReplayLayout)) {
         continue;
+      }
+      passSawScene = passSawScene || command.data.draw.gx.uniformReplayLayout.perspective;
+      if (pass.efbTarget && fullView(command.data.draw.gx)) {
+        ++fullViewDrawCount;
+        log_replay_quad(command.data.draw.gx, true);
+        continue;
+      }
+      if (pass.efbTarget && !command.data.draw.gx.uniformReplayLayout.perspective) {
+        log_replay_quad(command.data.draw.gx, false);
       }
       const auto& draw = command.data.draw.gx;
       const auto& layout = draw.uniformReplayLayout;
@@ -1687,17 +1763,20 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
     }
   }
   // 2D draws on the race's virtual screen, per 10 s (they carry the screen clip).
-  static uint64_t hudDrawsWindow = 0, hudFramesWindow = 0;
+  static uint64_t hudDrawsWindow = 0, hudFramesWindow = 0, fullViewDrawsWindow = 0, fullViewFramesWindow = 0;
   static auto hudWindowStart = std::chrono::steady_clock::now();
   hudDrawsWindow += replayHudScreenDrawCount;
+  fullViewDrawsWindow += fullViewDrawCount;
+  fullViewFramesWindow += fullViewDrawCount != 0 ? 1 : 0;
   ++hudFramesWindow;
   if (const auto now = std::chrono::steady_clock::now(); now - hudWindowStart >= std::chrono::seconds(10)) {
     if (hudScreen.valid()) {
-      Log.info("Immersive replay: {:.1f} 2D draws a frame on the virtual screen (10 s); screen clip self-check {:.5f}",
+      Log.info("Immersive replay: {:.1f} 2D draws a frame on the virtual screen (10 s); screen clip self-check {:.5f}; "
+               "full-view fades: {} draws in {} frames",
                static_cast<double>(hudDrawsWindow) / static_cast<double>(std::max<uint64_t>(hudFramesWindow, 1)),
-               g_screenClipCheck.load(std::memory_order_relaxed));
+               g_screenClipCheck.load(std::memory_order_relaxed), fullViewDrawsWindow, fullViewFramesWindow);
     }
-    hudDrawsWindow = hudFramesWindow = 0;
+    hudDrawsWindow = hudFramesWindow = fullViewDrawsWindow = fullViewFramesWindow = 0;
     hudWindowStart = now;
   }
   static bool replayCoverageLogged = false;
@@ -1744,6 +1823,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
       continue;
     }
     ClipRect drawScissor{};  // none until the pass sets one
+    passSawScene = false;
     for (auto& command : pass.commands) {
       if (command.type == CommandType::SetViewport) {
         drawViewport = command.data.setViewport;
@@ -1757,6 +1837,10 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
       }
       if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GX ||
           !replayed(command.data.draw.gx.uniformReplayLayout)) {
+        continue;
+      }
+      passSawScene = passSawScene || command.data.draw.gx.uniformReplayLayout.perspective;
+      if (fullView(command.data.draw.gx)) {
         continue;
       }
       auto& draw = command.data.draw.gx;
