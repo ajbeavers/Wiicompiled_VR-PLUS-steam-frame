@@ -70,6 +70,14 @@ constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
 constexpr u32 MaxPostexMtx = MaxPnMtx + MaxTexMtx;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
 constexpr u32 MaxUniformSize = 3840;
+// Virtual-screen (exactScreenDepth) variants read a clip block after the draw's own uniform: three rows
+// mapping an eye pixel to homogeneous frame NDC on the 2D layer's screen, and the rectangle (the draw's
+// recorded scissor within the frame) its fragments must fall in. 0: the uniform has no room.
+constexpr u32 ScreenClipBytes = 64;
+constexpr u32 screen_clip_offset(u32 uniformSize) noexcept {
+  const u32 offset = (uniformSize + 15u) & ~15u;
+  return offset + ScreenClipBytes <= MaxUniformSize ? offset : 0u;
+}
 
 extern wgpu::BindGroup g_emptyTextureBindGroup;
 

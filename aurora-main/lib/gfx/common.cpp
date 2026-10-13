@@ -349,6 +349,8 @@ struct LateStereoUniform {
   gx::UniformReplayLayout layout;
   Viewport viewport;
   ClipRect displayRegion;
+  ClipRect scissor;         // the draw's recorded scissor (2D screen clip)
+  uint32_t clipOffset = 0;  // gx::screen_clip_offset of a 2D screen draw's uniform, 0: none
   Range current;
   Range previous;
   std::array<Range, AURORA_STEREO_EYE_COUNT> eyes;
@@ -1345,6 +1347,18 @@ static StereoDisplaySource stereo_display_source(const std::vector<RenderPass>& 
 static void log_stereo_display_source_region(ClipRect region, bool foundDisplayCopy) noexcept {
   static std::array<std::pair<ClipRect, bool>, 8> seen{};
   static size_t seenCount = 0;
+  // How often a frame had no display copy (the fallback region scales the 2D layer differently).
+  static uint64_t found = 0, fallback = 0;
+  static auto windowStart = std::chrono::steady_clock::now();
+  ++(foundDisplayCopy ? found : fallback);
+  if (const auto now = std::chrono::steady_clock::now(); now - windowStart >= std::chrono::seconds(10)) {
+    if (fallback != 0) {
+      Log.info("Immersive display-copy source: {} frames with a display copy, {} with the full-EFB fallback (10 s)",
+               found, fallback);
+    }
+    found = fallback = 0;
+    windowStart = now;
+  }
   if (region.width <= 0 || region.height <= 0) {
     return;
   }
@@ -1391,10 +1405,111 @@ static stereo_replay::HudScreen stereo_hud_screen() noexcept {
 
 // Shared by the normal seal and headset-deadline replay. Head transforms are
 // composed after scene interpolation, so free look never inherits its delay.
+// The clip block of a virtual-screen 2D draw (gx::ScreenClipBytes at clipOffset): rows taking an eye
+// pixel to homogeneous frame NDC on `screen` (as seen through `view`), and the frame NDC rectangle of
+// the draw's recorded scissor within the frame. The fragment shader drops what falls
+// outside, so the frame edge and the game's scissor clip as on a TV.
+static void write_screen_clip(std::span<uint8_t> uniform, uint32_t clipOffset, const StereoReplayEye& eye,
+                              const Mat3x4<float>& view, const stereo_replay::HudScreen& screen, bool clip,
+                              const Viewport& drawViewport, ClipRect scissor, ClipRect displayRegion) noexcept {
+  if (clipOffset + gx::ScreenClipBytes > uniform.size()) {
+    return;
+  }
+  // KARTFRAME_HUD_CLIP=0: the old behaviour (no clip), for comparisons.
+  static const bool clipEnabled = [] {
+    const char* env = std::getenv("KARTFRAME_HUD_CLIP");
+    return env == nullptr || env[0] != '0';
+  }();
+  clip = clip && clipEnabled;
+  std::array<float, 16> block{1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, -1e30f, -1e30f, 1e30f, 1e30f};
+  const auto mask = clip ? stereo_replay::window_mask(eye.projection, view, screen) : stereo_replay::WindowMask{};
+  const float width = static_cast<float>(eye.target.size.width);
+  const float height = static_cast<float>(eye.target.size.height);
+  if (clip && (mask.w.x != 0.f || mask.w.y != 0.f || mask.w.z != 0.f) && width > 0.f && height > 0.f &&
+      displayRegion.width > 0 && displayRegion.height > 0) {
+    // NDC x = 2 px / W - 1, y = 1 - 2 py / H, folded into each row.
+    const auto row = [&](const Vec3<float>& r, size_t at) {
+      block[at + 0] = 2.f * r.x / width;
+      block[at + 1] = -2.f * r.y / height;
+      block[at + 2] = r.z - r.x + r.y;
+      block[at + 3] = 0.f;
+    };
+    row(mask.u, 0);
+    row(mask.v, 4);
+    row(mask.w, 8);
+    const float regionLeft = static_cast<float>(displayRegion.x);
+    const float regionTop = static_cast<float>(displayRegion.y);
+    const float regionRight = regionLeft + static_cast<float>(displayRegion.width);
+    const float regionBottom = regionTop + static_cast<float>(displayRegion.height);
+    // The frame and the game's scissor, not the viewport: GX can draw outside its viewport (clipping
+    // off), the scissor and the frame's own edges are what bound a draw on a TV.
+    (void)drawViewport;
+    float left = regionLeft;
+    float top = regionTop;
+    float right = regionRight;
+    float bottom = regionBottom;
+    if (scissor.width > 0 && scissor.height > 0) {
+      left = std::max(left, static_cast<float>(scissor.x));
+      top = std::max(top, static_cast<float>(scissor.y));
+      right = std::min(right, static_cast<float>(scissor.x + scissor.width));
+      bottom = std::min(bottom, static_cast<float>(scissor.y + scissor.height));
+    }
+    const float w = static_cast<float>(displayRegion.width);
+    const float h = static_cast<float>(displayRegion.height);
+    block[12] = 2.f * (left - regionLeft) / w - 1.f;
+    block[13] = 1.f - 2.f * (bottom - regionTop) / h;
+    block[14] = 2.f * (right - regionLeft) / w - 1.f;
+    block[15] = 1.f - 2.f * (top - regionTop) / h;
+  }
+  std::memcpy(uniform.data() + clipOffset, block.data(), sizeof(block));
+}
+
+// Checks write_screen_clip's conventions against the projection the 2D draws actually get: frame points
+// placed on the screen by compose_hud_screen_projection must come back from the clip rows unchanged.
+// Logged with the 10 s screen line; an error above a few thousandths means the clip would cut the HUD.
+static float screen_clip_self_check(const StereoReplayEye& eye, const stereo_replay::HudScreen& screen) noexcept {
+  Mat4x4<float> identity{};
+  identity.m0 = {1.f, 0.f, 0.f, 0.f};
+  identity.m1 = {0.f, 1.f, 0.f, 0.f};
+  identity.m2 = {0.f, 0.f, 1.f, 0.f};
+  identity.m3 = {0.f, 0.f, 0.f, 1.f};
+  const auto projection = stereo_replay::compose_hud_screen_projection(eye.projection, eye.viewFromCenter, screen, identity);
+  std::array<uint8_t, gx::ScreenClipBytes> bytes{};
+  const ClipRect region{0, 0, 640, 480};
+  const Viewport full{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
+  write_screen_clip({bytes.data(), bytes.size()}, 0, eye, eye.viewFromCenter, screen, true, full, {}, region);
+  std::array<float, 16> block;
+  std::memcpy(block.data(), bytes.data(), sizeof(block));
+  const float width = static_cast<float>(eye.target.size.width);
+  const float height = static_cast<float>(eye.target.size.height);
+  float worst = 0.f;
+  for (const auto& [u, v] : std::array<std::pair<float, float>, 4>{{{-0.6f, -0.4f}, {0.5f, 0.7f}, {-0.9f, 0.9f}, {0.8f, -0.8f}}}) {
+    const auto row = [&](const Vec4<float>& r) { return r[0] * u + r[1] * v + r[3]; };
+    const float w = row(projection.m3);
+    if (!(w > 0.f)) {
+      return -1.f;
+    }
+    const float px = (row(projection.m0) / w + 1.f) * 0.5f * width;
+    const float py = (1.f - row(projection.m1) / w) * 0.5f * height;
+    const float hu = block[0] * px + block[1] * py + block[2];
+    const float hv = block[4] * px + block[5] * py + block[6];
+    const float hw = block[8] * px + block[9] * py + block[10];
+    if (!(hw > 0.f)) {
+      return 1e9f;
+    }
+    worst = std::max({worst, std::fabs(hu / hw - u), std::fabs(hv / hw - v)});
+  }
+  return worst;
+}
+
+// The latest screen_clip_self_check, from the late replay (the only place with real eye poses); -2: none yet.
+static std::atomic<float> g_screenClipCheck{-2.f};
+
 static void write_stereo_uniform(std::span<uint8_t> uniform, const gx::UniformReplayLayout& layout,
                                  const StereoReplayEye& eye, const Mat4x4<float>& gameProjection,
                                  const Viewport& drawViewport, ClipRect displayRegion,
-                                 const stereo_replay::HudScreen& hudScreen, bool positionsAnchored = false) noexcept {
+                                 const stereo_replay::HudScreen& hudScreen, bool positionsAnchored = false,
+                                 ClipRect scissor = {}, uint32_t clipOffset = 0) noexcept {
   if (layout.perspective) {
     // A projection that flips X (mirror mode) keeps its flip: the eye frustum
     // replaces the X scale's magnitude, and the reflection moves onto the eye
@@ -1458,10 +1573,15 @@ static void write_stereo_uniform(std::span<uint8_t> uniform, const gx::UniformRe
       screen.halfHeight = .15f * hudScreen.halfHeight / hudScreen.halfWidth;
       screen.distance = 1.0f;
     }
-    const auto projection = stereo_replay::compose_hud_screen_projection(
-        eye.projection, worldNameBalloon ? eye.viewFromScene : eye.handHud ? eye.handHudViewFromPanel : eye.viewFromCenter,
-        screen, gameProjection, ndcRemap, placement);
+    const auto& view =
+        worldNameBalloon ? eye.viewFromScene : eye.handHud ? eye.handHudViewFromPanel : eye.viewFromCenter;
+    const auto projection =
+        stereo_replay::compose_hud_screen_projection(eye.projection, view, screen, gameProjection, ndcRemap, placement);
     std::memcpy(uniform.data() + layout.projectionOffset, &projection, sizeof(projection));
+    // Name balloons move with their kart's world depth and anchor: left unclipped.
+    if (clipOffset != 0) {
+      write_screen_clip(uniform, clipOffset, eye, view, screen, !worldNameBalloon, drawViewport, scissor, displayRegion);
+    }
   }
 
   if (displayRegion.width > 0 && displayRegion.height > 0) {
@@ -1558,8 +1678,27 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
             draw.uniformRange.size, projectionEnd, positionEnd, normalEnd);
         return false;
       }
-      requiredBytes += static_cast<size_t>(draw.uniformRange.size) * AURORA_STEREO_EYE_COUNT;
+      // A 2D screen draw's eye copies carry the clip block (write_screen_clip), padded to the alignment.
+      const uint32_t clip = layout.perspective || layout.uniformSize == 0 ? 0u : gx::screen_clip_offset(layout.uniformSize);
+      const size_t eyeBytes = clip != 0 ? std::max<size_t>(draw.uniformRange.size, clip + gx::ScreenClipBytes) +
+                                              g_cachedLimits.minUniformBufferOffsetAlignment
+                                        : draw.uniformRange.size;
+      requiredBytes += eyeBytes * AURORA_STEREO_EYE_COUNT;
     }
+  }
+  // 2D draws on the race's virtual screen, per 10 s (they carry the screen clip).
+  static uint64_t hudDrawsWindow = 0, hudFramesWindow = 0;
+  static auto hudWindowStart = std::chrono::steady_clock::now();
+  hudDrawsWindow += replayHudScreenDrawCount;
+  ++hudFramesWindow;
+  if (const auto now = std::chrono::steady_clock::now(); now - hudWindowStart >= std::chrono::seconds(10)) {
+    if (hudScreen.valid()) {
+      Log.info("Immersive replay: {:.1f} 2D draws a frame on the virtual screen (10 s); screen clip self-check {:.5f}",
+               static_cast<double>(hudDrawsWindow) / static_cast<double>(std::max<uint64_t>(hudFramesWindow, 1)),
+               g_screenClipCheck.load(std::memory_order_relaxed));
+    }
+    hudDrawsWindow = hudFramesWindow = 0;
+    hudWindowStart = now;
   }
   static bool replayCoverageLogged = false;
   if (!replayCoverageLogged) {
@@ -1604,9 +1743,16 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
     if (!pass.efbTarget) {
       continue;
     }
+    ClipRect drawScissor{};  // none until the pass sets one
     for (auto& command : pass.commands) {
       if (command.type == CommandType::SetViewport) {
         drawViewport = command.data.setViewport;
+        continue;
+      }
+      if (command.type == CommandType::SetScissor) {
+        const auto& sc = command.data.setScissor;
+        drawScissor = {static_cast<int32_t>(sc.x), static_cast<int32_t>(sc.y), static_cast<int32_t>(sc.width),
+                       static_cast<int32_t>(sc.height)};
         continue;
       }
       if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GX ||
@@ -1658,12 +1804,19 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
         mirroredProjectionLogged = true;
         Log.info("Immersive replay: perspective draws flip X (mirror mode); mirroring the eye transform to match");
       }
+      // A 2D draw on the virtual screen gets the clip block after its own uniform (write_screen_clip).
+      const uint32_t clipOffset =
+          layout.perspective || layout.uniformSize == 0 ? 0u : gx::screen_clip_offset(layout.uniformSize);
+      const uint32_t eyeUniformSize =
+          clipOffset != 0 ? std::max(draw.uniformRange.size, clipOffset + gx::ScreenClipBytes) : draw.uniformRange.size;
       LateStereoUniform* saved = nullptr;
       if (history != nullptr) {
         saved = &history->uniforms.emplace_back();
         saved->layout = layout;
         saved->viewport = drawViewport;
         saved->displayRegion = uniformRegion;
+        saved->scissor = drawScissor;
+        saved->clipOffset = clipOffset;
         const auto save = [&](const uint8_t* source, uint32_t size) -> Range {
           if (size == 0)
             return {};
@@ -1676,7 +1829,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
         saved->previous = save(g_uniforms.data() + draw.previousUniformRange.offset, draw.previousUniformRange.size);
       }
       for (uint32_t eyeIndex = 0; eyeIndex < AURORA_STEREO_EYE_COUNT; ++eyeIndex) {
-        auto [uniform, range] = map_uniform(draw.uniformRange.size);
+        auto [uniform, range] = map_uniform(eyeUniformSize);
         draw.stereoUniformRanges[eyeIndex] = range;
         if (saved != nullptr) {
           // The late replay uploads these ranges at the actual display time.
@@ -1687,7 +1840,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
         const auto& eye = stereoFrame.eyes[eyeIndex];
         std::memcpy(eyeUniform.data(), sourceUniform.data(), range.size);
         write_stereo_uniform({eyeUniform.data(), range.size}, layout, eye, gameProjection, drawViewport, uniformRegion,
-                             hudScreen);
+                             hudScreen, false, drawScissor, clipOffset);
         std::memcpy(uniform.data(), eyeUniform.data(), range.size);
       }
     }
@@ -2170,6 +2323,11 @@ bool prepare_late_stereo_replay(SealedFrame& frame, wgpu::CommandEncoder& cmd, c
   if (!has_late_stereo_replay(frame))
     return false;
   auto& data = frame.data().stereo;
+  if (static auto lastCheck = std::chrono::steady_clock::time_point{};
+      data.hudScreen.valid() && std::chrono::steady_clock::now() - lastCheck >= std::chrono::seconds(5)) {
+    lastCheck = std::chrono::steady_clock::now();
+    g_screenClipCheck.store(screen_clip_self_check(stereoFrame.eyes[0], data.hudScreen), std::memory_order_relaxed);
+  }
   data.uploadBytes.resize(data.uploadSize);
   auto* bytes = data.uploadBytes.data();
   weight = std::clamp(weight, 0.0f, 1.0f);
@@ -2223,9 +2381,9 @@ bool prepare_late_stereo_replay(SealedFrame& frame, wgpu::CommandEncoder& cmd, c
       std::memcpy(bytes + saved.eyes[eye].offset - data.uploadOffset, uniform.data(), uniform.size());
     }
     for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
-      write_stereo_uniform({bytes + saved.eyes[eye].offset - data.uploadOffset, saved.current.size}, layout,
+      write_stereo_uniform({bytes + saved.eyes[eye].offset - data.uploadOffset, saved.eyes[eye].size}, layout,
                            stereoFrame.eyes[eye], projection, saved.viewport, saved.displayRegion, data.hudScreen,
-                           stereoFrame.interpolateInAnchor);
+                           stereoFrame.interpolateInAnchor, saved.scissor, saved.clipOffset);
     }
   }
   // Never interpolate in mapped upload memory: write-combined pages make CPU

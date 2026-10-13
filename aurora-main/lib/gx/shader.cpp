@@ -1694,6 +1694,26 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
         "    return out;";
   }
 
+  if (config.exactScreenDepth && screen_clip_offset(info.uniformSize) != 0) {
+    // A reprojected 2D draw uses the whole eye viewport and scissor, so the frame edge and the game's
+    // scissor no longer clip it (Mario Kart's item box sliding up out of the frame stayed visible
+    // above the screen). The clip block (gx.hpp, written per eye by gfx/common.cpp) maps the pixel
+    // back to frame NDC; outside the recorded rectangle the fragment is dropped. Checked last, after
+    // every texture sample, so it cannot affect uniformity.
+    uniBufAttrs +=
+        "\n    screen_clip_u: vec4f,"
+        "\n    screen_clip_v: vec4f,"
+        "\n    screen_clip_w: vec4f,"
+        "\n    screen_clip_rect: vec4f,";
+    fragmentFn +=
+        "\n    let screen_clip_p = vec3f(in.pos.xy, 1.0);"
+        "\n    let screen_clip_h = vec3f(dot(ubuf.screen_clip_u.xyz, screen_clip_p), "
+        "dot(ubuf.screen_clip_v.xyz, screen_clip_p), dot(ubuf.screen_clip_w.xyz, screen_clip_p));"
+        "\n    let screen_clip_uv = screen_clip_h.xy / max(screen_clip_h.z, 1e-20);"
+        "\n    if (screen_clip_h.z <= 0.0 || any(screen_clip_uv < ubuf.screen_clip_rect.xy) || "
+        "any(screen_clip_uv > ubuf.screen_clip_rect.zw)) { discard; }";
+  }
+
   const auto shaderSource = fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
