@@ -41,6 +41,12 @@ User state, from `runtime_config.h`:
 
 ## Tools and runs
 
-`frame/tools/mockrun.sh` runs the game against the mock runtime (xrmock) or flat, headless
-(`SDL_VIDEO_DRIVER=offscreen`, `SDL_AUDIO_DRIVER=dummy`, no DISPLAY), in a scratch state dir. It aborts
-when the mock runtime file is missing or empty. Never run the game with the real runtime from an agent.
+`frame/tools/mockrun.sh [--flat] [--seconds N]` runs the game against the mock runtime (xrmock) or flat,
+headless: a private Xvfb for the window (Dawn needs a window surface to pick the adapter),
+`SDL_AUDIO_DRIVER=dummy`, and `KARTFRAME_HEADLESS=1`, which makes aurora skip configuring and
+presenting the desktop swapchain (it renders into an offscreen texture and logs a frame count). The
+scratch user state is `~/.cache/kf-mockrun/data/WiiCompiled`. It aborts when the mock runtime file is
+missing or empty and when a game is already running. Never run the game with the real runtime from an
+agent. Known facts: Valve's implicit OpenXR layer `XrApiLayer_VALVE_fdm_injection` is loaded in front of
+the mock; the mock offers no `XR_KHR_convert_timespec_time` yet, so the game logs "no clock
+conversion"; the binary links the system libabsl, libpng, freetype (present on SteamOS).
