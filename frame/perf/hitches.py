@@ -9,16 +9,21 @@ first N seconds (10) of each race, and the frames with their likely cause:
   pipelines   blocked on or compiling pipelines (pipeline_wait + inline compiles) for most of the excess
   textures    CPU texture conversion for most of the excess
   disc        game data read in the frame (rchar, newly opened files under DATA/files)
-  worker      waiting for the frame worker (Aurora's encode of the previous frame)
-  other       none of the above (game logic, scheduling)."""
+  worker      waiting for the frame worker (Aurora's encode of the previous frame) or its GPU lock
+  no cpu      the game thread was runnable but waiting for a CPU (runq_ms) for most of the excess
+  aurora begin  inside aurora_begin_frame (frame-worker preparation) for most of the excess
+  game cpu    the game thread computed for 80 % of a 60 Hz frame or more (game logic, GX recording)
+  blocked     none of these: the thread slept elsewhere (the game's own waits: VI retrace, threads)
+  other       older logs without game_cpu_ms: none of the above."""
 import bisect
 import os
 import re
 import sys
 
+CAUSES = ("pipelines", "textures", "disc", "worker", "no cpu", "aurora begin", "game cpu", "blocked", "other")
 BUCKETS = [(20, 33), (33, 50), (50, 100), (100, 250), (250, 1000), (1000, 1e9)]
-HITCH = re.compile(r"hitch: mono=([\d.]+) frame_ms=([\d.]+) worker_wait_ms=([\d.]+) pipelines_new=(\d+) pipeline_wait_ms=([\d.]+) "
-                   r"pipeline_inline=(\d+) pipeline_inline_ms=([\d.]+) tex_convert_ms=([\d.]+) tex_convert_kb=(\d+) tex_upload_kb=(\d+)")
+HITCH = re.compile(r"hitch: mono=([\d.]+) frame_ms=([\d.]+)(?: game_cpu_ms=([\d.]+))?(?: runq_ms=([\d.]+) begin_ms=([\d.]+))? worker_wait_ms=([\d.]+) pipelines_new=(\d+) pipeline_wait_ms=([\d.]+) "
+                   r"pipeline_inline=(\d+) pipeline_inline_ms=([\d.]+) tex_convert_ms=([\d.]+) tex_convert_kb=(\d+) tex_upload_kb=(\d+)(?: begin_joins=(\d+))?")
 
 
 def load(d):
@@ -39,8 +44,8 @@ def load(d):
                 race_open = None
             m = HITCH.search(line)
             if m:
-                v = [float(x) for x in m.groups()]
-                hitches.append(dict(zip(("mono", "ms", "worker", "pnew", "pwait", "pinl", "pinlms", "tex", "texkb", "upkb"), v)))
+                v = [float(x) if x is not None else -1.0 for x in m.groups()]
+                hitches.append(dict(zip(("mono", "ms", "cpu", "runq", "begin", "worker", "pnew", "pwait", "pinl", "pinlms", "tex", "texkb", "upkb", "joins"), v)))
     if race_open is not None:
         races.append((race_open, 1e9))
     io = []
@@ -76,10 +81,16 @@ def cause(h, rbytes, files):
         return "textures"
     if h["worker"] >= 0.5 * excess:
         return "worker"
-    return "other"
+    if h["runq"] >= 0.5 * excess:
+        return "no cpu"
+    if h["begin"] >= 0.5 * excess:
+        return "aurora begin"
+    if h["cpu"] >= 0.8 * 16.7:
+        return "game cpu"
+    return "blocked" if h["cpu"] >= 0 else "other"
 
 
-def main(d, window):
+def main(d, window, limit=60):
     hitches, races, start, io = load(d)
     if start is None:
         print("no 'vr pacing clock' line; is this a run of a build with lane E's diagnostics?")
@@ -99,18 +110,20 @@ def main(d, window):
     print("races at session seconds: %s" % ", ".join("%d-%s" % (a, "end" if b >= 1e9 else int(b)) for a, b in races))
     print()
     print("| part | frames > 20 ms | " + " | ".join("%d-%s ms" % (a, "" if b >= 1e9 else int(b)) for a, b in BUCKETS) +
-          " | pipelines | textures | disc | worker | other |")
-    print("| --- " * (len(BUCKETS) + 7) + "|")
+          " | " + " | ".join(CAUSES) + " |")
+    print("| --- " * (len(BUCKETS) + 2 + len(CAUSES)) + "|")
     for name, items in groups.items():
         hist = [sum(1 for h, _ in items if a <= h["ms"] < b) for a, b in BUCKETS]
-        causes = [sum(1 for _, c in items if c == k) for k in ("pipelines", "textures", "disc", "worker", "other")]
+        causes = [sum(1 for _, c in items if c == k) for k in CAUSES]
         print("| %s | %d | %s | %s |" % (name, len(items), " | ".join(map(str, hist)), " | ".join(map(str, causes))))
     print()
     print("frames over 33 ms (t = session seconds):")
+    shown = 0
     for t, part, h, c, rb, files in rows:
-        if h["ms"] >= 33:
-            print("  t=%.1f %s %.0f ms: %s; worker %.1f, pipelines new %d wait %.1f inline %d/%.1f ms, tex %.1f ms %d KiB, "
-                  "upload %d KiB, read %d KiB%s" % (t, part, h["ms"], c, h["worker"], h["pnew"], h["pwait"], h["pinl"], h["pinlms"],
+        if h["ms"] >= 33 and shown < limit:
+            shown += 1
+            print("  t=%.1f %s %.0f ms (cpu %.0f, runq %.0f, begin %.0f): %s; worker %.1f, pipelines new %d wait %.1f inline %d/%.1f ms, tex %.1f ms %d KiB, "
+                  "upload %d KiB, read %d KiB%s" % (t, part, h["ms"], h["cpu"], h["runq"], h["begin"], c, h["worker"], h["pnew"], h["pwait"], h["pinl"], h["pinlms"],
                                                     h["tex"], h["texkb"], h["upkb"], rb // 1024,
                                                     (", opened " + " ".join(files[:4])) if files else ""))
     return 0

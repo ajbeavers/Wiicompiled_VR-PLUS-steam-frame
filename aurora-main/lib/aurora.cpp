@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -2488,14 +2489,22 @@ void record_frame_telemetry() {
   previousProcessCpu100ns = processCpu100ns;
   previousThreadCpu100ns = threadCpu100ns;
 #endif
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__linux__)
   {
     // `adb shell setprop debug.wiicompiled.fpslog 1` before launch logs the game's rendered frame rate every five
     // seconds. The headset compositor's own log (logcat tag VrApi) repeats frames, so it cannot show this.
+    // Linux: KARTFRAME_FPSLOG=1 (frame rate and the producer/worker split), 2 (also per-pass GPU timestamps).
     static const bool fpsLog = [] {
+#if defined(__ANDROID__)
       const bool on = android_debug::property_int("debug.wiicompiled.fpslog", 0) == 1;
+      const bool gpuTiming = on;
+#else
+      const char* env = std::getenv("KARTFRAME_FPSLOG");
+      const bool on = env != nullptr && (env[0] == '1' || env[0] == '2');
+      const bool gpuTiming = env != nullptr && env[0] == '2';
+#endif
       // The same switch turns on the per-pass GPU timestamps reported below the frame-rate line.
-      gfx::gpu_timing_set_enabled(on);
+      gfx::gpu_timing_set_enabled(gpuTiming);
       return on;
     }();
     if (fpsLog) {
@@ -2680,6 +2689,82 @@ void end_frame_impl(bool pumpEvents, bool drainFifo, uint64_t contentTag,
 #endif
 }
 
+// One "hitch:" line per game frame slower than kHitchFrameNs (end_frame to end_frame), with what the
+// process did meanwhile (gfx/hitch_stats.hpp; frame/perf/hitches.py reads it). mono is CLOCK_MONOTONIC
+// seconds (steady_clock on Linux), so external samplers can be lined up with it.
+struct HitchTracker {
+  static constexpr uint64_t kHitchFrameNs = 20'000'000;
+  uint64_t lastEndNs = 0;
+  uint64_t lastCpuNs = 0;
+  uint64_t lastRunDelayNs = 0;
+  uint64_t workerWaitNs = 0;
+  uint64_t beginNs = 0;  // inside aurora_begin_frame (worker preparation, surface)
+  uint32_t beginJoins = 0;  // begin_frame joined the worker's preparation (waitForSurfacePreparation)
+  uint64_t pipelineWait = 0, pipelineSync = 0, pipelineSyncCount = 0, texConvert = 0, texConvertBytes = 0,
+           texUploadBytes = 0;
+  uint32_t createdPipelines = 0;
+  uint32_t lines = 0;
+  uint64_t lineWindowStart = 0;
+
+  void on_end_frame(uint64_t now) noexcept {
+    using namespace gfx::hitch;
+    const uint64_t pw = g_pipelineWaitNs.load(std::memory_order_relaxed);
+    const uint64_t ps = g_pipelineSyncNs.load(std::memory_order_relaxed);
+    const uint64_t pc = g_pipelineSyncCount.load(std::memory_order_relaxed);
+    const uint64_t tc = g_texConvertNs.load(std::memory_order_relaxed);
+    const uint64_t tb = g_texConvertBytes.load(std::memory_order_relaxed);
+    const uint64_t tu = g_texUploadBytes.load(std::memory_order_relaxed);
+    const uint32_t cp = gfx::g_stats.createdPipelines;
+    // The game thread's own CPU time: frame_ms well above cpu_ms means it was blocked or not scheduled.
+    uint64_t cpu = 0;
+#if defined(__linux__)
+    if (timespec ts{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+      cpu = static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ull + static_cast<uint64_t>(ts.tv_nsec);
+    }
+#endif
+    // Time the game thread was runnable but waiting for a CPU (second field of schedstat).
+    uint64_t runDelay = 0;
+#if defined(__linux__)
+    if (std::FILE* f = std::fopen("/proc/thread-self/schedstat", "r")) {
+      unsigned long long onCpu = 0, waited = 0;
+      if (std::fscanf(f, "%llu %llu", &onCpu, &waited) == 2) {
+        runDelay = waited;
+      }
+      std::fclose(f);
+    }
+#endif
+    if (lastEndNs != 0 && now - lastEndNs > kHitchFrameNs) {
+      if (now - lineWindowStart > 1'000'000'000) {
+        lineWindowStart = now;
+        lines = 0;
+      }
+      if (++lines <= 30) {
+        Log.info("hitch: mono={:.3f} frame_ms={:.1f} game_cpu_ms={:.1f} runq_ms={:.1f} begin_ms={:.1f} worker_wait_ms={:.1f} "
+                 "pipelines_new={} pipeline_wait_ms={:.1f} pipeline_inline={} pipeline_inline_ms={:.1f} tex_convert_ms={:.1f} "
+                 "tex_convert_kb={} tex_upload_kb={} begin_joins={}",
+                 now / 1e9, (now - lastEndNs) / 1e6, (cpu - lastCpuNs) / 1e6, (runDelay - lastRunDelayNs) / 1e6,
+                 beginNs / 1e6, workerWaitNs / 1e6, cp - createdPipelines, (pw - pipelineWait) / 1e6,
+                 pc - pipelineSyncCount, (ps - pipelineSync) / 1e6, (tc - texConvert) / 1e6, (tb - texConvertBytes) / 1024,
+                 (tu - texUploadBytes) / 1024, beginJoins);
+      }
+    }
+    lastEndNs = now;
+    lastCpuNs = cpu;
+    lastRunDelayNs = runDelay;
+    beginNs = 0;
+    beginJoins = 0;
+    workerWaitNs = 0;
+    pipelineWait = pw;
+    pipelineSync = ps;
+    pipelineSyncCount = pc;
+    texConvert = tc;
+    texConvertBytes = tb;
+    texUploadBytes = tu;
+    createdPipelines = cp;
+  }
+};
+HitchTracker g_hitchTracker; // game thread only
+
 bool begin_frame() noexcept {
 #ifdef AURORA_ENABLE_GX
   // The asynchronous fast path below can return a logically prepared frame
@@ -2723,6 +2808,16 @@ bool begin_frame() noexcept {
   }
 
   if (workerPreparationPending) {
+    ++g_hitchTracker.beginJoins;
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      Log.info("begin_frame joins the frame worker's preparation: presentable {}, surface {}, resize pending {}, "
+               "paused {}, size matches {}",
+               window::is_presentable(), static_cast<bool>(g_surface), window::native_resize_pending(), window::is_paused(),
+               window::native_window_size_matches(webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                                                  webgpu::g_graphicsConfig.surfaceConfiguration.height));
+    }
     // DONE, not SEALED: this only runs while the window is changing and the caller is about to act on
     // the surface, so keep the resize path fully serialized.
     wait_for_frame_worker_private(FrameWorkerPhase::Done);
@@ -2745,53 +2840,6 @@ bool begin_frame() noexcept {
   return prepared;
 }
 
-// One "hitch:" line per game frame slower than kHitchFrameNs (end_frame to end_frame), with what the
-// process did meanwhile (gfx/hitch_stats.hpp; frame/perf/hitches.py reads it). mono is CLOCK_MONOTONIC
-// seconds (steady_clock on Linux), so external samplers can be lined up with it.
-struct HitchTracker {
-  static constexpr uint64_t kHitchFrameNs = 20'000'000;
-  uint64_t lastEndNs = 0;
-  uint64_t workerWaitNs = 0;
-  uint64_t pipelineWait = 0, pipelineSync = 0, pipelineSyncCount = 0, texConvert = 0, texConvertBytes = 0,
-           texUploadBytes = 0;
-  uint32_t createdPipelines = 0;
-  uint32_t lines = 0;
-  uint64_t lineWindowStart = 0;
-
-  void on_end_frame(uint64_t now) noexcept {
-    using namespace gfx::hitch;
-    const uint64_t pw = g_pipelineWaitNs.load(std::memory_order_relaxed);
-    const uint64_t ps = g_pipelineSyncNs.load(std::memory_order_relaxed);
-    const uint64_t pc = g_pipelineSyncCount.load(std::memory_order_relaxed);
-    const uint64_t tc = g_texConvertNs.load(std::memory_order_relaxed);
-    const uint64_t tb = g_texConvertBytes.load(std::memory_order_relaxed);
-    const uint64_t tu = g_texUploadBytes.load(std::memory_order_relaxed);
-    const uint32_t cp = gfx::g_stats.createdPipelines;
-    if (lastEndNs != 0 && now - lastEndNs > kHitchFrameNs) {
-      if (now - lineWindowStart > 1'000'000'000) {
-        lineWindowStart = now;
-        lines = 0;
-      }
-      if (++lines <= 30) {
-        Log.info("hitch: mono={:.3f} frame_ms={:.1f} worker_wait_ms={:.1f} pipelines_new={} pipeline_wait_ms={:.1f} "
-                 "pipeline_inline={} pipeline_inline_ms={:.1f} tex_convert_ms={:.1f} tex_convert_kb={} tex_upload_kb={}",
-                 now / 1e9, (now - lastEndNs) / 1e6, workerWaitNs / 1e6, cp - createdPipelines, (pw - pipelineWait) / 1e6,
-                 pc - pipelineSyncCount, (ps - pipelineSync) / 1e6, (tc - texConvert) / 1e6, (tb - texConvertBytes) / 1024,
-                 (tu - texUploadBytes) / 1024);
-      }
-    }
-    lastEndNs = now;
-    workerWaitNs = 0;
-    pipelineWait = pw;
-    pipelineSync = ps;
-    pipelineSyncCount = pc;
-    texConvert = tc;
-    texConvertBytes = tb;
-    texUploadBytes = tu;
-    createdPipelines = cp;
-  }
-};
-HitchTracker g_hitchTracker; // game thread only
 
 void end_frame(uint64_t contentTag, imgui::HostFramePtr hostImGuiFrame) noexcept {
 #ifdef AURORA_ENABLE_GX
@@ -2819,7 +2867,9 @@ void end_frame(uint64_t contentTag, imgui::HostFramePtr hostImGuiFrame) noexcept
   // Seal all current GX work on the CPU while the renderer is known ready.
   // Later FIFO writes belong exclusively to the next frame.
   {
+    const uint64_t lockStart = gfx::hitch::now_ns();
     std::lock_guard gpuLock(g_rendererGpuMutex);
+    g_hitchTracker.workerWaitNs += gfx::hitch::now_ns() - lockStart;
     gx::fifo::drain();
   }
   {
@@ -2931,7 +2981,12 @@ AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config)
 }
 void aurora_shutdown() { aurora::shutdown(); }
 const AuroraEvent* aurora_update() { return aurora::update(); }
-bool aurora_begin_frame() { return aurora::begin_frame(); }
+bool aurora_begin_frame() {
+  const uint64_t start = aurora::gfx::hitch::now_ns();
+  const bool ok = aurora::begin_frame();
+  aurora::g_hitchTracker.beginNs += aurora::gfx::hitch::now_ns() - start;
+  return ok;
+}
 void aurora_end_frame() { aurora::end_frame(AURORA_STEREO_CONTENT_TAG_UNKNOWN, {}); }
 void aurora_end_frame_tagged(uint64_t contentTag) { aurora::end_frame(contentTag, {}); }
 void aurora_end_frame_ex(uint64_t contentTag, void* imguiFrame) {

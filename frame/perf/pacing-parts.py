@@ -6,7 +6,7 @@ RaceScene", the mock's summary) and samples.txt (KARTFRAME_PACING_SAMPLES: every
 encode ms per pacing second). A second belongs to the race from the pacing line after "entered
 RaceScene" up to the one after "exited RaceScene" (session-report.py's rule). Prints one markdown row
 per run and part: sets/s, late % (of sets due), repeats % (of ticks), missed refreshes, half-rate
-switches, GPU ms per set p50/p99, encode ms p50/p99, then the mock's own counts against the game's."""
+switches, GPU ms per set p50/p99, encode ms p50/p99, game frames/s (KARTFRAME_FPSLOG lines), then the mock's own counts against the game's."""
 import os
 import re
 import sys
@@ -14,6 +14,7 @@ import sys
 PACING = re.compile(r"vr pacing: t=(\d+) hz=([\d.]+) mode=(\S+) ticks=(\d+) rendered=(\d+) interpolated=(\d+) "
                     r"late=(\d+) missed=(\d+) repeats=(\d+)")
 TOTALS = re.compile(r"vr pacing totals: .* ticks=(\d+) rendered=(\d+) interpolated=(\d+) late=(\d+) missed=(\d+) repeats=(\d+)")
+FPS = re.compile(r"Game frame rate [\d.]+ FPS \((\d+) frames in ([\d.]+) s\); per frame the producer waited ([\d.]+) ms for DONE")
 MOCK = re.compile(r"xrmock: frames: (\d+) ended; (\d+) showed newly released eyes .*?\), (\d+) repeated a projection layer, "
                   r"(\d+) a quad, (\d+) no layer")
 
@@ -26,7 +27,8 @@ def pct(values, p):
 
 
 def run(d):
-    parts = {k: {"s": 0, "ticks": 0, "rendered": 0, "late": 0, "missed": 0, "repeats": 0, "gpu": [], "enc": [], "half": 0}
+    parts = {k: {"s": 0, "ticks": 0, "rendered": 0, "late": 0, "missed": 0, "repeats": 0, "gpu": [], "enc": [], "half": 0,
+                 "frames": 0, "fsecs": 0.0, "done_ms": 0.0}
              for k in ("menus", "race")}
     second_part = {}
     in_race = False
@@ -51,6 +53,13 @@ def run(d):
                 for i, k in ((4, "ticks"), (5, "rendered"), (7, "late"), (8, "missed"), (9, "repeats")):
                     p[k] += int(m.group(i))
                 continue
+            m = FPS.search(line)
+            if m:
+                p = parts["race" if in_race else "menus"]
+                p["frames"] += int(m.group(1))
+                p["fsecs"] += float(m.group(2))
+                p["done_ms"] += float(m.group(3)) * int(m.group(1))
+                continue
             m = TOTALS.search(line)
             if m:
                 totals = [int(x) for x in m.groups()]
@@ -74,8 +83,8 @@ def fmt(x):
 
 
 def main(dirs):
-    print("| run | part | s | sets/s | late % | repeats % | missed | GPU ms p50 / p99 | encode ms p50 / p99 |")
-    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    print("| run | part | s | sets/s | late % | repeats % | missed | GPU ms p50 / p99 | encode ms p50 / p99 | game fps |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     checks = []
     for d in dirs:
         name = os.path.basename(os.path.normpath(d))
@@ -85,10 +94,11 @@ def main(dirs):
             if not p["s"]:
                 continue
             due = p["rendered"] + p["late"]
-            print("| %s | %s | %d | %.1f | %.2f | %.2f | %d | %s / %s | %s / %s |" % (
+            fps = "%.1f" % (p["frames"] / p["fsecs"]) if p["fsecs"] else "-"
+            print("| %s | %s | %d | %.1f | %.2f | %.2f | %d | %s / %s | %s / %s | %s |" % (
                 name, k, p["s"], p["rendered"] / p["s"], 100.0 * p["late"] / max(due, 1),
                 100.0 * p["repeats"] / max(p["ticks"], 1), p["missed"], fmt(pct(p["gpu"], .5)), fmt(pct(p["gpu"], .99)),
-                fmt(pct(p["enc"], .5)), fmt(pct(p["enc"], .99))))
+                fmt(pct(p["enc"], .5)), fmt(pct(p["enc"], .99)), fps))
         hs = ", ".join("%s in %s" % (a, "race" if r else "menus") for a, r in half) or "none"
         if totals and mock:
             ticks, rendered, interp, late, missed, repeats = totals

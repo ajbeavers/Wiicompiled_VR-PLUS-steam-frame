@@ -19,7 +19,7 @@ rm -rf "$D"; mkdir -p "$D"
 [ "${KF_PERF_COLD:-0}" = 1 ] && rm -rf "$HOMEDIR"
 mkdir -p "$HOMEDIR"
 for kv in "$@"; do export "$kv"; done
-export KF_MOCKRUN_HOME=$HOMEDIR KARTFRAME_PACING_SAMPLES=$D/samples.txt
+export KF_MOCKRUN_HOME=$HOMEDIR KARTFRAME_PACING_SAMPLES=$D/samples.txt KARTFRAME_FPSLOG=${KARTFRAME_FPSLOG:-1}
 printf '%s\n' "$@" > "$D/env.txt"
 EXE=${KF_BUILD:-$(cd "$HERE/../.." && pwd)/build-linux}/kartframe
 busy() { pgrep -af 'SteamLaunch|lepton|waydroid|(^|[ /])kartframe( |$)' | grep -Ev 'pgrep|mockrun|perf/run.sh' ; }
