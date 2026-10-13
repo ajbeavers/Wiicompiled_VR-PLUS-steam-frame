@@ -539,6 +539,32 @@ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
   }
 }
 
+bool headless() noexcept {
+  static const bool value = [] {
+    const char* env = std::getenv("KARTFRAME_HEADLESS");
+    return env != nullptr && *env != '\0' && *env != '0';
+  }();
+  return value;
+}
+
+wgpu::Texture headless_surface_texture() {
+  static wgpu::Texture texture;
+  static uint32_t width = 0, height = 0;
+  const auto& cfg = g_graphicsConfig.surfaceConfiguration;
+  if (!texture || width != cfg.width || height != cfg.height) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Headless surface",
+        .usage = cfg.usage,
+        .size = {cfg.width, cfg.height, 1},
+        .format = cfg.format,
+    };
+    texture = g_device.CreateTexture(&descriptor);
+    width = cfg.width;
+    height = cfg.height;
+  }
+  return texture;
+}
+
 static bool create_surface() {
   SDL_Window* window = window::get_sdl_window();
   if (window == nullptr) {
@@ -1090,7 +1116,9 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
   g_graphicsConfig.surfaceConfiguration.height = native_height;
   auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
   surfaceConfiguration.device = g_device;
-  g_surface.Configure(&surfaceConfiguration);
+  if (!headless()) {
+    g_surface.Configure(&surfaceConfiguration);
+  }
   if (!sizeChanged) {
     // Forced reconfigure at an unchanged size (present-mode change or recreated surface). The
     // offscreen targets are not swapchain images, so reallocating them would only stall the frame.

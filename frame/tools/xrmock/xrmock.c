@@ -193,6 +193,26 @@ static XrResult XRAPI_CALL mCreateActionSpace(XrSession s, const XrActionSpaceCr
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mDestroySpace(XrSpace s) { (void)s; return XR_SUCCESS; }
+// Added for the KartFrame game, which calls these (the Galaxy app did not).
+static XrResult XRAPI_CALL mEnumBlend(XrInstance i, XrSystemId sys, XrViewConfigurationType vct, uint32_t cap, uint32_t* count, XrEnvironmentBlendMode* modes) {
+    (void)i;
+    (void)sys;
+    (void)vct;
+    *count = 1;
+    if (cap >= 1 && modes) modes[0] = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL mEnumRefSpaces(XrSession s, uint32_t cap, uint32_t* count, XrReferenceSpaceType* spaces) {
+    (void)s;
+    *count = 3;
+    if (cap >= 3 && spaces) {
+        spaces[0] = XR_REFERENCE_SPACE_TYPE_VIEW;
+        spaces[1] = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        spaces[2] = XR_REFERENCE_SPACE_TYPE_STAGE;
+    }
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL mDestroyActionSet(XrActionSet a) { (void)a; return XR_SUCCESS; }
 static XrResult XRAPI_CALL mLocateSpace(XrSpace sp, XrSpace base, XrTime t, XrSpaceLocation* loc) {
     (void)sp;
     (void)base;
@@ -640,7 +660,7 @@ static const Entry kTable[] = {
     E("xrEnumerateInstanceExtensionProperties", mEnumExt), E("xrCreateInstance", mCreateInstance), E("xrDestroyInstance", mDestroyInstance), E("xrGetInstanceProperties", mGetInstanceProps), E("xrResultToString", mResultToString),
     E("xrGetSystem", mGetSystem), E("xrGetSystemProperties", mGetSystemProps), E("xrCreateSession", mCreateSession),
     E("xrDestroySession", mDestroySession), E("xrCreateReferenceSpace", mCreateRefSpace), E("xrCreateActionSpace", mCreateActionSpace),
-    E("xrDestroySpace", mDestroySpace), E("xrLocateSpace", mLocateSpace), E("xrEnumerateViewConfigurationViews", mEnumViewConfigViews),
+    E("xrDestroySpace", mDestroySpace), E("xrEnumerateEnvironmentBlendModes", mEnumBlend), E("xrEnumerateReferenceSpaces", mEnumRefSpaces), E("xrDestroyActionSet", mDestroyActionSet), E("xrLocateSpace", mLocateSpace), E("xrEnumerateViewConfigurationViews", mEnumViewConfigViews),
     E("xrEnumerateSwapchainFormats", mEnumFormats), E("xrCreateSwapchain", mCreateSwapchain), E("xrDestroySwapchain", mDestroySwapchain), E("xrEnumerateSwapchainImages", mEnumSwapImages),
     E("xrAcquireSwapchainImage", mAcquire), E("xrWaitSwapchainImage", mWaitImage), E("xrReleaseSwapchainImage", mRelease),
     E("xrBeginSession", mBeginSession), E("xrEndSession", mEndSession), E("xrRequestExitSession", mRequestExit), E("xrPollEvent", mPollEvent),

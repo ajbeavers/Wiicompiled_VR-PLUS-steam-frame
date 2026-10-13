@@ -3,7 +3,7 @@
 #
 #   frame/tools/mockrun.sh [--flat] [--seconds N] [--game DIR] [--exe PATH]
 #
-# --flat runs without the mock: VR off, desktop renderer (title screen check).
+# Needs Xvfb (a virtual X server; nothing is shown anywhere). --flat runs without the mock: VR off, desktop renderer (title screen check).
 # Environment: MOCK_XR_* settings of xrmock (MOCK_XR_SECONDS, MOCK_XR_HZ, MOCK_XR_TRACE, ...),
 # KF_BUILD (build dir, default <repo>/build-linux), KF_MOCKRUN_HOME (scratch user dir, default
 # ~/.cache/kf-mockrun). The game reads its user state from $XDG_DATA_HOME/WiiCompiled (Config.toml,
@@ -50,14 +50,24 @@ widescreen = true
 display_mode = "windowed"
 
 [vr]
+mirror_view = "none"
 enabled = $([ $FLAT = 1 ] && echo false || echo true)
 required = $([ $FLAT = 1 ] && echo false || echo true)
 TOML
 LOG=$OUT/logs/$(date +%Y%m%d-%H%M%S)-$([ $FLAT = 1 ] && echo flat || echo mock).log
 
-# Headless: nothing on the owner's displays, nothing audible.
-unset DISPLAY WAYLAND_DISPLAY
-export SDL_VIDEO_DRIVER=offscreen SDL_AUDIO_DRIVER=dummy
+# Headless: nothing on the owner's displays, nothing audible. The game gets a private virtual X server
+# (Xvfb on a display it picks itself) for its window; Dawn needs a window surface to choose the
+# adapter, and KARTFRAME_HEADLESS=1 (aurora) never configures or presents that swapchain.
+unset WAYLAND_DISPLAY
+XVFB_DISPLAY_FILE=$OUT/xvfb.display; : > "$XVFB_DISPLAY_FILE"
+Xvfb -displayfd 3 -screen 0 1280x720x24 -nolisten tcp 3>"$XVFB_DISPLAY_FILE" >"$OUT/logs/xvfb.log" 2>&1 &
+XVFB_PID=$!
+trap 'kill $XVFB_PID 2>/dev/null' EXIT
+for _ in $(seq 50); do [ -s "$XVFB_DISPLAY_FILE" ] && break; sleep 0.2; done
+[ -s "$XVFB_DISPLAY_FILE" ] || die "Xvfb did not start (see $OUT/logs/xvfb.log)"
+export DISPLAY=:$(head -1 "$XVFB_DISPLAY_FILE")
+export SDL_VIDEO_DRIVER=x11 SDL_AUDIO_DRIVER=dummy KARTFRAME_HEADLESS=1
 export XDG_DATA_HOME=$OUT/data
 
 if [ $FLAT = 0 ]; then
@@ -74,10 +84,23 @@ else
 fi
 echo "mockrun: $EXE ($([ $FLAT = 1 ] && echo flat || echo "mock runtime $XR_RUNTIME_JSON")), ${SECONDS_RUN}s, log $LOG"
 set +e
-timeout -s INT --kill-after=15 $((SECONDS_RUN + 120)) "$EXE" > "$LOG" 2>&1 &
+# The game has no run time of its own: the mock ends the XR session after MOCK_XR_SECONDS and the
+# game would carry on in desktop mode, so it is stopped (SIGTERM, then SIGKILL) shortly after.
+STOP=$SECONDS_RUN; [ $FLAT = 0 ] && STOP=$((SECONDS_RUN + 8))
+"$EXE" > "$LOG" 2>&1 &
 PID=$!
-if [ $FLAT = 1 ]; then sleep "$SECONDS_RUN"; kill -INT $PID 2>/dev/null; fi
+( sleep "$STOP"; kill -TERM $PID 2>/dev/null; sleep 15; kill -KILL $PID 2>/dev/null ) &
+WATCH=$!
 wait $PID; RC=$?
-echo "mockrun: exit $RC"
+kill $WATCH 2>/dev/null
+echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
 grep -a 'xrmock: summary' "$LOG" || true
-exit $RC
+echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
+FATAL=$(grep -a -c 'fatal dialog\|Signal 11' "$LOG")
+echo "mockrun: fatal lines: $FATAL"
+[ "$FATAL" = 0 ] || exit 1
+if [ $FLAT = 0 ]; then
+  grep -aq 'session state -> FOCUSED' "$LOG" || { echo "mockrun: FAIL, the session never reached FOCUSED" >&2; exit 1; }
+  grep -aq 'xrmock: summary: 0 errors' "$LOG" || { echo "mockrun: FAIL, mock errors (see the trace)" >&2; exit 1; }
+fi
+echo "mockrun: ok"
