@@ -426,7 +426,9 @@ if(MKW_PLATFORM_LINUX)
     # line out of build.ninja (the same scheme as the Quest probe above).
     add_executable(kartframe_kit_probe EXCLUDE_FROM_ALL "${MKW_BASE_PRODUCT_SOURCE}")
     mkw_configure_product(kartframe_kit_probe WITHOUT_GAME)
-    target_precompile_headers(kartframe_kit_probe REUSE_FROM WiiCompiled)
+    # Its own PCH: REUSE_FROM would make the probe depend on the whole WiiCompiled target, which
+    # compiles every translated shard.
+    target_precompile_headers(kartframe_kit_probe PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
     target_link_options(kartframe_kit_probe PRIVATE "-Wl,--unresolved-symbols=ignore-all")
 endif()
 

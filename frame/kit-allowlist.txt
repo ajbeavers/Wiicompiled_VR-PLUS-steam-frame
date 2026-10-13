@@ -1,0 +1,7 @@
+# Files over 1 MB the kit may contain (globs, see boundary-check.sh). Prebuilt runtime objects and
+# archives, the sysroot's libraries, and the converted controller models are not disc-derived.
+objects/*
+libs/*
+sysroot/usr/lib/*
+sysroot/usr/lib/gcc/*
+resources/*
