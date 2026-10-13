@@ -43,6 +43,9 @@ typedef struct MockGfx {
     int (*poll_snapshots)(int wait);
     // How many releases the exact check covered.
     int (*snapshots_checked)(void);
+    // MOCK_XR_DUMP: writes image `index` (waits for the app's queue first) as a PPM, every
+    // `step`-th pixel. Null: not available.
+    int (*dump_image)(void* images, int index, int width, int height, int64_t format, int step, const char* path);
 } MockGfx;
 
 extern const MockGfx kMockGfxGles;
