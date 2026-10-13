@@ -36,9 +36,9 @@ def run(d):
     half = []
     with open(os.path.join(d, "game.log"), errors="replace") as f:
         for line in f:
-            if "entered RaceScene" in line:
+            if "entered RaceScene" in line or "presentation=immersive-race" in line:
                 in_race = True
-            elif "exited RaceScene" in line:
+            elif "exited RaceScene" in line or "presentation=virtual-screen" in line or "presentation=desktop" in line:
                 in_race = False
             elif "rendering every second refresh" in line:
                 half.append(("down", in_race))

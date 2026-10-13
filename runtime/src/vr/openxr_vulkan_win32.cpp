@@ -1134,9 +1134,11 @@ public:
             quad.layerFlags = 0;
             quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
             quad.subImage.swapchain = retained_swapchains_[0].handle;
-            quad.subImage.imageRect = {{0, 0},
-                                       {static_cast<int32_t>(retained_swapchains_[0].width),
-                                        static_cast<int32_t>(retained_swapchains_[0].height)}};
+            // Only the picture, not the black bands letterboxing it into the square eye-sized image
+            // (as the Android backend): they framed the screen in black.
+            const uint32_t image_width = retained_swapchains_[0].width;
+            quad.subImage.imageRect = OpenXRVirtualScreenContentRect(
+                image_width, retained_swapchains_[0].height, frame.presentation.quad_content_aspect);
             quad.subImage.imageArrayIndex = 0;
             if (frame.presentation.quad_anchored) {
                 // Placed in the application space, so the screen keeps its place
@@ -1151,9 +1153,12 @@ public:
                 quad.pose.position = {
                     0.0f, 0.0f, -std::max(0.25f, frame.presentation.quad_distance_meters)};
             }
-            quad.size.width = std::max(0.25f, frame.presentation.quad_width_meters);
-            quad.size.height = quad.size.width * static_cast<float>(retained_swapchains_[0].height) /
-                               static_cast<float>(retained_swapchains_[0].width);
+            // The whole image would be quad_width_meters across: the crop keeps that size per pixel,
+            // so the picture stays where the pointer and the settings panel expect it.
+            const float meters_per_pixel =
+                std::max(0.25f, frame.presentation.quad_width_meters) / static_cast<float>(image_width);
+            quad.size.width = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.width);
+            quad.size.height = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.height);
             return EndFrameWithPanel(frame, reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad));
         } else {
             std::array<XrCompositionLayerProjectionView, kOpenXREyeCount> views{};

@@ -53,14 +53,20 @@ conversion"; abseil, zlib, libpng and freetype are built static from pinned sour
 
 ## Pacing knobs (lane A)
 Config `[vr] frame_pacing = auto|inline|pipelined` (auto = pipelined, measured) and `refresh_rate`
-(120). Env: KARTFRAME_PACING overrides the mode; KARTFRAME_REFRESH_HZ the rate;
+(120; requested in-app only when SteamVR offers exactly that rate, else the wrapper's per-app key
+decides). Menus are a quad layer fixed in the room (menu_shader_quality 0), the first-run guide is
+projected. Env: KARTFRAME_PACING overrides the mode; KARTFRAME_REFRESH_HZ the rate;
 KARTFRAME_PACING_MARGIN_US (1000) is kept free before the deadline for release + xrEndFrame;
-KARTFRAME_HALF_RATE=0|1 never/always every second refresh (default: drop at more than 12 late of
-240, back after 10 s with 6 or fewer of 600); KARTFRAME_PACING_DEBUG=1 per-set timelines;
+every refresh always by default (a late set repeats the retained layer, which SteamVR reprojects;
+half rate is 60 Hz content shown twice, the judder H1 rejected); KARTFRAME_HALF_RATE=1 always every
+second refresh (measurements), =auto drops after more than 5 % late over 30 s and stays there for
+the session; KARTFRAME_PACING_DEBUG=1 per-set timelines;
 KARTFRAME_NO_GPU_WAIT=1 negative test only. The wrapper sets TU_DEBUG=sysmem unless
 KARTFRAME_SYSMEM=0 (the race holds 120 Hz at 1728 only with it). Log line per second:
 `vr pacing: t= hz= mode= ticks= rendered= interpolated= late= missed= repeats= gpu_ms=p50/p99 encode_ms=p50/p99`
 (format in runtime/include/vr/openxr_diagnostics.h); session-report.py reads it with vrtiming.log.
 Mock: MOCK_XR_BUSY_MS (exact released-unfinished check), MOCK_XR_FOCUS_BLIP=<ms>[@<s>],
-MOCK_XR_PROFILE, MOCK_XR_EYE, MOCK_XR_TIME_OFFSET_S; mockrun seeds welcome/tutorial done so the
-demo race starts by itself.
+MOCK_XR_PROFILE, MOCK_XR_EYE, MOCK_XR_TIME_OFFSET_S, MOCK_XR_DUMP=<dir> (released images as PPM at
+MOCK_XR_DUMP_AT seconds); mockrun seeds welcome/tutorial done so the demo race starts by itself
+(KF_MOCKRUN_INTRO=1 shows them). KARTFRAME_FPSLOG=1 logs the game frame rate every 5 s;
+KARTFRAME_SYNC_WINDOW=1 restores aurora's per-frame SDL_SyncWindow (10 ms a game frame on X11).
