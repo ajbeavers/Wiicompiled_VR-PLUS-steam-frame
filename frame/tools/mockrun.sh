@@ -81,6 +81,10 @@ for _ in $(seq 50); do [ -s "$XVFB_DISPLAY_FILE" ] && break; sleep 0.2; done
 [ -s "$XVFB_DISPLAY_FILE" ] || die "Xvfb did not start (see $OUT/logs/xvfb.log)"
 export DISPLAY=:$(head -1 "$XVFB_DISPLAY_FILE")
 export SDL_VIDEO_DRIVER=x11 SDL_AUDIO_DRIVER=dummy KARTFRAME_HEADLESS=1
+# The loader looks for explicit layers (the validation layer: VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
+# under XDG_DATA_HOME, which points at the scratch dir below; keep the user's own layer folder findable.
+[ -d "${XDG_DATA_HOME:-$HOME/.local/share}/vulkan/explicit_layer.d" ] &&
+  export VK_ADD_LAYER_PATH="${VK_ADD_LAYER_PATH:+$VK_ADD_LAYER_PATH:}${XDG_DATA_HOME:-$HOME/.local/share}/vulkan/explicit_layer.d"
 export XDG_DATA_HOME=$OUT/data
 
 if [ $FLAT = 0 ]; then
