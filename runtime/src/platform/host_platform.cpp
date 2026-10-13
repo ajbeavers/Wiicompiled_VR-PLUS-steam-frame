@@ -54,6 +54,13 @@ std::optional<std::filesystem::path> ExecutableDirectory() noexcept {
         return std::filesystem::path(resources);
     }
     return std::nullopt;
+#elif defined(__linux__)
+    std::error_code ec;
+    const auto resolved = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return resolved.parent_path();
 #else
     return std::nullopt;
 #endif
