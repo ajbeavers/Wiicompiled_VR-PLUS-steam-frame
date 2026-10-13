@@ -20,19 +20,23 @@ bash "$HERE/run.sh" "$NAME" "$SECS" MOCK_XR_SKIP=1 TU_DEBUG=sysmem "KF_MOCKRUN_V
 hand_hud = false" "MOCK_XR_PRESS=/user/hand/right/input/a/click@12/1.5" MOCK_XR_HANDS=1 \
   MOCK_XR_DUMP=$TMP MOCK_XR_DUMP_AT=65,75 MOCK_XR_DUMP_FRAMES=2 "$@" || true
 mkdir -p "$DUMP"
-mv "$TMP"/*.ppm "$DUMP"/ 2>/dev/null || true; rm -rf "$TMP"
-python3 -I - "$DUMP"/*.ppm <<'PY'
+mv "$TMP"/*.ppm "$TMP"/*.pgm "$DUMP"/ 2>/dev/null || true; rm -rf "${TMP:?}"
+# PPM (RGB) and, with MOCK_XR_DUMP_ALPHA=1, PGM (alpha) to PNG.
+python3 -I - "$DUMP"/*.ppm "$DUMP"/*.pgm <<'PY'
+import os
 import sys, zlib, struct
 for src in sys.argv[1:]:
+    if not os.path.exists(src): continue
     data = open(src, 'rb').read()
     head = data.split(b'\n', 3)
     w, h = map(int, head[1].split())
-    px = data[len(data) - w * h * 3:]
-    raw = b''.join(b'\0' + px[y * w * 3:(y + 1) * w * 3] for y in range(h))
+    n = 1 if head[0] == b'P5' else 3
+    px = data[len(data) - w * h * n:]
+    raw = b''.join(b'\0' + px[y * w * n:(y + 1) * w * n] for y in range(h))
     chunk = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
-    open(src[:-4] + '.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+    open(src[:-4] + '.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2 if n == 3 else 0, 0, 0, 0))
                                         + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
 PY
-rm -f "$DUMP"/*.ppm
+rm -f "${DUMP:?}"/*.ppm "${DUMP:?}"/*.pgm
 grep -a 'entered RaceScene\|screen clip self-check' "$OUT/$NAME/game.log" | tail -3
 echo "hudrace: eye images in $DUMP"

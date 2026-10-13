@@ -438,6 +438,19 @@ static int dumpImage(void* images, int index, int width, int height, int64_t for
                     fwrite(rgb, 1, 3, f);
                 }
             fclose(f);
+            // MOCK_XR_DUMP_ALPHA=1: the alpha channel beside it (<path without .ppm>-alpha.pgm), to
+            // composite layers blended by their alpha (the menus' environment layer over the screen).
+            if (getenv("MOCK_XR_DUMP_ALPHA")) {
+                char apath[600];
+                snprintf(apath, sizeof(apath), "%.*s-alpha.pgm", (int)(strlen(path) > 4 ? strlen(path) - 4 : strlen(path)), path);
+                FILE* a = fopen(apath, "wb");
+                if (a) {
+                    fprintf(a, "P5\n%d %d\n255\n", ow, oh);
+                    for (int y = 0; y < height; y += step)
+                        for (int x = 0; x < width; x += step) fputc(px[((size_t)y * width + x) * 4 + 3], a);
+                    fclose(a);
+                }
+            }
         } else ok = 0;
         DEV(vkUnmapMemory)(gDevice, mem);
     }

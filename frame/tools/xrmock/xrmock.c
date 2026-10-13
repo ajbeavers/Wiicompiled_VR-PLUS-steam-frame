@@ -45,7 +45,8 @@
 //                             <dir>/t<seconds>-sc<id>-<n>.ppm: at the seconds in
 //                             MOCK_XR_DUMP_AT=<s>,<s>... (default every 10 s), the next
 //                             MOCK_XR_DUMP_FRAMES=<n> (1) releases of every swapchain;
-//                             MOCK_XR_DUMP_STEP=<n> every n-th pixel (4; 1: full resolution)
+//                             MOCK_XR_DUMP_STEP=<n> every n-th pixel (4; 1: full resolution);
+//                             MOCK_XR_DUMP_ALPHA=1 also the alpha channel (<name>-alpha.pgm)
 //   MOCK_XR_STAMP=1           Vulkan, with KARTFRAME_FRAME_STAMP=1 in the app: every eye image a
 //                             projection layer submits carries the display time its poses were
 //                             located for (a block in its corner); compared with the locate the
@@ -62,7 +63,8 @@
 // Every xrEndFrame must carry the predictedDisplayTime of the xrWaitFrame its xrBeginFrame followed
 // (ERROR otherwise; summary line "end times").
 //   MOCK_XR_HANDS=1           controllers held in front of the player (left and right action
-//                             spaces at chest height, pointing ahead), instead of all at the head
+//                             spaces at chest height, pointing ahead), instead of all at the head;
+//                             =high raises the right one to eye height in the middle (in front of the menu screen)
 //   MOCK_XR_PRESS=<path>@<start s>/<every s>[;...]  scripted presses for the current profile
 //                             (MOCK_XR_PROFILE): the action bound to <path> (e.g.
 //                             /user/hand/right/input/a/click) is held for 150 ms every <every> s from
@@ -297,7 +299,10 @@ static XrResult XRAPI_CALL mLocateSpace(XrSpace sp, XrSpace base, XrTime t, XrSp
         // Held at chest height, pointing ahead and a little up (the right one at the menu screen).
         const float pitch = 0.08f;
         loc->pose.orientation = (XrQuaternionf){sinf(pitch * 0.5f), 0, 0, cosf(pitch * 0.5f)};
-        loc->pose.position = (XrVector3f){gSpaceHand[id] ? 0.16f : -0.2f, 1.3f, -0.32f};
+        // MOCK_XR_HANDS=high: the right hand raised to eye height, in front of the menu screen.
+        static int high = -1;
+        if (high < 0) high = getenv("MOCK_XR_HANDS") && !strcmp(getenv("MOCK_XR_HANDS"), "high");
+        loc->pose.position = (XrVector3f){gSpaceHand[id] ? (high ? 0.0f : 0.16f) : -0.2f, high && gSpaceHand[id] ? 1.55f : 1.3f, -0.32f};
     }
     return XR_SUCCESS;
 }

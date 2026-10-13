@@ -37,8 +37,9 @@
 
 namespace mkw::vr {
 namespace {
-// KARTFRAME_MENU_ENV: unset the menus' environment layer goes under the screen's quad, "over" over it,
-// "0" there is none.
+// KARTFRAME_MENU_ENV: unset (or "over") the menus' environment layer goes over the screen's quad, blended
+// by its alpha; "under" puts it under the quad (lane G's first order: the quad then hid the pointer's ray
+// and target mark on the screen, third headset session); "0" there is none.
 const char* MenuEnvironmentSetting() {
     const char* env = std::getenv("KARTFRAME_MENU_ENV");
     return env != nullptr ? env : "";
@@ -1193,10 +1194,12 @@ public:
             quad.size.width = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.width);
             quad.size.height = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.height);
             // The room around the screen (controllers, pointer, plain background): one projection
-            // layer from the packed environment image, with the set's own poses. Under the quad by
-            // default; KARTFRAME_MENU_ENV=over puts it over the quad, blended by its alpha (the
-            // screen's area is transparent there), so a controller in front of the screen stays in
-            // front of it on a compositor that keeps the layer order.
+            // layer from the packed environment image, with the set's own poses, the frame's only
+            // projection layer. Over the quad by default, blended by its alpha: the screen's area is
+            // transparent (0,0,0,0) except where the ray, its target mark or a controller is drawn
+            // (opaque, alpha 1, so premultiplied and straight alpha agree), so the pointer shows on the
+            // screen and a controller held in front of it stays in front. KARTFRAME_MENU_ENV=under puts
+            // it under the quad (the pointer is then hidden where the screen is).
             const bool position_valid = (frame.xr_frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
             if (retained_env_valid_ && frame.presentation.menu_environment && frame.xr_frame.views_valid &&
                 position_valid && retained_env_swapchain_.handle != XR_NULL_HANDLE) {
@@ -1592,7 +1595,7 @@ private:
     }
 
     static bool MenuEnvironmentOver() {
-        static const bool over = std::string_view(MenuEnvironmentSetting()) == "over";
+        static const bool over = std::string_view(MenuEnvironmentSetting()) != "under";
         return over;
     }
 
