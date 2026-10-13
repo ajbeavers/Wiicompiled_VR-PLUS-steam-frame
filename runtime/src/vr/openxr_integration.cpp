@@ -483,6 +483,10 @@ public:
         interpolation_available_.store(true, std::memory_order_release);
         clock_fallback_logged_ = false;
         clock_offset_valid_ = false;
+        RT_LOG(RT_TAG_RUNTIME) << "OpenXR display times: "
+                               << (convert_display_time_ != nullptr ? "XR_KHR_convert_timespec_time"
+                                                                     : "no conversion offered; CLOCK_MONOTONIC fallback")
+                               << std::endl;
 #else
         interpolation_available_.store(convert_display_time_ != nullptr, std::memory_order_release);
 #endif
