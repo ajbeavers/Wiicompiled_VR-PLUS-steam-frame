@@ -33,6 +33,9 @@ struct DrawData {
   // Writes colour, blended or opaque (not a logic-op or depth-only quad): a candidate for a full-frame
   // fade shown across the whole eye.
   bool fadeCandidate = false;
+  // Leaves the picture unchanged: blended with the source alpha, untextured, one TEV stage passing a
+  // material alpha under 2/255 through, no depth write (an idle screen filter). The eye replay skips it.
+  bool invisible = false;
   // Diagnostics (KARTFRAME_LOG_2D_QUADS): blend | logic << 2 | texgens << 6 | tex0 width << 10 | height << 21 |
   // tex0 is an EFB copy << 32.
   uint64_t quadSignature = 0;

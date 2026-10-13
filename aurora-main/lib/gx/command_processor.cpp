@@ -2521,6 +2521,22 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   // logic-op full-frame quads are not: the race draws such quads every frame (backgrounds, a logic-op
   // pass), and one shown across the eye blacked it out.
   const bool fadeCandidate = g_gxState.colorUpdate && g_gxState.blendMode == GX_BM_BLEND;
+  const auto invisible_blend = [] {
+    const auto& st = g_gxState;
+    if (st.blendMode != GX_BM_BLEND || st.blendFacSrc != GX_BL_SRCALPHA || st.blendFacDst != GX_BL_INVSRCALPHA ||
+        st.depthUpdate || st.numTexGens != 0 || st.numTevStages != 1 || st.vtxDesc[GX_VA_CLR0] != GX_NONE) {
+      return false;
+    }
+    const auto& stage = st.tevStages[0];
+    if (stage.alphaPass.a != GX_CA_ZERO || stage.alphaPass.b != GX_CA_ZERO || stage.alphaPass.c != GX_CA_ZERO ||
+        stage.alphaPass.d != GX_CA_RASA || stage.alphaOp.op != GX_TEV_ADD || stage.alphaOp.bias != GX_TB_ZERO ||
+        stage.alphaOp.outReg != GX_TEVPREV || stage.channelId != GX_COLOR0A0 || stage.tevSwapRas != GX_TEV_SWAP0) {
+      return false;
+    }
+    const auto& alphaChannel = st.colorChannelConfig[GX_ALPHA0];
+    return alphaChannel.matSrc == GX_SRC_REG && !alphaChannel.lightingEnabled &&
+           st.colorChannelState[GX_ALPHA0].matColor[3] < 2.f / 255.f;
+  };
   const auto quad_signature = [] {
     const auto& tex = get_texture(GX_TEXMAP0);
     const uint32_t w = tex.ref ? std::min<uint32_t>(tex.texObj.width(), 2047) : 0;
@@ -2540,17 +2556,24 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
                            (uint64_t(g_gxState.alphaUpdate) << 5) | (uint64_t(g_gxState.depthUpdate) << 6) |
                            (uint64_t(g_gxState.depthCompare) << 7) | (uint64_t(g_gxState.numTevStages) << 8) |
                            (uint64_t(g_gxState.numTexGens) << 16) | (uint64_t(drawScreenRect->width) << 24) |
-                           (uint64_t(drawScreenRect->height) << 40);
+                           (uint64_t(drawScreenRect->height) << 40) ^
+                           (uint64_t(g_gxState.colorChannelState[GX_ALPHA0].matColor[3] * 255.f) << 56);
       std::lock_guard lock(loggedMutex);
-      if (logged.size() < 24 && std::find(logged.begin(), logged.end(), key) == logged.end()) {
+      if (logged.size() < 200 && std::find(logged.begin(), logged.end(), key) == logged.end()) {
         logged.push_back(key);
         Log.info("VR large 2D rectangle: {:.0f}x{:.0f} at ({:.0f}, {:.0f}) of a {:.0f}x{:.0f} viewport; blend {} colour "
                  "{} alpha {} depth update {} compare {} func {}; {} TEV stages, {} texgens; material colour "
-                 "{:.2f} {:.2f} {:.2f} {:.2f}",
+                 "{:.2f} {:.2f} {:.2f} {:.2f}; blend factors {}/{}; TEV0 alpha {} {} {} {} ka {} chan {}; alpha channel src {} "
+                 "light {} {:.2f}; vertex colour {}; invisible {}",
                  drawScreenRect->width, drawScreenRect->height, drawScreenRect->left, drawScreenRect->top, vp.width,
                  vp.height, int(g_gxState.blendMode), g_gxState.colorUpdate, g_gxState.alphaUpdate,
                  g_gxState.depthUpdate, g_gxState.depthCompare, int(g_gxState.depthFunc), g_gxState.numTevStages,
-                 g_gxState.numTexGens, c[0], c[1], c[2], c[3]);
+                 g_gxState.numTexGens, c[0], c[1], c[2], c[3], int(g_gxState.blendFacSrc), int(g_gxState.blendFacDst),
+                 int(g_gxState.tevStages[0].alphaPass.a), int(g_gxState.tevStages[0].alphaPass.b),
+                 int(g_gxState.tevStages[0].alphaPass.c), int(g_gxState.tevStages[0].alphaPass.d),
+                 int(g_gxState.tevStages[0].kaSel), int(g_gxState.tevStages[0].channelId),
+                 int(g_gxState.colorChannelConfig[GX_ALPHA0].matSrc), g_gxState.colorChannelConfig[GX_ALPHA0].lightingEnabled,
+                 g_gxState.colorChannelState[GX_ALPHA0].matColor[3], int(g_gxState.vtxDesc[GX_VA_CLR0]), invisible_blend());
       }
     }
   }
@@ -2573,6 +2596,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
       .dstAlpha = pipelineState.dstAlpha,
       .screenRect = drawScreenRect,
       .fadeCandidate = fadeCandidate,
+      .invisible = stereo && invisible_blend(),
       .quadSignature = drawScreenRect ? quad_signature() : uint64_t{0},
   });
   // What the next draw must match to be allowed to fold into this one.

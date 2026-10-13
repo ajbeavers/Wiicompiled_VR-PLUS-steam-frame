@@ -1696,6 +1696,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
            r.top + r.height >= y + 0.98f * h;
   };
   size_t fullViewDrawCount = 0;
+  size_t fullViewInvisibleCount = 0;  // of them provably transparent (skipped by the eye replay)
   size_t requiredBytes = 0;
   size_t efbPassCount = 0;
   size_t perspectiveDrawCount = 0;
@@ -1720,6 +1721,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
       passSawScene = passSawScene || command.data.draw.gx.uniformReplayLayout.perspective;
       if (pass.efbTarget && fullView(command.data.draw.gx)) {
         ++fullViewDrawCount;
+        fullViewInvisibleCount += command.data.draw.gx.invisible ? 1 : 0;
         log_replay_quad(command.data.draw.gx, true);
         continue;
       }
@@ -1763,7 +1765,9 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
     }
   }
   // 2D draws on the race's virtual screen, per 10 s (they carry the screen clip).
-  static uint64_t hudDrawsWindow = 0, hudFramesWindow = 0, fullViewDrawsWindow = 0, fullViewFramesWindow = 0;
+  static uint64_t hudDrawsWindow = 0, hudFramesWindow = 0, fullViewDrawsWindow = 0, fullViewFramesWindow = 0,
+                  fullViewInvisibleWindow = 0;
+  fullViewInvisibleWindow += fullViewInvisibleCount;
   static auto hudWindowStart = std::chrono::steady_clock::now();
   hudDrawsWindow += replayHudScreenDrawCount;
   fullViewDrawsWindow += fullViewDrawCount;
@@ -1772,11 +1776,12 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
   if (const auto now = std::chrono::steady_clock::now(); now - hudWindowStart >= std::chrono::seconds(10)) {
     if (hudScreen.valid()) {
       Log.info("Immersive replay: {:.1f} 2D draws a frame on the virtual screen (10 s); screen clip self-check {:.5f}; "
-               "full-view fades: {} draws in {} frames",
+               "full-view fades: {} draws in {} frames ({} transparent, skipped)",
                static_cast<double>(hudDrawsWindow) / static_cast<double>(std::max<uint64_t>(hudFramesWindow, 1)),
-               g_screenClipCheck.load(std::memory_order_relaxed), fullViewDrawsWindow, fullViewFramesWindow);
+               g_screenClipCheck.load(std::memory_order_relaxed), fullViewDrawsWindow, fullViewFramesWindow,
+               fullViewInvisibleWindow);
     }
-    hudDrawsWindow = hudFramesWindow = fullViewDrawsWindow = fullViewFramesWindow = 0;
+    hudDrawsWindow = hudFramesWindow = fullViewDrawsWindow = fullViewFramesWindow = fullViewInvisibleWindow = 0;
     hudWindowStart = now;
   }
   static bool replayCoverageLogged = false;
@@ -2971,6 +2976,9 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
       const auto& draw = cmd.data.draw;
       switch (draw.type) {
       case ShaderType::GX: {
+        if (overrideTarget && draw.gx.invisible) {
+          break;
+        }
         if (multiplayer && draw.gx.screenRect &&
             stereo_replay::is_split_screen_furniture(
                 *draw.gx.screenRect, {float(display.x), float(display.y), float(display.width), float(display.height)},
