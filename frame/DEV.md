@@ -81,3 +81,15 @@ KARTFRAME_FRAME_STAMP=1 (tests) stamps each eye image with its locate time. Mock
 MOCK_XR_PREDICT_JITTER, MOCK_XR_FOV (default Frame-like asymmetric), MOCK_XR_HANDS, MOCK_XR_PRESS
 (scripted presses; frame/perf/hudrace.sh drives a real Grand Prix race). Log lines: "vr display
 times" and "VR interpolation weights" every 10 s, eye fields of view once. Details in frame/perf/H2.md.
+
+## Lane H switches
+KARTFRAME_END_TIME=locate (lane G's rule; default now: each frame's own predicted time).
+KARTFRAME_THREADPRIO=high|nice|off (game, pacing, frame worker, GX and GPU watcher threads at up to
+nice -15 through RealtimeKit), KARTFRAME_UCLAMP=0 (no utilization clamp; by default the game thread
+runs on the big core). KARTFRAME_FULL_VIEW_FADES=0 keeps full-frame fades on the screen (default:
+across the whole eye; about 0.3 ms GPU a set). KARTFRAME_COPY_TRIM=0 keeps the minimap copy's last
+columns (default trims them: removes the thin line by the map). KARTFRAME_MENU_ENV defaults to
+over (controllers and laser over the screen quad, alpha blended); =under is lane G's order.
+KARTFRAME_LOG_2D_QUADS logs large 2D rectangles (to find the Blooper ink later). Mock: MOCK_XR_LEAD
+(display lead in refreshes, default 3 like SteamVR), MOCK_XR_DUMP_STEP, MOCK_XR_DUMP_ALPHA,
+MOCK_XR_HANDS=high. Details in frame/perf/H3.md.
