@@ -97,6 +97,8 @@ struct StereoSinkRegistration {
   stereo::SinkCallback callback = nullptr;
   stereo::SubmitCallback submitted = nullptr;
   void* userdata = nullptr;
+  stereo::DirectTargetsCallback direct = nullptr;
+  void* directUserdata = nullptr;
 };
 #endif
 std::mutex g_stereoRegistrationMutex;
@@ -890,6 +892,71 @@ gfx::StereoReplayFrame make_stereo_replay_frame(const AuroraStereoFrame& input, 
   return replay;
 }
 
+// The eyes of the set being encoded, when they render straight into the headset's swapchain images
+// (stereo::DirectTargetsCallback); empty otherwise. Set by use_direct_eye_targets right before the eyes
+// are encoded, read by the panel composite and the sink, cleared by run_stereo_sink.
+struct DirectEye {
+  wgpu::Texture texture;
+  wgpu::TextureView view;
+};
+std::array<DirectEye, AURORA_STEREO_EYE_COUNT> g_directEyes;
+// The content tag of the last game frame a set replayed immersive (encode_sealed_frame's native cut).
+std::atomic<uint64_t> g_lastImmersiveTag{AURORA_STEREO_CONTENT_TAG_UNKNOWN};
+
+const wgpu::TextureView& eye_output_view(uint32_t eye) noexcept {
+  return g_directEyes[eye].texture ? g_directEyes[eye].view : g_stereoEyeTargets[eye].output().view;
+}
+
+// An immersive set's eyes go straight into the acquired swapchain images when the sink takes them (the
+// backend allows it per set: it measures which way is cheaper on the runtime's images) and
+// nothing else needs Aurora's own eye targets this set: no MSAA resolve, no orientation correction, no
+// foveation view, no desktop mirror of the eyes, both eyes the size of their swapchain image.
+void use_direct_eye_targets(gfx::StereoReplayFrame& replay, const AuroraStereoFrame& input) noexcept {
+  g_directEyes = {};
+  if (input.mode != AURORA_STEREO_FRAME_IMMERSIVE_REPLAY ||
+      webgpu::g_graphicsConfig.msaaSamples > 1 || webgpu::g_RaceOutputNeedsCopy) {
+    return;
+  }
+  const auto mirror = gfx::get_stereo_mirror_view();
+  if (mirror != AURORA_STEREO_MIRROR_NORMAL && mirror != AURORA_STEREO_MIRROR_NONE) {
+    return;
+  }
+  stereo::DirectTargetsCallback callback;
+  void* userdata;
+  {
+    std::lock_guard lock(g_stereoRegistrationMutex);
+    callback = g_stereoSink.direct;
+    userdata = g_stereoSink.directUserdata;
+  }
+  const auto& left = g_stereoEyeTargets[0];
+  if (callback == nullptr || replay.eyes[0].target.foveatedColorView || replay.eyes[1].target.foveatedColorView ||
+      g_stereoEyeTargets[1].color.size.width != left.color.size.width ||
+      g_stereoEyeTargets[1].color.size.height != left.color.size.height) {
+    return;
+  }
+  std::array<wgpu::Texture, AURORA_STEREO_EYE_COUNT> textures;
+  if (!callback(input.frameToken, left.color.format, left.color.size.width, left.color.size.height, textures,
+                userdata)) {
+    return;
+  }
+  // A view per swapchain image, kept while the image is (the runtime cycles through a few).
+  static std::vector<std::pair<WGPUTexture, wgpu::TextureView>> views;
+  for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
+    auto it = std::find_if(views.begin(), views.end(), [&](const auto& v) { return v.first == textures[eye].Get(); });
+    if (it == views.end()) {
+      if (views.size() >= 16) views.erase(views.begin());
+      views.emplace_back(textures[eye].Get(), textures[eye].CreateView());
+      it = views.end() - 1;
+    }
+    g_directEyes[eye] = {textures[eye], it->second};
+    auto& target = replay.eyes[eye].target;
+    target.colorView = it->second;
+    target.resolveView = {};
+    target.copySourceTexture = textures[eye];
+    target.copySourceView = it->second;
+  }
+}
+
 #include "vr_ui.hpp"
 
 // The Frame's menus (AuroraStereoFrame::window on a virtual-screen packet with ui.anchored): eye target
@@ -900,6 +967,11 @@ bool menu_environment_requested(const AuroraStereoFrame& frame) noexcept {
 }
 void encode_menu_environment(wgpu::CommandEncoder& encoder, const webgpu::PresentSource& mono,
                              const AuroraStereoFrame& frame) {
+  gfx::gpu_timing_mark(encoder, gfx::GpuTimingCategory::MenuEnv);
+  struct EndMark {
+    wgpu::CommandEncoder& encoder;
+    ~EndMark() { gfx::gpu_timing_mark(encoder, std::nullopt); }
+  } endMark{encoder};
   const auto& target = g_stereoEyeTargets[1].output();
   const uint32_t eyeWidth = target.size.width / AURORA_STEREO_EYE_COUNT;
   for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
@@ -966,9 +1038,19 @@ std::optional<PendingStereoSink> run_stereo_sink(wgpu::CommandEncoder& encoder, 
   };
   const int orientation = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY ? webgpu::g_RaceOutputCopyMode : 0;
   const bool correction = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && webgpu::g_RaceOutputNeedsCopy;
+  const auto directEyes = std::exchange(g_directEyes, {});
   for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
     const auto& output = g_stereoEyeTargets[eye].output();
     const webgpu::TextureWithSampler* image = &output;
+    if (directEyes[eye].texture && mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY) {
+      frame.eyes[eye] = {
+          .texture = &directEyes[eye].texture,
+          .view = &directEyes[eye].view,
+          .size = output.size,
+          .format = output.format,
+      };
+      continue;
+    }
     if (correction) {
       auto& target = g_stereoEyeTargets[eye];
       if (!target.orientedColor.texture || target.orientedColor.size.width != output.size.width ||
@@ -2051,6 +2133,7 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
   const auto input = request_stereo_frame(g_retainedStereo.logicalFrame, g_retainedStereo.contentTag);
   if (!input) return;
   if (input->mode == AURORA_STEREO_FRAME_VIRTUAL_SCREEN && g_retainedMenuImage) {
+    gfx::gpu_timing_begin_frame(1);
     auto encoder=g_device.CreateCommandEncoder();
     const auto& image=*g_retainedMenuImage;
     const webgpu::PresentSource mono{.bindGroup=image.bindGroup,.texture=image.texture.texture,
@@ -2082,13 +2165,18 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
         stereo_overlay::composite_flat(encoder,output.view,output.size,eye);
       }
     }
+    gfx::gpu_timing_mark(encoder,gfx::GpuTimingCategory::Sink);
     const auto sink=run_stereo_sink(encoder,input->frameToken,g_retainedStereo.logicalFrame,input->mode,true,input->displayTimeNanos);
+    gfx::gpu_timing_mark(encoder,std::nullopt);
+    gfx::gpu_timing_end_frame(encoder);
     const auto buffer=encoder.Finish();std::lock_guard submitLock(g_queueSubmitMutex);
     g_queue.Submit(1,&buffer);
     if(sink && sink->submitted) sink->submitted(sink->frame,sink->userdata);
+    gfx::gpu_timing_after_submit();
     return;
   }
   if(input->mode != AURORA_STEREO_FRAME_IMMERSIVE_REPLAY || !gfx::has_late_stereo_replay(sealedFrame)) return;
+  g_lastImmersiveTag.store(g_retainedStereo.contentTag, std::memory_order_relaxed);
   float weight;
   auto replay = interpolated_stereo_frame(*input, weight);
   {
@@ -2105,22 +2193,32 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
       binsStart = now;
     }
   }
+  gfx::gpu_timing_begin_frame(1);
   auto encoder = g_device.CreateCommandEncoder();
-  if (!gfx::prepare_late_stereo_replay(sealedFrame, encoder, replay, weight))
+  if (!gfx::prepare_late_stereo_replay(sealedFrame, encoder, replay, weight)) {
+    gfx::gpu_timing_end_frame(encoder);  // closes the slot; nothing was recorded on the GPU
     return;
+  }
+  use_direct_eye_targets(replay, *input);
   for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
     gfx::render_stereo_eye(sealedFrame, encoder, replay, eye, false);
     // The panel texture from the last sealed frame; its draw data is not ours to touch here.
-    stereo_overlay::composite_immersive(encoder, g_stereoEyeTargets[eye].output().view, replay.eyes[eye].projection,
+    stereo_overlay::composite_immersive(encoder, eye_output_view(eye), replay.eyes[eye].projection,
                                         replay.eyes[eye].viewFromCenter, eye);
   }
+  gfx::gpu_timing_mark(encoder, gfx::GpuTimingCategory::Sink);
   const auto sink = run_stereo_sink(encoder, input->frameToken, g_retainedStereo.logicalFrame, input->mode, true,
                                     input->displayTimeNanos);
+  gfx::gpu_timing_mark(encoder, std::nullopt);
+  gfx::gpu_timing_end_frame(encoder);
   const auto buffer = encoder.Finish();
-  std::lock_guard submitLock(g_queueSubmitMutex);
-  g_queue.Submit(1, &buffer);
-  if (sink && sink->submitted)
-    sink->submitted(sink->frame, sink->userdata);
+  {
+    std::lock_guard submitLock(g_queueSubmitMutex);
+    g_queue.Submit(1, &buffer);
+    if (sink && sink->submitted)
+      sink->submitted(sink->frame, sink->userdata);
+  }
+  gfx::gpu_timing_after_submit();
 }
 
 // Phase 1: everything that touches producer-shared renderer state. Needs g_rendererGpuMutex and
@@ -2247,10 +2345,28 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   // mirroring an eye would strobe between two different images.
   // Nothing presents the snapshot on a headset, so it only needs the clear (see headset_owns_display).
   const bool headsetOnly = headset_owns_display();
+  // An immersive race frame: its eyes are encoded here, or (most frames at 120 Hz) by the refresh sets
+  // that replay it later, recognised by its content tag, which a refresh set replayed immersive last.
+  const bool immersiveFrame =
+      immersiveReplay || (ctx.retainStereo && !ctx.stereoInput &&
+                          g_retainedStereo.contentTag != AURORA_STEREO_CONTENT_TAG_UNKNOWN &&
+                          g_retainedStereo.contentTag == g_lastImmersiveTag.load(std::memory_order_relaxed));
+  // The native render of such a frame stops after its last copy the eyes sample (below), as on a
+  // standalone headset. On Linux the desktop window then shows black during races (nobody sees it
+  // while the headset is on); KARTFRAME_MONO_FULL=1 keeps the whole native render and the window's
+  // mirror of it. Lane I: ~1 ms of GPU a game frame in the race.
+  static const bool monoFull = [] {
+    const char* env = std::getenv("KARTFRAME_MONO_FULL");
+    return env != nullptr && env[0] == '1';
+  }();
+  const bool cutNative = immersiveFrame && (headsetOnly || !monoFull) && stereo_frame_provider_active() &&
+                         !gfx::efb_ram::has_pending() &&
+                         g_captureFrame.load(std::memory_order_acquire) == UINT32_MAX;
   const MirrorPlan mirrorPlan =
-      headsetOnly ? MirrorPlan::Black
-                  : g_stereoMirrorState.Resolve(gfx::get_stereo_mirror_view(), stereo_frame_provider_active(),
-                                                stereoOutput, immersiveReplay);
+      headsetOnly || cutNative ? MirrorPlan::Black
+                               : g_stereoMirrorState.Resolve(gfx::get_stereo_mirror_view(),
+                                                             stereo_frame_provider_active(), stereoOutput,
+                                                             immersiveReplay);
 
   // Each slot is submitted as soon as it is encoded, so the GPU starts slot 0 while slot 1 is still
   // recording. Queue order preserves the ordering the single batched buffer gave.
@@ -2306,8 +2422,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   // 12 ms GPU frame spent on a 1280x720 image nobody saw. A pending CPU readback or a frame
   // capture still gets the whole image.
   int32_t nativeRenderLastPass = INT32_MAX;
-  if (headsetOnly && immersiveReplay && !gfx::efb_ram::has_pending() &&
-      g_captureFrame.load(std::memory_order_acquire) == UINT32_MAX) {
+  if (cutNative) {
     nativeRenderLastPass = gfx::last_pass_feeding_replay(sealedFrame);
   }
   gfx::render(sealedFrame, encoder, -1, !immersiveReplay && !ctx.retainStereo, nativeRenderLastPass);
@@ -2337,15 +2452,19 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   // previous frame's; the interpolated slots above necessarily mirror the
   // previous frame, having been encoded before this replay.
   if (immersiveReplay) {
+    g_lastImmersiveTag.store(g_retainedStereo.contentTag, std::memory_order_relaxed);
     if (ctx.retainStereo && ctx.stereoInput) {
       float weight;
       ctx.stereoReplay = interpolated_stereo_frame(*ctx.stereoInput, weight);
       gfx::prepare_late_stereo_replay(sealedFrame, encoder, *ctx.stereoReplay, weight);
     }
+    if (ctx.stereoInput) {
+      use_direct_eye_targets(*ctx.stereoReplay, *ctx.stereoInput);
+    }
     for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
       gfx::render_stereo_eye(sealedFrame, encoder, *ctx.stereoReplay, eye,
                              !ctx.retainStereo && eye + 1 == AURORA_STEREO_EYE_COUNT);
-      stereo_overlay::composite_immersive(encoder, g_stereoEyeTargets[eye].output().view,
+      stereo_overlay::composite_immersive(encoder, eye_output_view(eye),
                                           ctx.stereoReplay->eyes[eye].projection,
                                           ctx.stereoReplay->eyes[eye].viewFromCenter, eye);
     }
@@ -2371,7 +2490,11 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   // an XR request: run_retained_stereo_frame can consume that request first.
   // Gating this on stereoOutput leaves the presenter replaying a stale (often
   // startup-black) image indefinitely, until recentering changes the timing.
-  if (stereo_frame_provider_active()) {
+  if (stereo_frame_provider_active() && cutNative) {
+    // The game image is incomplete: a virtual-screen set before the next full frame shows nothing
+    // new (the retained layer repeats) rather than a half-drawn picture.
+    g_retainedMenuImage.reset();
+  } else if (stereo_frame_provider_active()) {
     auto background=acquire_presentation_image(0,ctx.snapshotWidth,ctx.snapshotHeight);
     // Always sample the mono game source. Desktop ImGui is drawn separately
     // into the VR panel; including it only on frames with an XR request would
@@ -2431,8 +2554,10 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     }
   }
   if (stereoOutput) {
+    gfx::gpu_timing_mark(encoder, gfx::GpuTimingCategory::Sink);
     pendingStereoSink = run_stereo_sink(encoder, ctx.stereoFrameToken, ctx.logicalFrame, ctx.stereoFrameMode, false,
                                         ctx.stereoInput ? ctx.stereoInput->displayTimeNanos : 0);
+    gfx::gpu_timing_mark(encoder, std::nullopt);
   }
   auto pendingFrameCapture = encode_frame_capture(encoder, ctx.presentSource);
   presentationJobs.push_back({
@@ -3025,11 +3150,14 @@ void set_stereo_scene_anchor(const float anchorFromScene[12]) noexcept {
 namespace stereo {
 void set_sink(SinkCallback callback, SubmitCallback submitted, void* userdata) noexcept {
   std::lock_guard lock(g_stereoRegistrationMutex);
-  g_stereoSink = {
-      .callback = callback,
-      .submitted = submitted,
-      .userdata = userdata,
-  };
+  g_stereoSink.callback = callback;
+  g_stereoSink.submitted = submitted;
+  g_stereoSink.userdata = userdata;
+}
+void set_direct_targets(DirectTargetsCallback callback, void* userdata) noexcept {
+  std::lock_guard lock(g_stereoRegistrationMutex);
+  g_stereoSink.direct = callback;
+  g_stereoSink.directUserdata = userdata;
 }
 } // namespace stereo
 #endif

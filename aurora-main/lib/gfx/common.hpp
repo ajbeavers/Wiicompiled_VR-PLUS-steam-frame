@@ -8,6 +8,7 @@
 #include <cstring>
 #include <array>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -474,14 +475,34 @@ enum class GpuTimingCategory : uint8_t {
   DepthPeek,     // the depth snapshot compute pass
   Snapshot,      // presentation snapshot and its ImGui pass
   Present,       // the desktop presentation copy
+  // Segments inside an eye's render passes and around the headset submission, timed with in-pass
+  // timestamps (gpu_timing_mark) where the device has them (KARTFRAME_FPSLOG=2).
+  EyeScene,      // perspective (world) draws
+  EyeHud,        // 2D draws on the virtual screen
+  EyeFade,       // 2D draws across the whole eye (full-view fades, unclaimed 2D)
+  EyeEfbEffect,  // 2D draws sampling the game's own EFB copies (bloom, blur and the like)
+  EyeClear,      // clear draws
+  EyeOther2D,    // 2D draws that are none of the above
+  Cockpit,       // the VR cockpit and the immersive window's mask
+  Upload,        // the late replay's uniform upload
+  Sink,          // copies into the headset's swapchain images
+  HudLayer,      // the race's 2D layer rendered once into its own image
+  MenuEnv,       // the menus' environment layer
   Count,
 };
 void gpu_timing_set_enabled(bool enabled) noexcept;
 bool gpu_timing_enabled() noexcept;
 // Opens the current frame's query slot; a frame whose slot is still being read back is skipped.
-void gpu_timing_begin_frame() noexcept;
+// kind 0: a game frame's cycle (native render and its eye set), 1: a refresh's eye set.
+void gpu_timing_begin_frame(uint8_t kind = 0) noexcept;
 // Timestamp writes for one pass of the open frame, or nullptr when timing is off or exhausted.
 const wgpu::PassTimestampWrites* gpu_timing_pass(GpuTimingCategory category) noexcept;
+// True when the open frame is timed and the device writes timestamps inside passes.
+bool gpu_timing_marks_enabled() noexcept;
+// A timestamp starting a segment of `category` inside a timed pass, or on the encoder between passes
+// (no category: ends the segment). Segments end at the next timestamp of the frame in GPU order.
+void gpu_timing_mark(const wgpu::RenderPassEncoder& pass, GpuTimingCategory category) noexcept;
+void gpu_timing_mark(const wgpu::CommandEncoder& encoder, std::optional<GpuTimingCategory> category) noexcept;
 // Resolves the open frame's queries on `encoder`, which must be the frame's last submission.
 void gpu_timing_end_frame(wgpu::CommandEncoder& encoder) noexcept;
 // After that submission: starts the readback of the resolved queries.

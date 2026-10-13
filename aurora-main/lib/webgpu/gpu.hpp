@@ -63,6 +63,8 @@ extern wgpu::Instance g_instance;
 extern bool g_bcTexturesSupported;
 // The device was created with TimestampQuery, so passes may carry timestamp writes (gfx::gpu_timing_*).
 extern bool g_timestampQueriesSupported;
+// Timestamps inside passes and on the encoder (Dawn experimental feature; KARTFRAME_FPSLOG=2 only).
+extern bool g_timestampInsidePassesSupported;
 
 bool initialize(AuroraBackend backend);
 // KARTFRAME_HEADLESS=1: development runs without a presentable swapchain. The window and surface

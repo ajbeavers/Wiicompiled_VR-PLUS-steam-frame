@@ -154,6 +154,11 @@ static void* createImages(int64_t format, uint64_t usage, int width, int height,
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
         ci.usage = u;
+        // As the spec asks of a runtime (and what lets the app write an sRGB image through a UNORM view).
+        // No format list: the driver may then lay the image out uncompressed (Turnip: no UBWC), which a
+        // runtime's images may be too. MOCK_XR_MUTABLE=0 leaves the flag out (the old mock).
+        if ((usage & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) && !(getenv("MOCK_XR_MUTABLE") && getenv("MOCK_XR_MUTABLE")[0] == '0'))
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (DEV(vkCreateImage)(gDevice, &ci, NULL, &images[i]) != VK_SUCCESS) {
             fprintf(stderr, "xrmock: vkCreateImage failed\n");

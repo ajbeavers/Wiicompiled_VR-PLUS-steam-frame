@@ -22,6 +22,7 @@ int AuroraDawnVulkanDrain(void* handle);
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -144,6 +145,9 @@ bool CopyCompatible(int64_t a, int64_t b) {
 struct Import { uint64_t image; uint32_t width, height; wgpu::TextureFormat format; wgpu::Texture texture; };
 // The eyes, then the settings panel's layer image after them.
 constexpr uint32_t kMaxImages = 3;
+// Whether the next sets' eyes may render straight into their swapchain images; the backend decides
+// (it measures both ways, see openxr_vulkan_win32.cpp).
+std::atomic<bool> g_allowDirect{false};
 class Bridge {
 public:
   std::mutex mutex;
@@ -156,6 +160,10 @@ public:
   uint32_t images = 0;
   bool panel = false;
   bool encoded = false;
+  // The eyes render straight into this set's images (DirectTargets): it can no longer be canceled.
+  bool claimed = false;
+  // The backend lets this set's eyes render straight into its images (aurora_vulkan_win32_allow_direct).
+  bool directAllowed = false;
   AuroraD3D12StereoSubmittedCallback callback;
   void* userdata;
   Bridge(AuroraD3D12StereoSubmittedCallback cb, void* data) : callback(cb), userdata(data) {}
@@ -173,12 +181,53 @@ public:
     for (uint32_t i = 0; i < n; ++i) targets[i] = data[i];
     panel = panelTarget != nullptr;
     if (panel) targets[n] = *panelTarget;
+    directAllowed = g_allowDirect.load(std::memory_order_relaxed);
     token = next; count = n; images = n + (panel ? 1u : 0u); return true;
   }
   bool Cancel(uint64_t wanted) {
     std::unique_lock guard(mutex, std::try_to_lock);
-    if (!guard.owns_lock() || encoded || !token || token != wanted) return false;
+    if (!guard.owns_lock() || encoded || claimed || !token || token != wanted) return false;
     token = 0; return true;
+  }
+  // The wrapped texture of target i as `format`, imported on first use (mutex held).
+  wgpu::Texture* ImportTarget(uint32_t i, wgpu::TextureFormat format) {
+    const auto& target = targets[i];
+    const uint64_t image = reinterpret_cast<uintptr_t>(target.resource);
+    auto it = std::find_if(imports.begin(), imports.end(), [&](const Import& entry) { return entry.image == image; });
+    if (it != imports.end() && (it->width != target.width || it->height != target.height || it->format != format)) {
+      // The runtime reuses VkImage handles across swapchain recreation, and Aurora's eye format can
+      // change with the surface: re-wrap.
+      imports.erase(it);
+      it = imports.end();
+    }
+    if (it == imports.end()) {
+      wgpu::TextureDescriptor descriptor;
+      descriptor.usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::RenderAttachment;
+      descriptor.size = {target.width, target.height, 1};
+      descriptor.format = format;
+      void* wrapped = api.wrap(webgpu::g_device.Get(), &descriptor, image);
+      if (!wrapped) return nullptr;
+      imports.push_back({image, target.width, target.height, format,
+                        wgpu::Texture::Acquire(static_cast<WGPUTexture>(wrapped))});
+      it = imports.end() - 1;
+    }
+    return &it->texture;
+  }
+  bool DirectTargets(uint64_t wanted, wgpu::TextureFormat format, uint32_t width, uint32_t height,
+                     std::array<wgpu::Texture, AURORA_STEREO_EYE_COUNT>& out) {
+    std::lock_guard guard(mutex);
+    if (!token || token != wanted || encoded || !directAllowed || count != AURORA_STEREO_EYE_COUNT) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+      if (targets[i].width != width || targets[i].height != height ||
+          !CopyCompatible(VkFormat(format), targets[i].dxgiFormat)) return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      auto* texture = ImportTarget(i, format);
+      if (!texture) return false;
+      out[i] = *texture;
+    }
+    claimed = true;
+    return true;
   }
   bool Encode(wgpu::CommandEncoder& encoder, const stereo::SinkFrame& frame) {
     std::lock_guard guard(mutex);
@@ -193,35 +242,17 @@ public:
       const auto& target = targets[i];
       if (!eye.texture || eye.size.width != target.width || eye.size.height != target.height ||
           !CopyCompatible(VkFormat(eye.format), target.dxgiFormat)) return false;
-      const uint64_t image = reinterpret_cast<uintptr_t>(target.resource);
-      auto it = std::find_if(imports.begin(), imports.end(), [&](const Import& entry) { return entry.image == image; });
-      if (it == imports.end()) {
-        wgpu::TextureDescriptor descriptor;
-        descriptor.usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::RenderAttachment;
-        descriptor.size = {target.width, target.height, 1};
-        descriptor.format = eye.format;
-        void* wrapped = api.wrap(webgpu::g_device.Get(), &descriptor, image);
-        if (!wrapped) return false;
-        imports.push_back({image, target.width, target.height, eye.format,
-                          wgpu::Texture::Acquire(static_cast<WGPUTexture>(wrapped))});
-        it = imports.end() - 1;
-      }
-      if (it->width != target.width || it->height != target.height || it->format != eye.format) {
-        // The runtime reuses VkImage handles across swapchain recreation, and
-        // Aurora's eye format can change with the surface. Re-wrap rather than
-        // rejecting every future frame for this image.
-        imports.erase(it);
-        --i;
-        continue;
-      }
-      active[i] = it->texture;
+      auto* texture = ImportTarget(i, eye.format);
+      if (!texture) return false;
+      active[i] = *texture;
     }
     for (uint32_t i = 0; i < images; ++i) {
       wgpu::TexelCopyTextureInfo source, destination;
       source.texture = *sources[i].texture;
       destination.texture = active[i];
       wgpu::Extent3D size{targets[i].width, targets[i].height, 1};
-      encoder.CopyTextureToTexture(&source, &destination, &size);
+      // An eye rendered straight into its swapchain image (DirectTargets) needs no copy.
+      if (source.texture.Get() != destination.texture.Get()) encoder.CopyTextureToTexture(&source, &destination, &size);
       if (StampEnabled() && frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && i < count && count == 2 &&
           targets[i].width >= 64 * kStampCell &&
           targets[i].height >= 3 * kStampCell)
@@ -239,7 +270,7 @@ public:
     // flush them under its device guard, then allow the XR thread to release.
     const bool success = api.release(webgpu::g_device.Get(), textures.data(), images) != 0;
     const auto completed = token;
-    token = 0; encoded = false;
+    token = 0; encoded = false; claimed = false;
     submittingRetained = frame.retained;
     callback(completed, success, userdata);
     submittingRetained = false;
@@ -266,6 +297,11 @@ bool aurora_vulkan_win32_enable(AuroraD3D12StereoSubmittedCallback cb, void* dat
       [](wgpu::CommandEncoder& encoder, const aurora::stereo::SinkFrame& frame, void* self) noexcept {
         return static_cast<Bridge*>(self)->Encode(encoder, frame);
       }, [](const aurora::stereo::SinkFrame& frame, void* self) noexcept { static_cast<Bridge*>(self)->Submitted(frame); }, bridge.get());
+  aurora::stereo::set_direct_targets(
+      [](uint64_t token, wgpu::TextureFormat format, uint32_t width, uint32_t height,
+         std::array<wgpu::Texture, AURORA_STEREO_EYE_COUNT>& out, void* self) noexcept {
+        return static_cast<Bridge*>(self)->DirectTargets(token, format, width, height, out);
+      }, bridge.get());
   return true;
 }
 bool aurora_vulkan_win32_set_targets(uint64_t token, const AuroraD3D12StereoTarget* targets, uint32_t count) {
@@ -285,11 +321,16 @@ bool aurora_vulkan_win32_disable() {
   using namespace aurora::vulkan_win32;
   if (!bridge) return true;
   aurora::stereo::set_sink(nullptr, nullptr, nullptr);
+  aurora::stereo::set_direct_targets(nullptr, nullptr);
   if (!api.drain(aurora::webgpu::g_device.Get())) { bridge.release(); return false; }
   bridge.reset();
   return true;
 }
 bool aurora_vulkan_win32_submitting_retained() { return aurora::vulkan_win32::submittingRetained; }
+// Not in the public header (lane I): the OpenXR Vulkan backend declares it where it calls it.
+extern "C" void aurora_vulkan_win32_allow_direct(bool allowed) {
+  aurora::vulkan_win32::g_allowDirect.store(allowed, std::memory_order_relaxed);
+}
 void* aurora_vulkan_win32_lock_queue() {
   return aurora::vulkan_win32::api.lock(aurora::webgpu::g_device.Get());
 }
@@ -311,6 +352,7 @@ bool aurora_vulkan_win32_set_targets_with_panel(uint64_t, const AuroraD3D12Stere
 bool aurora_vulkan_win32_cancel(uint64_t) { return false; }
 bool aurora_vulkan_win32_disable() { return true; }
 bool aurora_vulkan_win32_submitting_retained() { return false; }
+extern "C" void aurora_vulkan_win32_allow_direct(bool) {}
 void* aurora_vulkan_win32_lock_queue() { return nullptr; }
 void aurora_vulkan_win32_unlock_queue(void*) {}
 #endif

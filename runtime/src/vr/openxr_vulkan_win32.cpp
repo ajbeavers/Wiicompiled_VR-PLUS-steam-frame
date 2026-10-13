@@ -21,11 +21,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -35,8 +37,90 @@
 #include <unistd.h>
 #endif
 
+// Aurora's Vulkan bridge (aurora-main/lib/webgpu/vulkan_win32_interop.cpp): whether the next sets' eyes
+// may render straight into their swapchain images. Not in the bridge's public header yet (lane I).
+extern "C" void aurora_vulkan_win32_allow_direct(bool allowed);
+
 namespace mkw::vr {
 namespace {
+// Whether a race's eyes render straight into the swapchain images (no copy) or into Aurora's own
+// targets, copied into them. Which is cheaper depends on the runtime's images, not on us: in the mock,
+// images in ordinary device memory took the eyes directly 0.9 ms a set cheaper than the copy (1.3 to
+// 1.9 ms); images in host-visible write-combined memory made the eyes' own passes 1.5 ms dearer than
+// the copy. So by default the first immersive sets measure both (blocks of 30 sets, alternating, after
+// the first 240) by their GPU time and keep the cheaper for the session; KARTFRAME_DIRECT_EYES=1 / 0
+// forces one way.
+class DirectEyesChoice {
+public:
+    // Pacing thread: whether this immersive set may render straight into its images.
+    bool NextImmersiveSet() {
+        std::lock_guard lock(mutex_);
+        if (forced_ >= 0) return forced_ == 1;
+        if (decided_ >= 0) return decided_ == 1;
+        const uint32_t n = sets_++;
+        if (n < kSkip) return false;
+        const uint32_t block = (n - kSkip) / kBlock;
+        if (block >= kBlocks) {
+            Decide();
+            return decided_ == 1;
+        }
+        return (block & 1u) == 0;
+    }
+    // GPU watcher thread: a set's submit-to-completion time, with the way its eyes were made.
+    void Sample(int mode, double ms) {
+        if (mode < 0) return;
+        std::lock_guard lock(mutex_);
+        if (decided_ >= 0 || forced_ >= 0) return;
+        samples_[mode].push_back(static_cast<float>(ms));
+    }
+    // A line for the log once the choice is made, else empty.
+    std::string TakeReport() {
+        std::lock_guard lock(mutex_);
+        return std::exchange(report_, {});
+    }
+    DirectEyesChoice() {
+        const char* env = std::getenv("KARTFRAME_DIRECT_EYES");
+        forced_ = env != nullptr && (env[0] == '0' || env[0] == '1') ? env[0] - '0' : -1;
+        if (forced_ >= 0)
+            report_ = forced_ ? "VR eyes: rendered straight into the swapchain images (KARTFRAME_DIRECT_EYES=1)"
+                              : "VR eyes: rendered into Aurora's targets and copied (KARTFRAME_DIRECT_EYES=0)";
+    }
+
+private:
+    static constexpr uint32_t kSkip = 240, kBlock = 30, kBlocks = 12;
+    void Decide() {
+        // Every block was handed out; decide once enough of their GPU times came back.
+        if (samples_[0].size() < 120 || samples_[1].size() < 120) {
+            if (sets_ < kSkip + kBlock * kBlocks + 600) return;
+        }
+        const auto median = [](std::vector<float>& v) {
+            if (v.empty()) return 1e9f;
+            std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+            return v[v.size() / 2];
+        };
+        const float copy = median(samples_[0]), direct = median(samples_[1]);
+        decided_ = direct < copy ? 1 : 0;
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "VR eyes: GPU per set %.2f ms rendered straight into the swapchain images (%zu sets), %.2f ms "
+                      "rendered apart and copied (%zu sets): %s for this session",
+                      static_cast<double>(direct), samples_[1].size(), static_cast<double>(copy), samples_[0].size(),
+                      decided_ ? "straight into the images" : "copied");
+        report_ = line;
+        samples_[0].clear();
+        samples_[1].clear();
+    }
+    std::mutex mutex_;
+    int forced_ = -1, decided_ = -1;
+    uint32_t sets_ = 0;
+    std::array<std::vector<float>, 2> samples_;
+    std::string report_;
+};
+DirectEyesChoice& DirectEyes() {
+    static DirectEyesChoice choice;
+    return choice;
+}
+
 // KARTFRAME_MENU_ENV: unset (or "over") the menus' environment layer goes over the screen's quad, blended
 // by its alpha; "under" puts it under the quad (lane G's first order: the quad then hid the pointer's ray
 // and target mark on the screen, third headset session); "0" there is none.
@@ -126,7 +210,8 @@ public:
     // Frame worker, inside the bridge's submitted callback (Aurora's queue-submit mutex
     // held, Dawn's device lock not). Returns the value to wait for: 0 when there is
     // nothing to wait for (no GPU sync, or the drain mode), UINT64_MAX on failure.
-    uint64_t Signal(int64_t submit_ns) {
+    // direct_mode: how the set's eyes were made (DirectEyesChoice), -1 when it does not count.
+    uint64_t Signal(int64_t submit_ns, int direct_mode = -1) {
         if (mode_ != Mode::Timeline) return 0;
         uint64_t value;
         {
@@ -134,6 +219,7 @@ public:
             if (failed_) return std::numeric_limits<uint64_t>::max();
             value = signaled_ + 1;
             submit_ns_[value % kRing] = submit_ns;
+            direct_mode_[value % kRing] = static_cast<int8_t>(direct_mode);
         }
         VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
         timeline.signalSemaphoreValueCount = 1;
@@ -207,7 +293,9 @@ private:
                 cv_.notify_all();
                 return;
             }
-            pacing::OnSetGpu(static_cast<double>(now - submit_ns_[next % kRing]) / 1.0e6);
+            const double gpu_ms = static_cast<double>(now - submit_ns_[next % kRing]) / 1.0e6;
+            pacing::OnSetGpu(gpu_ms);
+            DirectEyes().Sample(direct_mode_[next % kRing], gpu_ms);
             completed_ = next++;
             cv_.notify_all();
         }
@@ -232,6 +320,7 @@ private:
     bool failed_ = false;
     bool stop_ = false;
     std::array<int64_t, kRing> submit_ns_{};
+    std::array<int8_t, kRing> direct_mode_{};
 };
 
 bool SameVkCopyFamily(VkFormat a, VkFormat b) {
@@ -654,9 +743,16 @@ public:
         }
         diagnostics::OnSwapchainAcquire(acquire_timer);
 
+        // A race set: straight into its images or copied (DirectEyesChoice); read by the bridge's Set.
+        const int direct_mode = !virtual_screen && target_count == kOpenXREyeCount
+                                    ? (DirectEyes().NextImmersiveSet() ? 1 : 0)
+                                    : -1;
+        aurora_vulkan_win32_allow_direct(direct_mode == 1);
+        if (const std::string report = DirectEyes().TakeReport(); !report.empty()) Log(OpenXRLogLevel::Info, report);
         {
             std::lock_guard lock(submission_mutex_);
             awaiting_token_ = frame.xr_frame.serial;
+            awaiting_direct_mode_ = direct_mode;
             submitted_token_ = 0;
             submission_arrived_ = false;
             submission_success_ = false;
@@ -1666,8 +1762,13 @@ private:
             }
         }
         uint64_t gpu_value = 0;
+        int direct_mode = -1;
+        {
+            std::lock_guard lock(self->submission_mutex_);
+            direct_mode = self->awaiting_direct_mode_;
+        }
         if (success) {
-            gpu_value = self->gpu_.Signal(now);
+            gpu_value = self->gpu_.Signal(now, direct_mode);
             // No completion marker for work already queued: never release these images.
             if (gpu_value == std::numeric_limits<uint64_t>::max()) success = false;
         }
@@ -1745,6 +1846,7 @@ private:
     std::mutex submission_mutex_;
     std::condition_variable submission_cv_;
     uint64_t awaiting_token_ = 0;
+    int awaiting_direct_mode_ = -1;  // the pending set's DirectEyesChoice way, -1 none
     uint64_t submitted_token_ = 0;
     uint64_t submitted_gpu_value_ = 0;
     GpuCompletion gpu_;

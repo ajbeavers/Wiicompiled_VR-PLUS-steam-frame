@@ -86,6 +86,7 @@ static wgpu::AdapterInfo g_adapterInfo;
 static wgpu::SurfaceCapabilities g_surfaceCapabilities;
 bool g_bcTexturesSupported;
 bool g_timestampQueriesSupported = false;
+bool g_timestampInsidePassesSupported = false;
 // Written by Dawn's device-loss callback and consumed at ordered frame boundaries. Keep the
 // callback free of logging, allocation, teardown and renderer state mutation.
 static std::atomic_bool g_deviceLost{false};
@@ -752,6 +753,14 @@ bool initialize(AuroraBackend auroraBackend) {
       if (feature == wgpu::FeatureName::TimestampQuery) {
         g_timestampQueriesSupported = true;
         requiredFeatures.push_back(feature);
+      }
+      // The per-segment GPU profile (KARTFRAME_FPSLOG=2) times parts of a render pass; asked for only then.
+      if (feature == wgpu::FeatureName::ChromiumExperimentalTimestampQueryInsidePasses) {
+        const char* env = std::getenv("KARTFRAME_FPSLOG");
+        if (env != nullptr && env[0] == '2') {
+          g_timestampInsidePassesSupported = true;
+          requiredFeatures.push_back(feature);
+        }
       }
       // The presenter calls device and queue methods while the frame worker encodes, which Dawn only
       // supports with this feature; without it the two race inside the device's dynamic uploader.

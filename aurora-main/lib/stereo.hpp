@@ -44,4 +44,16 @@ using SubmitCallback = void (*)(const SinkFrame& frame, void* userdata) noexcept
 void set_sink(SinkCallback callback, SubmitCallback submitted, void* userdata) noexcept;
 inline void set_sink(SinkCallback callback, void* userdata) noexcept { set_sink(callback, nullptr, userdata); }
 
+// Optional, for a sink that can take the eyes as render targets (the Vulkan OpenXR bridge): the
+// swapchain images acquired for `frameToken`, wrapped as textures of `format` and `width` x `height`,
+// so the eyes render straight into them and the sink only stamps them instead of copying 2 x 12 MB a
+// set (lane I: 1.3 ms of GPU a set at 1728). False when the set cannot take them (no pending set
+// for that token, other sizes or formats); the eyes then render into Aurora's own targets and the sink
+// copies as before. Once it returned true the set can no longer be canceled: the caller must hand
+// the same textures to the sink (SinkFrame::eyes) for this token.
+using DirectTargetsCallback = bool (*)(uint64_t frameToken, wgpu::TextureFormat format, uint32_t width,
+                                       uint32_t height, std::array<wgpu::Texture, AURORA_STEREO_EYE_COUNT>& out,
+                                       void* userdata) noexcept;
+void set_direct_targets(DirectTargetsCallback callback, void* userdata) noexcept;
+
 } // namespace aurora::stereo

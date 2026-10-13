@@ -28,6 +28,8 @@
 //                             completed (other queued work does not count). Else
 //                             a release that waits longer than <ms> for the
 //                             app's queue to go idle is an error.
+//   MOCK_XR_MUTABLE=0         Vulkan: create images without VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT even when
+//                             the app asks for XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT (the old mock)
 //   MOCK_XR_EYE=<w>x<h>       recommended eye size (1728x1728, SteamVR's on
 //                             the Frame)
 //   MOCK_XR_TIME_OFFSET_S=<s> XrTime runs this far ahead of CLOCK_MONOTONIC
@@ -425,7 +427,8 @@ static void stampPoll(int wait) {
                 gStampOther++;
                 double k = (double)diff / (double)gPeriod;
                 long n = lround(k);
-                gStampOff[fabs(k - (double)n) > 0.1 ? 2 : n <= -2 ? 0 : n == -1 ? 1 : n == 1 ? 3 : 4]++;
+                // Off by less than a refresh (n == 0, beyond the 0.2 ms tolerance) is "between", not ">=+2".
+                gStampOff[fabs(k - (double)n) > 0.1 || n == 0 ? 2 : n <= -2 ? 0 : n == -1 ? 1 : n == 1 ? 3 : 4]++;
                 if (gStampOther <= 20)
                     trace("ERROR stamp: eye %d image rendered for a display time %.2f ms %s the one its submitted poses were located for%s",
                           gStampPending[i].eye, fabs((double)diff) / 1e6, diff < 0 ? "before" : "after", gStampPending[i].fresh ? "" : " (repeat)");

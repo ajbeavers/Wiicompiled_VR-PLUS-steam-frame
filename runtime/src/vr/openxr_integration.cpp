@@ -2364,18 +2364,19 @@ private:
         const auto delta = static_cast<int64_t>(
             (static_cast<double>(display_counter.QuadPart) - static_cast<double>(counter.QuadPart)) *
             1.0e9 / static_cast<double>(frequency.QuadPart));
-#else
-        // XR_KHR_convert_timespec_time yields CLOCK_MONOTONIC, the clock behind
-        // libc++'s steady_clock, so the delta is measured on that clock too.
-        timespec display_spec{};
-        timespec now_spec{};
-        if (XR_FAILED(convert_display_time_(runtime_->Instance(), display_time, &display_spec)) ||
-            clock_gettime(CLOCK_MONOTONIC, &now_spec) != 0) return 0;
-        const int64_t display_ns = static_cast<int64_t>(display_spec.tv_sec) * 1'000'000'000ll + display_spec.tv_nsec;
-        const int64_t monotonic_ns = static_cast<int64_t>(now_spec.tv_sec) * 1'000'000'000ll + now_spec.tv_nsec;
-        const int64_t delta = display_ns - monotonic_ns;
-#endif
         return now_ns + delta > 0 ? static_cast<uint64_t>(now_ns + delta) : 0;
+#else
+        // XR_KHR_convert_timespec_time yields CLOCK_MONOTONIC, which on Linux is the clock behind
+        // steady_clock (libstdc++ and libc++ alike), so the converted time is the answer as it is. It
+        // used to be carried over as a delta between two clock reads (steady_clock above, then
+        // CLOCK_MONOTONIC after the conversion), off by however long the thread was preempted between
+        // them: the mock's stamp check caught two eye sets stamped 0.24 ms early in a 10-minute soak.
+        timespec display_spec{};
+        if (XR_FAILED(convert_display_time_(runtime_->Instance(), display_time, &display_spec))) return 0;
+        (void)now_ns;
+        const int64_t display_ns = static_cast<int64_t>(display_spec.tv_sec) * 1'000'000'000ll + display_spec.tv_nsec;
+        return display_ns > 0 ? static_cast<uint64_t>(display_ns) : 0;
+#endif
     }
 
 #if defined(__ANDROID__) || defined(MKW_OPENXR_LINUX_DESKTOP)
