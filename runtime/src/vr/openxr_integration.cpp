@@ -118,10 +118,12 @@ inline constexpr bool kWindowShapedEyesSupported = false;
 // Whether menus are drawn into the eye images (projection layer) rather than shown on a quad layer.
 // On Android always: under Lepton, SteamVR turns a quad layer into a slow submission, so quality 0
 // only swaps Aurora's raymarched menu background for a plain one, which the GPU draws for free.
+// The Frame (native SteamVR, Linux desktop) takes the PC rule: with menu_shader_quality 0 the game
+// screen is a quad layer fixed in the room (the compositor reprojects it), so a menu set costs a
+// copy instead of two full eyes. Projected menus there cost 5 to 7 ms a set in the headset (H1)
+// and the screen flickered; the introduction stays projected for its controller models.
 inline bool OpenXRProjectedMenus() noexcept {
-#if defined(__ANDROID__) || defined(MKW_OPENXR_LINUX_DESKTOP)
-    // The Frame (native SteamVR): menus in the eyes as well, so they are rendered every refresh
-    // from that refresh's head pose; menu_shader_quality 0 gives the plain background.
+#if defined(__ANDROID__)
     return true;
 #else
     return RuntimeConfigFile::Get().vrMenuShaderQuality>0 || OpenXRIntroductionActive();
@@ -807,8 +809,8 @@ private:
     }
 
     // Asks for the display refresh rate in-app as well (the wrapper sets SteamVR's per-app
-    // 120 Hz too): KARTFRAME_REFRESH_HZ, else [vr] refresh_rate, else 120; the nearest rate
-    // the runtime offers. 0 leaves the runtime's choice.
+    // 120 Hz too): KARTFRAME_REFRESH_HZ, else [vr] refresh_rate, else 120, if the runtime offers
+    // it. 0 leaves the runtime's choice.
     void RequestDisplayRefreshRate() {
         if (runtime_ == nullptr || !runtime_->HasSession() || enumerate_display_refresh_rates_ == nullptr ||
             request_display_refresh_rate_ == nullptr) {
@@ -832,9 +834,17 @@ private:
             RT_LOG(RT_TAG_RUNTIME) << "display refresh rates: " << offered.str() << "; requested none (runtime's choice)" << std::endl;
             return;
         }
-        float best = rates.front();
+        // Only a rate the runtime offers. SteamVR on the Frame offered only 90 in H1 while the
+        // per-app setting ran the display at 120: asking for the nearest (90) switched it to 90
+        // until the per-app key put 120 back. Not offered: leave it to SteamVR's setting.
+        float best = 0.0f;
         for (float rate : rates) {
-            if (std::fabs(rate - wanted) < std::fabs(best - wanted)) best = rate;
+            if (std::fabs(rate - wanted) < 0.5f) best = rate;
+        }
+        if (best == 0.0f) {
+            RT_LOG(RT_TAG_RUNTIME) << "display refresh rates: " << offered.str() << "; " << wanted
+                                   << " Hz not offered, requested none (SteamVR's per-app setting decides)" << std::endl;
+            return;
         }
         const XrResult result = request_display_refresh_rate_(runtime_->Session(), best);
         RT_LOG(RT_TAG_RUNTIME) << "display refresh rates: " << offered.str() << "; requested " << best << " Hz"
@@ -1029,11 +1039,14 @@ private:
             const bool render_first = !aurora_get_stereo_frame_interpolation();
             if (last_pacing_mode != static_cast<int>(render_first)) {
                 last_pacing_mode = static_cast<int>(render_first);
-                RT_LOG(RT_TAG_RUNTIME) << "OpenXR " << kGraphicsBackendName << " pacing: "
-                    << (render_first ? std::string("render-first")
-                                     : std::string("per-refresh eye sets (VR interpolation), ") +
-                                           PacingModeName(pacing_mode_) + " (frame_pacing " + pacing_mode_source_ + ")")
-                    << std::endl;
+                // One write: std::cerr is unbuffered, and another thread's log output landed inside
+                // this line when it was written piece by piece ("pacing: 0per-refresh").
+                const std::string banner = std::string("OpenXR ") + kGraphicsBackendName + " pacing: " +
+                    (render_first ? std::string("render-first")
+                                  : std::string("per-refresh eye sets (VR interpolation), ") +
+                                        PacingModeName(pacing_mode_) + " (frame_pacing " + pacing_mode_source_ + ")") +
+                    "\n";
+                RT_LOG(RT_TAG_RUNTIME) << banner << std::flush;
                 pacing::SetMode(PacingModeName(pacing_mode_));
             }
             // A set still in flight is shown (or dropped) by the set loop before switching.
@@ -1080,12 +1093,12 @@ private:
     // published after this cycle ended, and shown by the next cycle, so the GPU and the CPU
     // overlap by one refresh (one refresh more latency). A set not finished by its deadline is
     // never released early: the cycle repeats the retained layer with its own poses (late), and
-    // the set is shown by a later cycle. Only real misses (more than 12 of the last 240 sets
-    // late) drop the loop to a set every second refresh; it returns after 10 s once 6 or fewer
-    // of the last 600 were late. Both changes are logged.
+    // the set is shown by a later cycle. The loop never drops to a set every second refresh on
+    // its own (KARTFRAME_HALF_RATE, see ReadPacingMode).
     enum class CycleResult { Continue, Break, Fatal };
     enum class PacingMode { Inline, Pipelined };
     enum class HalfRatePolicy { Auto, Never, Always };
+    static constexpr size_t kHalfRateWindow = 3600;  // sets: 30 s at 120 Hz
 
     struct SetPacingState {
         OpenXRBackendFrame set{};
@@ -1146,11 +1159,18 @@ private:
             margin_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
         }
         pacing_margin_ = std::chrono::microseconds(margin_us);
-        // KARTFRAME_HALF_RATE=0 never drops to every second refresh, 1 always renders at
-        // half rate (measurements); unset: only on real misses.
-        half_rate_policy_ = HalfRatePolicy::Auto;
+        // Every refresh by default: a late set repeats the retained layer with its own poses
+        // (the compositor reprojects it). Half rate shows 60 Hz content twice on a 120 Hz panel,
+        // the judder and head-turn ghosting the owner rejected; in H1 the old auto rule flapped
+        // (16 drops, 15 returns in 4 minutes). KARTFRAME_HALF_RATE=1 always renders at half rate
+        // (measurements), =auto drops after 30 s of sustained lateness and stays there for the
+        // session, =0 (or unset) never.
+        half_rate_policy_ = HalfRatePolicy::Never;
         if (const char* env = std::getenv("KARTFRAME_HALF_RATE"); env != nullptr && *env != '\0') {
-            half_rate_policy_ = *env == '0' ? HalfRatePolicy::Never : HalfRatePolicy::Always;
+            const std::string value(env);
+            half_rate_policy_ = value == "auto" ? HalfRatePolicy::Auto
+                                : (value == "1" || value == "always") ? HalfRatePolicy::Always
+                                                                      : HalfRatePolicy::Never;
         }
     }
 
@@ -1176,10 +1196,10 @@ private:
         if (st.first_set == std::chrono::steady_clock::time_point{}) st.first_set = now;
         if (now - st.first_set < std::chrono::seconds(5)) return;
         st.results.push_back(late ? 1 : 0);
-        while (st.results.size() > 600) st.results.pop_front();
+        while (st.results.size() > kHalfRateWindow) st.results.pop_front();
     }
 
-    void UpdateHalfRate() {
+    void UpdateHalfRate(XrDuration period) {
         auto& st = set_pacing_;
         const auto late_in_last = [&](size_t count) {
             const size_t n = std::min(count, st.results.size());
@@ -1194,27 +1214,20 @@ private:
             }
             return;
         }
-        if (!st.half_rate) {
-            const size_t window = std::min<size_t>(240, st.results.size());
-            const size_t late = late_in_last(240);
-            if (window >= 240 && late > 12) {
+        // Auto (opt-in): more than 5 % of the sets of the last 30 s (at 120 Hz) late drops to every
+        // second refresh for the rest of the session; it never returns, so it cannot flap.
+        if (!st.half_rate && st.results.size() >= kHalfRateWindow) {
+            const size_t late = late_in_last(kHalfRateWindow);
+            if (late * 20 > kHalfRateWindow) {
                 st.half_rate = true;
                 st.half_since = now;
-                st.results.clear();
-                RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last " << window
-                                       << " eye sets late; rendering every second refresh" << std::endl;
+                RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last " << kHalfRateWindow
+                                       << " eye sets late; rendering every second refresh for the rest of the session"
+                                       << std::endl;
                 pacing::SetMode(std::string(PacingModeName(pacing_mode_)) + "/2");
             }
-        } else if (now - st.half_since >= std::chrono::seconds(10) && st.results.size() >= 600) {
-            const size_t late = late_in_last(600);
-            if (late <= 6) {
-                st.half_rate = false;
-                st.results.clear();
-                RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last 600 eye sets late; rendering every refresh again"
-                                       << std::endl;
-                pacing::SetMode(PacingModeName(pacing_mode_));
-            }
         }
+        (void)period;
     }
 
     // Locates the set for display_time, places the screens and the pointer from its poses,
@@ -1387,7 +1400,7 @@ private:
             const CycleResult started = StartSet(presentation, policy, immersive, set_time, cycle);
             if (started != CycleResult::Continue) return started;
         }
-        UpdateHalfRate();
+        UpdateHalfRate(period);
         pacing::Flush();
         return CycleResult::Continue;
     }

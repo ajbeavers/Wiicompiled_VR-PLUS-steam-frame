@@ -8,7 +8,9 @@
 # KF_BUILD (build dir, default <repo>/build-linux), KF_MOCKRUN_HOME (scratch user dir, default
 # ~/.cache/kf-mockrun), KF_XRMOCK_DIR (where the mock is built; default one per checkout under
 # ~/.cache/kf-xrmock, rebuilt when its sources change), KF_MOCKRUN_VR (extra lines for the [vr]
-# section, e.g. 'frame_pacing = "pipelined"'). The game reads its user state from
+# section, e.g. 'frame_pacing = "pipelined"'), KF_MOCKRUN_RENDER_SCALE (render_scale, default 1.0;
+# 1.25 is the panel's native 2160 per eye), KF_MOCKRUN_INTRO=1 (the first-run welcome and controller
+# guide show instead of being seeded done). The game reads its user state from
 # $XDG_DATA_HOME/WiiCompiled (Config.toml, NAND, Cache), which this script points at the scratch dir
 # and seeds with a Config.toml naming the extracted game (~/Games/KartFrame/data/game or --game) and
 # the Frame's VR defaults (render_scale 1.0, VR interpolation auto, plain menu background).
@@ -59,12 +61,11 @@ display_mode = "windowed"
 mirror_view = "none"
 enabled = $([ $FLAT = 1 ] && echo false || echo true)
 required = $([ $FLAT = 1 ] && echo false || echo true)
-render_scale = 1.0
+render_scale = ${KF_MOCKRUN_RENDER_SCALE:-1.0}
 frame_interpolation_fps = 1
 menu_shader_quality = 0
-# No first-run welcome or tutorial: the attract-mode demo race starts on its own.
-welcome_complete = true
-tutorial_completed = 3
+$([ "${KF_MOCKRUN_INTRO:-0}" = 1 ] && echo "# KF_MOCKRUN_INTRO=1: the first-run welcome and controller guide show." || printf '%s\n' \
+  "# No first-run welcome or tutorial: the attract-mode demo race starts on its own." "welcome_complete = true" "tutorial_completed = 3")
 ${KF_MOCKRUN_VR:-}
 TOML
 LOG=$OUT/logs/$(date +%Y%m%d-%H%M%S)-$([ $FLAT = 1 ] && echo flat || echo mock).log

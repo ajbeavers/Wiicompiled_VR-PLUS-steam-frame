@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -53,6 +54,12 @@ AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
 std::atomic_bool g_backgrounded = false;
 std::atomic_bool g_nativeResizePending = false;
+// SDL_SyncWindow is for after a window request; pump_events used to call it every game frame. On X11,
+// when the window's geometry differs from what SDL expects (Xvfb without a window manager, or a WM that
+// sizes the window itself, as gamescope does) and nothing is pending, it ends in SDL_Delay(10): 10 ms of
+// every game frame on the game thread, which took the demo race from 60 to 39 game frames a second in
+// headless mock runs. Now it runs once after each window request (KARTFRAME_SYNC_WINDOW=1: every frame).
+std::atomic_bool g_windowSyncWanted = true;
 std::atomic<AuroraDisplayMode> g_displayMode{AURORA_DISPLAY_MODE_WINDOWED};
 #if defined(SDL_PLATFORM_ANDROID)
 // SDL's own activity mutex (Android_LockActivityMutex) is internal and not
@@ -478,6 +485,7 @@ void destroy_window() {
 void show_window() {
   if (g_window != nullptr) {
     TRY_WARN(SDL_ShowWindow(g_window), "Failed to show window: {}", SDL_GetError());
+    g_windowSyncWanted.store(true, std::memory_order_release);
   }
 }
 
@@ -594,7 +602,11 @@ void pump_events() noexcept {
   // runtime calls on the scheduler's own stack (KartPad found this on device).
   return;
 #else
-  if (g_window != nullptr) {
+  static const bool syncEveryFrame = [] {
+    const char* env = std::getenv("KARTFRAME_SYNC_WINDOW");
+    return env != nullptr && env[0] == '1';
+  }();
+  if (g_window != nullptr && (g_windowSyncWanted.exchange(false, std::memory_order_acq_rel) || syncEveryFrame)) {
     SDL_SyncWindow(g_window);
   }
   SDL_PumpEvents();
@@ -726,6 +738,7 @@ void set_display_mode(AuroraDisplayMode mode) {
   }
   g_displayMode.store(mode, std::memory_order_release);
   g_nativeResizePending.store(true, std::memory_order_release);
+  g_windowSyncWanted.store(true, std::memory_order_release);
   TRY_WARN(push_custom_event(CustomEvent::FutureResize), "Failed to queue fullscreen resize event: {}",
            SDL_GetError());
 }
@@ -735,15 +748,18 @@ AuroraDisplayMode get_display_mode() { return g_displayMode.load(std::memory_ord
 void set_window_size(uint32_t width, uint32_t height) {
   TRY_WARN(SDL_RestoreWindow(g_window), "Failed to un-maximize window: {}", SDL_GetError());
   TRY_WARN(SDL_SetWindowSize(g_window, width, height), "Failed to set window size: {}", SDL_GetError());
+  g_windowSyncWanted.store(true, std::memory_order_release);
 }
 
 void set_window_position(uint32_t x, uint32_t y) {
   TRY_WARN(SDL_SetWindowPosition(g_window, x, y), "Failed to set window position: {}", SDL_GetError());
+  g_windowSyncWanted.store(true, std::memory_order_release);
 }
 
 void center_window() {
   TRY_WARN(SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED),
            "Failed to center window: {}", SDL_GetError());
+  g_windowSyncWanted.store(true, std::memory_order_release);
 }
 
 void sync_frame_buffer_size() noexcept {

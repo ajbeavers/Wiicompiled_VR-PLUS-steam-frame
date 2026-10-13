@@ -287,6 +287,40 @@ public:
         app.apiVersion = std::max({app.apiVersion, VkVersion(owner.requirements_.min_api_version), preferred});
         if (app.apiVersion > VkVersion(owner.requirements_.max_api_version)) return VK_ERROR_INCOMPATIBLE_DRIVER;
         vk_info.pApplicationInfo = &app;
+        // Dawn enables VK_EXT_swapchain_maintenance1 on the device whenever the device offers it, but
+        // that extension requires VK_EXT_surface_maintenance1 (and its dependency
+        // VK_KHR_get_surface_capabilities2) on the instance, which Dawn does not ask for here
+        // (VUID-vkCreateDevice-ppEnabledExtensionNames-01387). Add them when the loader offers them.
+        std::vector<const char*> extensions(vk_info.ppEnabledExtensionNames,
+                                            vk_info.ppEnabledExtensionNames + vk_info.enabledExtensionCount);
+        if (const auto enumerate_ext = get_proc ? reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                                                      get_proc(nullptr, "vkEnumerateInstanceExtensionProperties"))
+                                                : nullptr) {
+            uint32_t count = 0;
+            std::vector<VkExtensionProperties> offered;
+            if (enumerate_ext(nullptr, &count, nullptr) == VK_SUCCESS) {
+                offered.resize(count);
+                if (enumerate_ext(nullptr, &count, offered.data()) != VK_SUCCESS) offered.clear();
+                offered.resize(std::min<size_t>(offered.size(), count));
+            }
+            const auto is_offered = [&](const char* name) {
+                for (const auto& e : offered) if (std::strcmp(e.extensionName, name) == 0) return true;
+                return false;
+            };
+            const auto is_enabled = [&](const char* name) {
+                for (const char* e : extensions) if (std::strcmp(e, name) == 0) return true;
+                return false;
+            };
+            if (is_offered(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) &&
+                is_offered(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+                !is_enabled(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)) {
+                if (!is_enabled(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME))
+                    extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+                extensions.push_back(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+                vk_info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+                vk_info.ppEnabledExtensionNames = extensions.data();
+            }
+        }
         create.vulkanCreateInfo = &vk_info;
         create.vulkanAllocator = static_cast<const VkAllocationCallbacks*>(allocator);
         VkResult result = VK_ERROR_INITIALIZATION_FAILED;
@@ -1100,9 +1134,11 @@ public:
             quad.layerFlags = 0;
             quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
             quad.subImage.swapchain = retained_swapchains_[0].handle;
-            quad.subImage.imageRect = {{0, 0},
-                                       {static_cast<int32_t>(retained_swapchains_[0].width),
-                                        static_cast<int32_t>(retained_swapchains_[0].height)}};
+            // Only the picture, not the black bands letterboxing it into the square eye-sized image
+            // (as the Android backend): they framed the screen in black.
+            const uint32_t image_width = retained_swapchains_[0].width;
+            quad.subImage.imageRect = OpenXRVirtualScreenContentRect(
+                image_width, retained_swapchains_[0].height, frame.presentation.quad_content_aspect);
             quad.subImage.imageArrayIndex = 0;
             if (frame.presentation.quad_anchored) {
                 // Placed in the application space, so the screen keeps its place
@@ -1117,9 +1153,12 @@ public:
                 quad.pose.position = {
                     0.0f, 0.0f, -std::max(0.25f, frame.presentation.quad_distance_meters)};
             }
-            quad.size.width = std::max(0.25f, frame.presentation.quad_width_meters);
-            quad.size.height = quad.size.width * static_cast<float>(retained_swapchains_[0].height) /
-                               static_cast<float>(retained_swapchains_[0].width);
+            // The whole image would be quad_width_meters across: the crop keeps that size per pixel,
+            // so the picture stays where the pointer and the settings panel expect it.
+            const float meters_per_pixel =
+                std::max(0.25f, frame.presentation.quad_width_meters) / static_cast<float>(image_width);
+            quad.size.width = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.width);
+            quad.size.height = meters_per_pixel * static_cast<float>(quad.subImage.imageRect.extent.height);
             return EndFrameWithPanel(frame, reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad));
         } else {
             std::array<XrCompositionLayerProjectionView, kOpenXREyeCount> views{};

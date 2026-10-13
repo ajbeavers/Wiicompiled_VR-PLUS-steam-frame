@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -655,12 +656,43 @@ void SetSink(std::function<void(std::string_view line)> sink) {
     std::lock_guard lock(S().mutex);
     S().sink = std::move(sink);
 }
+// KARTFRAME_PACING_SAMPLES=<file>: every set's GPU and encode milliseconds, one line per pacing second
+// ("t=<s> gpu=<ms>,... encode=<ms>,..."), so frame/perf/pacing-parts.py can take exact percentiles of
+// any stretch of a session (menus, race). Off unless set; one short write a second when on.
+std::FILE* SamplesFile() {
+    static std::FILE* file = [] {
+        const char* path = std::getenv("KARTFRAME_PACING_SAMPLES");
+        return path && *path ? std::fopen(path, "w") : nullptr;
+    }();
+    return file;
+}
+void WriteSamples(double t, const Window& w) {
+    std::FILE* f = SamplesFile();
+    if (!f) return;
+    std::fprintf(f, "t=%.0f gpu=", t);
+    for (size_t i = 0; i < w.gpu.size(); ++i) std::fprintf(f, i ? ",%.2f" : "%.2f", static_cast<double>(w.gpu[i]));
+    std::fprintf(f, " encode=");
+    for (size_t i = 0; i < w.encode.size(); ++i) std::fprintf(f, i ? ",%.2f" : "%.2f", static_cast<double>(w.encode[i]));
+    std::fprintf(f, "\n");
+    std::fflush(f);
+}
+
 void Reset() {
     auto& s = S();
-    std::lock_guard lock(s.mutex);
-    s.session_start_ns = s.window_start_ns = diagnostics::detail::NowNs();
-    s.window.Clear();
-    s.total.Clear();
+    std::function<void(std::string_view)> sink;
+    char line[96];
+    {
+        std::lock_guard lock(s.mutex);
+        s.session_start_ns = s.window_start_ns = diagnostics::detail::NowNs();
+        s.window.Clear();
+        s.total.Clear();
+        sink = s.sink;
+        // t=0 of the "vr pacing:" lines on the steady clock (CLOCK_MONOTONIC), so other logs can be
+        // lined up with them (aurora's "hitch:" lines carry mono=).
+        std::snprintf(line, sizeof(line), "vr pacing clock: session start mono=%.3f",
+                      static_cast<double>(s.session_start_ns) / 1.0e9);
+    }
+    if (sink) sink(line);
 }
 void SetMode(std::string_view mode) {
     std::lock_guard lock(S().mutex);
@@ -725,6 +757,7 @@ void Flush() {
         t.gpu.insert(t.gpu.end(), w.gpu.begin(), w.gpu.end());
         t.encode.insert(t.encode.end(), w.encode.begin(), w.encode.end());
         line = Format("vr pacing:", static_cast<double>(now - s.session_start_ns) / 1.0e9, s.hz, s.mode, w);
+        WriteSamples(static_cast<double>(now - s.session_start_ns) / 1.0e9, w);
         w.Clear();
         s.window_start_ns = now;
         sink = s.sink;

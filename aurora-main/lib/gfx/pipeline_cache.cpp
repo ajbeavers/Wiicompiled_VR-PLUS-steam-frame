@@ -4,6 +4,7 @@
 #include "../gx/pipeline.hpp"
 #include "../fs_helper.hpp"
 #include "../sqlite_utils.hpp"
+#include "hitch_stats.hpp"
 #include "../webgpu/gpu.hpp"
 
 #include <algorithm>
@@ -505,7 +506,10 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
   }
 
   if (syncCreate) {
+    const uint64_t syncStart = hitch::now_ns();
     const auto pipeline = cb();
+    hitch::g_pipelineSyncNs.fetch_add(hitch::now_ns() - syncStart, std::memory_order_relaxed);
+    hitch::g_pipelineSyncCount.fetch_add(1, std::memory_order_relaxed);
     {
       std::scoped_lock guard{g_pipelineMutex};
       removedPending = remove_pending_pipeline(g_priorityPipelines, hash);
@@ -1423,6 +1427,7 @@ static bool wait_pipeline_impl(PipelineRef ref, wgpu::RenderPipeline& pipeline, 
       // A persistent resolve is the last chance to produce its texture, so timing out here corrupts it
       // permanently. Only a pass marked requireReadyPipelines takes this path.
     }
+    const hitch::ScopedNs waited(hitch::g_pipelineWaitNs);
     g_pipelineCv.wait(lock, finished);
   }
   const auto it = g_pipelines.find(ref);

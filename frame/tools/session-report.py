@@ -39,11 +39,13 @@ def parse_game_log(path):
          "parts": {k: {"seconds": 0, "rendered": 0, "late": 0, "ticks": 0, "g50": [], "g99": [], "e50": []} for k in ("menus", "race")}}
     with open(path, errors="replace") as f:
         for line in f:
-            if "entered RaceScene" in line:
+            # A race restart ("Scene Restart") logs no new "entered RaceScene"; the presentation
+            # lines (immersive-race / virtual-screen) mark the race too (H1 lost 150 s of race).
+            if "entered RaceScene" in line or "presentation=immersive-race" in line:
                 r["in_race"] = True
                 if r["race"] is None:
                     r["race"] = r["t_last"]
-            elif "exited RaceScene" in line:
+            elif "exited RaceScene" in line or "presentation=virtual-screen" in line or "presentation=desktop" in line:
                 r["in_race"] = False
             m = PACING.search(line)
             if m:

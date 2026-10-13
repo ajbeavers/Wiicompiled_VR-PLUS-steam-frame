@@ -40,6 +40,11 @@
 //                             default none); an INTERACTION_PROFILE_CHANGED
 //                             event follows the first FOCUSED, and suggested
 //                             bindings for it are traced
+//   MOCK_XR_RATES=<hz>,...    refresh rates XR_FB_display_refresh_rate offers (72,90,120)
+//   MOCK_XR_DUMP=<dir>        Vulkan: write released images as PPM files (every 4th pixel)
+//                             <dir>/t<seconds>-sc<id>-<n>.ppm: at the seconds in
+//                             MOCK_XR_DUMP_AT=<s>,<s>... (default every 10 s), the next
+//                             MOCK_XR_DUMP_FRAMES=<n> (1) releases of every swapchain
 // The graphics API is chosen by the app's binding (xrmock_gfx.h).
 //
 // Checks (ERROR lines in the trace, and a summary on stderr when the session
@@ -97,6 +102,7 @@ typedef struct {
     int acquired, next;
     int waited;  // of the images acquired, how many were waited for
     int released;  // an image was released since the last xrEndFrame
+    int dumpMark, dumped;  // MOCK_XR_DUMP: the dump time this chain is on, images written for it
 } Chain;
 static Chain gChains[MAXSC];
 static int gErrors = 0;  // ERROR lines in the trace
@@ -348,6 +354,41 @@ static XrResult XRAPI_CALL mWaitImage(XrSwapchain sc, const XrSwapchainImageWait
     c->waited++;
     return XR_SUCCESS;
 }
+// MOCK_XR_DUMP (see the top): the image being released, written at the dump times.
+static void maybeDump(Chain* c, XrSwapchain sc) {
+    static const char* dir = NULL;
+    static double at[64];
+    static int atCount = -1, frames = 1;
+    if (atCount < 0) {
+        dir = getenv("MOCK_XR_DUMP");
+        atCount = 0;
+        const char* list = getenv("MOCK_XR_DUMP_AT");
+        for (const char* q = list; q && *q && atCount < 64;) {
+            at[atCount++] = atof(q);
+            q = strchr(q, ',');
+            if (q) q++;
+        }
+        if (!atCount)
+            for (; atCount < 64; atCount++) at[atCount] = 10.0 * (atCount + 1);
+        if (getenv("MOCK_XR_DUMP_FRAMES")) frames = atoi(getenv("MOCK_XR_DUMP_FRAMES"));
+    }
+    if (!dir || !gGfx || !gGfx->dump_image || !gT0) return;
+    double t = (double)(nowNs() - gT0) / 1e9;
+    int mark = 0;
+    while (mark < atCount && at[mark] <= t) mark++;
+    if (mark == 0) return;
+    if (c->dumpMark != mark) {
+        c->dumpMark = mark;
+        c->dumped = 0;
+    }
+    if (c->dumped >= frames || t - at[mark - 1] > 5.0) return;
+    int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/t%03d-sc%d-%02d.ppm", dir, (int)at[mark - 1], chainId(sc), c->dumped);
+    if (gGfx->dump_image(c->images, idx, c->w, c->h, c->format, 4, path)) trace("dump sc%d %s", chainId(sc), path);
+    c->dumped++;
+}
+
 static XrResult XRAPI_CALL mRelease(XrSwapchain sc, const XrSwapchainImageReleaseInfo* ri) {
     (void)ri;
     Chain* c = chainOf(sc);
@@ -389,6 +430,7 @@ static XrResult XRAPI_CALL mRelease(XrSwapchain sc, const XrSwapchainImageReleas
             gErrors++;
         }
     }
+    maybeDump(c, sc);
     c->acquired--;
     c->waited--;
     c->released = 1;
@@ -745,12 +787,20 @@ static XrResult XRAPI_CALL mReqRefresh(XrSession s, float hz) {
 }
 static XrResult XRAPI_CALL mEnumRefresh(XrSession s, uint32_t cap, uint32_t* count, float* r) {
     (void)s;
-    *count = 3;
-    if (cap) {
-        r[0] = 72;
-        r[1] = 90;
-        r[2] = 120;
+    // MOCK_XR_RATES=<hz>,<hz>... (default 72,90,120); SteamVR on the Frame offered only 90 in H1.
+    float rates[8] = {72, 90, 120};
+    uint32_t n = 3;
+    if (getenv("MOCK_XR_RATES")) {
+        n = 0;
+        for (const char* q = getenv("MOCK_XR_RATES"); q && *q && n < 8;) {
+            rates[n++] = (float)atof(q);
+            q = strchr(q, ',');
+            if (q) q++;
+        }
     }
+    *count = n;
+    if (cap)
+        for (uint32_t i = 0; i < n && i < cap; i++) r[i] = rates[i];
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mGetRefresh(XrSession s, float* hz) {

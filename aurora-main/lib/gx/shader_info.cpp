@@ -769,6 +769,7 @@ UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGrou
       .perspective = perspective,
       .indexedMatrices = info.indexAttr.test(GX_VA_PNMTXIDX),
       .nativeEfbEffect = !perspective && samplesRecentEfbCopy && (samplesReducedEfbCopy || blends),
+      .uniformSize = info.uniformSize,
   };
 
   if (!perspective || !frame_interpolation_active()) {
