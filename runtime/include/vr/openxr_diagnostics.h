@@ -378,6 +378,9 @@ void NoteSetConsumed();
 void OnSetSubmitted(int64_t now_ns, bool retained);
 // GPU submit-to-completion of one set (the GPU watcher thread).
 void OnSetGpu(double ms);
+// The last set's consumed, submitted and GPU-complete times (steady ns; 0 unknown), for
+// KARTFRAME_PACING_DEBUG.
+void LastSetTimes(int64_t& consumed_ns, int64_t& submitted_ns, int64_t& complete_ns);
 // Pacing thread: writes the line once a second has passed since the last one.
 void Flush();
 // Writes the session's totals line (and resets nothing).

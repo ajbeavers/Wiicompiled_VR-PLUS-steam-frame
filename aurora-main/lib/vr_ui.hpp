@@ -174,6 +174,7 @@ void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,co
     // perspective and ordering; no scene depth exists behind the tutorial.
     struct Triangle { std::array<Vertex,3> v;float depth;uint32_t material; };
     std::vector<Triangle> triangles;
+    triangles.reserve(9216);
     {
       std::lock_guard lock(mutex);
       for(auto& [id,material]:controllerTextures) if(!material.pixels.empty()) {
@@ -211,11 +212,22 @@ void render(wgpu::CommandEncoder& encoder,const webgpu::PresentSource& source,co
         }
       }
     }
-    std::sort(triangles.begin(),triangles.end(),[](const auto& a,const auto& b){return a.depth>b.depth;});
+    // Sort small keys, not the triangles themselves: the controller models are ~9000
+    // triangles per eye and moving them dominated the frame worker at 120 Hz. Back to front
+    // in 5 mm slices, by material within a slice: a strict depth order switched material
+    // (a draw and a bind group each) almost every triangle.
+    struct Key { int32_t slice; uint32_t material; uint32_t index; };
+    std::vector<Key> order(triangles.size());
+    for(uint32_t i=0;i<order.size();++i)
+      order[i]={static_cast<int32_t>(std::floor(triangles[i].depth*(1.f/3.f)/.005f)),triangles[i].material,i};
+    std::sort(order.begin(),order.end(),[](const Key& a,const Key& b){
+      return a.slice!=b.slice?a.slice>b.slice:a.material<b.material;});
     materialRanges.push_back({0,static_cast<uint32_t>(vertices.size()),source.bindGroup});
+    vertices.reserve(vertices.size()+triangles.size()*3+512);
     {
       std::lock_guard lock(mutex);
-      for(const auto& t:triangles) {
+      for(const auto& key:order) {
+        const auto& t=triangles[key.index];
         const auto found=controllerTextures.find(t.material);
         auto binding=found!=controllerTextures.end() && found->second.binding?found->second.binding:source.bindGroup;
         if(materialRanges.back().binding.Get()==binding.Get()) materialRanges.back().count+=3;

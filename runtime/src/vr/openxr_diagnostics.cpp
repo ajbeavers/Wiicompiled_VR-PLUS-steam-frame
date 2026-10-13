@@ -625,6 +625,7 @@ struct State {
     Window window;
     Window total;  // gpu/encode samples are kept for the totals' percentiles
     std::atomic_int64_t consumed_ns{0};
+    int64_t last_consumed = 0, last_submitted = 0, last_complete = 0;
 };
 State& S() {
     static State state;
@@ -689,6 +690,9 @@ void OnSetSubmitted(int64_t now_ns, bool retained) {
     auto& s = S();
     const int64_t consumed = s.consumed_ns.exchange(0, std::memory_order_relaxed);
     std::lock_guard lock(s.mutex);
+    s.last_consumed = consumed;
+    s.last_submitted = now_ns;
+    s.last_complete = 0;
     if (retained) ++s.window.interpolated;
     if (consumed != 0 && now_ns > consumed) {
         s.window.encode.push_back(static_cast<float>(static_cast<double>(now_ns - consumed) / 1.0e6));
@@ -697,6 +701,13 @@ void OnSetSubmitted(int64_t now_ns, bool retained) {
 void OnSetGpu(double ms) {
     std::lock_guard lock(S().mutex);
     S().window.gpu.push_back(static_cast<float>(ms));
+    S().last_complete = diagnostics::detail::NowNs();
+}
+void LastSetTimes(int64_t& consumed_ns, int64_t& submitted_ns, int64_t& complete_ns) {
+    std::lock_guard lock(S().mutex);
+    consumed_ns = S().last_consumed;
+    submitted_ns = S().last_submitted;
+    complete_ns = S().last_complete;
 }
 void Flush() {
     auto& s = S();

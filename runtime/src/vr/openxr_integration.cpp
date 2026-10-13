@@ -892,6 +892,7 @@ private:
                 set_pacing_.half_rate = false;
                 set_pacing_.results.clear();
                 set_pacing_.last_display_time = 0;
+                set_pacing_.first_set = {};
             }
             if (session_active != session_was_active_) {
                 session_was_active_ = session_active;
@@ -1080,6 +1081,7 @@ private:
     // of the last 600 were late. Both changes are logged.
     enum class CycleResult { Continue, Break, Fatal };
     enum class PacingMode { Inline, Pipelined };
+    enum class HalfRatePolicy { Auto, Never, Always };
 
     struct SetPacingState {
         OpenXRBackendFrame set{};
@@ -1091,6 +1093,7 @@ private:
         std::chrono::steady_clock::time_point half_since{};
         std::deque<uint8_t> results;  // 1: the set was not finished by its first deadline
         XrTime last_display_time = 0;
+        std::chrono::steady_clock::time_point first_set{};
     };
 
     static const char* PacingModeName(PacingMode mode) noexcept {
@@ -1137,6 +1140,12 @@ private:
             margin_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
         }
         pacing_margin_ = std::chrono::microseconds(margin_us);
+        // KARTFRAME_HALF_RATE=0 never drops to every second refresh, 1 always renders at
+        // half rate (measurements); unset: only on real misses.
+        half_rate_policy_ = HalfRatePolicy::Auto;
+        if (const char* env = std::getenv("KARTFRAME_HALF_RATE"); env != nullptr && *env != '\0') {
+            half_rate_policy_ = *env == '0' ? HalfRatePolicy::Never : HalfRatePolicy::Always;
+        }
     }
 
     // The session stopped or the loop is leaving the set path: a set still acquired is
@@ -1155,6 +1164,11 @@ private:
 
     void NoteSetResult(bool late) {
         auto& st = set_pacing_;
+        // The first seconds of a session (loading, pipeline compiles) say nothing about
+        // whether the loop holds the rate.
+        const auto now = std::chrono::steady_clock::now();
+        if (st.first_set == std::chrono::steady_clock::time_point{}) st.first_set = now;
+        if (now - st.first_set < std::chrono::seconds(5)) return;
         st.results.push_back(late ? 1 : 0);
         while (st.results.size() > 600) st.results.pop_front();
     }
@@ -1166,10 +1180,18 @@ private:
             return static_cast<size_t>(std::count(st.results.end() - static_cast<std::ptrdiff_t>(n), st.results.end(), 1));
         };
         const auto now = std::chrono::steady_clock::now();
+        if (half_rate_policy_ != HalfRatePolicy::Auto) {
+            const bool half = half_rate_policy_ == HalfRatePolicy::Always;
+            if (st.half_rate != half) {
+                st.half_rate = half;
+                pacing::SetMode(std::string(PacingModeName(pacing_mode_)) + (half ? "/2" : ""));
+            }
+            return;
+        }
         if (!st.half_rate) {
             const size_t window = std::min<size_t>(240, st.results.size());
             const size_t late = late_in_last(240);
-            if (late > 12) {
+            if (window >= 240 && late > 12) {
                 st.half_rate = true;
                 st.half_since = now;
                 st.results.clear();
@@ -1288,6 +1310,16 @@ private:
                 }
                 shown = true;
                 st.pending = false;
+                if (pacing_debug_ > 0 && st.timeouts > 0) {
+                    --pacing_debug_;
+                    int64_t consumed = 0, submitted = 0, complete = 0;
+                    pacing::LastSetTimes(consumed, submitted, complete);
+                    const int64_t published = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        st.published_at.time_since_epoch()).count();
+                    const auto ms = [&](int64_t t) { return t ? static_cast<double>(t - published) / 1e6 : -1.0; };
+                    RT_LOG(RT_TAG_RUNTIME) << "vr pacing debug: late set shown; after publish: consumed " << ms(consumed)
+                        << " ms, submitted " << ms(submitted) << " ms, GPU done " << ms(complete) << " ms" << std::endl;
+                }
                 WithdrawPublishedFrame();
                 if (st.timeouts == 0) NoteSetResult(false);
                 pacing::OnRendered();
@@ -1302,6 +1334,14 @@ private:
             } else if (status == OpenXRSubmissionStatus::Timeout) {
                 ++st.timeouts;
                 if (st.timeouts == 1) NoteSetResult(true);
+                if (pacing_debug_ > 0 && st.timeouts == 1) {
+                    --pacing_debug_;
+                    RT_LOG(RT_TAG_RUNTIME) << "vr pacing debug: late set " << st.set.xr_frame.serial << " published "
+                        << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st.published_at).count()
+                        << " ms ago, " << (published_.load(std::memory_order_acquire) == nullptr ? "consumed" : "NOT consumed")
+                        << ", deadline was " << std::chrono::duration<double, std::milli>(deadline - st.published_at).count()
+                        << " ms after publish" << std::endl;
+                }
                 // Late: due this cycle (half rate: by the cycle after).
                 if (st.timeouts == (st.half_rate ? 2u : 1u)) pacing::OnLate();
                 // A stalled game (nothing to replay) leaves the packet unconsumed: withdraw it
@@ -2334,6 +2374,8 @@ private:
     SetPacingState set_pacing_;
     std::chrono::steady_clock::time_point last_focused_{};
     PacingMode pacing_mode_ = PacingMode::Inline;
+    HalfRatePolicy half_rate_policy_ = HalfRatePolicy::Auto;
+    int pacing_debug_ = std::getenv("KARTFRAME_PACING_DEBUG") ? 60 : 0;
     std::string pacing_mode_source_ = "auto";
     std::chrono::microseconds pacing_margin_{1000};
     std::atomic<float> headset_hz_{0};

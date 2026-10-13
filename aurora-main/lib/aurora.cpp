@@ -2569,11 +2569,39 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame, uint64_t contentTag, 
   g_workerSealNs.fetch_add(elapsedNs(stretchStarted), std::memory_order_relaxed);
   stretchStarted = std::chrono::steady_clock::now();
 
+  // VR interpolation: the producer permits the next frame's preparation only when it begins that
+  // frame, a game frame's logic later (about 10 ms of every 16.7 on the Frame). The worker used to
+  // sit out that wait, and an eye set asked for meanwhile (every refresh at 120 Hz) waited with it.
+  // So with the stereo provider and interpolation active the sealed frame is encoded first (its
+  // eyes, if a packet was taken at the seal, reach the headset earlier too) and the wait serves
+  // the retained replays, exactly as the idle worker would: the frame is sealed, its uploads are
+  // submitted, and nothing of the next frame exists yet. The producer's first drain still waits
+  // for SEALED, which follows the permit as before; only an encode longer than the producer's
+  // frame logic would delay it.
+  const bool encodeBeforePermit = stereo_frame_provider_active() && gx::stereo_frame_interpolation_active();
+  if (encodeBeforePermit) {
+    std::vector<PresentationJob> presentationJobs = encode_sealed_frame(sealedFrame, ctx);
+    publish_presentations(std::move(presentationJobs), ctx.interpolationActive);
+    g_workerEncodeNs.fetch_add(elapsedNs(stretchStarted), std::memory_order_relaxed);
+    stretchStarted = std::chrono::steady_clock::now();
+  }
   {
     std::unique_lock lock(g_frameWorker.mutex);
-    g_frameWorker.cv.wait(lock, [] { return g_frameWorker.stop || g_frameWorker.prepareAllowed; });
-    if (g_frameWorker.stop) {
-      return false;
+    for (;;) {
+      g_frameWorker.cv.wait(lock, [&] {
+        return g_frameWorker.stop || g_frameWorker.prepareAllowed ||
+               (encodeBeforePermit && g_frameWorker.stereoPending);
+      });
+      if (g_frameWorker.stop) {
+        return false;
+      }
+      if (g_frameWorker.prepareAllowed) {
+        break;
+      }
+      g_frameWorker.stereoPending = false;
+      lock.unlock();
+      run_retained_stereo_frame(sealedFrame);
+      lock.lock();
     }
     g_frameWorker.prepareAllowed = false;
   }
@@ -2599,8 +2627,10 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame, uint64_t contentTag, 
   }
   g_frameWorker.cv.notify_all();
 
-  std::vector<PresentationJob> presentationJobs = encode_sealed_frame(sealedFrame, ctx);
-  publish_presentations(std::move(presentationJobs), ctx.interpolationActive);
+  if (!encodeBeforePermit) {
+    std::vector<PresentationJob> presentationJobs = encode_sealed_frame(sealedFrame, ctx);
+    publish_presentations(std::move(presentationJobs), ctx.interpolationActive);
+  }
   if (imguiNewFrameOwed) {
     // Safe only now: every slot has replayed this frame's ImGui draw lists.
     std::lock_guard gpuLock(g_rendererGpuMutex);
