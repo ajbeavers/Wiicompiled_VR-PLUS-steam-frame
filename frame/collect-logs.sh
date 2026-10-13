@@ -11,7 +11,7 @@
 # The masking is a best effort. Read the files before you post them.
 set -euo pipefail
 KFHOME=${KARTFRAME_HOME:-$HOME/.local/share/KartFrame}
-STATE=${XDG_DATA_HOME:-$HOME/.local/share}/WiiCompiled
+STATE=$KFHOME/UserData
 SESSION=${1:-$KFHOME/sessions/latest}
 [ -d "$SESSION" ] || { echo "no session folder at $SESSION (launch the game once, or pass a session folder)"; exit 1; }
 SESSION=$(readlink -f "$SESSION")
@@ -30,11 +30,8 @@ grab "$(ls -t "$KFHOME"/build/*.log "$KFHOME"/logs/*.log 2>/dev/null | head -1 |
     echo "collected: $(date -u +%Y-%m-%dT%H:%MZ)"
     echo "session: $(basename "$SESSION")"
     grep -E '^(VERSION_ID|BUILD_ID)=' /etc/os-release 2>/dev/null | sed 's/^/steamos /' || true
-    APP=${KARTFRAME_APP:-$HOME/Games/KartFrame/app}
-    [ -x "$APP/kartframe" ] && echo "binary sha256: $(sha256sum "$APP/kartframe" | cut -d' ' -f1)"
-    for f in "$APP/kartframe.fingerprint" "$APP/kit.fingerprint"; do
-        [ -f "$f" ] && echo "$(basename "$f"): $(head -c 64 "$f")"
-    done
+    [ -x "$KFHOME/bin/kartframe" ] && echo "binary sha256: $(sha256sum "$KFHOME/bin/kartframe" | cut -d' ' -f1)"
+    [ -f "$KFHOME/bin/kartframe.fingerprint" ] && echo "built kit: $(head -c 64 "$KFHOME/bin/kartframe.fingerprint")"
 } > "$RAW/summary.txt"
 
 python3 -I - "$RAW" "$OUT" "$(hostname 2>/dev/null || true)" <<'EOF'

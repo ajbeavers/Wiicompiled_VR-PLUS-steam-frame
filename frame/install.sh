@@ -5,7 +5,7 @@
 #
 #   frame/install.sh [options] [kartframe-*-linux-arm64.tar.gz | BUILD_DIR]
 #   frame/install.sh --dev [BUILD_DIR]     a separate "KartFrame (dev)" shortcut that runs the build
-#                                          tree's binary in place (default <repo>/build-linux)
+#                                          build's binary into KARTFRAME_HOME/bin (default <repo>/build-linux)
 #
 #   --name NAME     shortcut name (default "KartFrame", with --dev "KartFrame (dev)")
 #   --art DIR       optional library art: p.png (portrait), wide.png, hero.png, logo.png, icon.png
@@ -43,17 +43,16 @@ if [ "$DEV" = 1 ]; then
     APP=${KARTFRAME_APP:-$HOME/Games/KartFrame/app-dev}
     BUILD=$(cd "${SRC:-$REPO/build-linux}" 2> /dev/null && pwd) || { echo "no build tree at ${SRC:-$REPO/build-linux}" >&2; exit 1; }
     [ -x "$BUILD/kartframe" ] || { echo "no kartframe in $BUILD (build with kfbuild.sh first)" >&2; exit 1; }
-    EXE=$BUILD/kartframe
 else
     NAME=${NAME:-KartFrame}
     APP=${KARTFRAME_APP:-$HOME/Games/KartFrame/app}
     [ -n "$SRC" ] || SRC=$(ls "$REPO"/release/kartframe-*-linux-arm64.tar.gz 2> /dev/null | sort -V | tail -1)
     [ -n "$SRC" ] || { [ -x "$REPO/build-linux/kartframe" ] && SRC=$REPO/build-linux; }
     [ -n "$SRC" ] && [ -e "$SRC" ] || { echo "usage: $0 [--dev] kartframe-*-linux-arm64.tar.gz | BUILD_DIR" >&2; exit 1; }
-    EXE=$APP/kartframe
 fi
-case $NAME in *\'* | *\\*) echo "the shortcut name cannot hold a quote or backslash" >&2; exit 2 ;; esac
 KFHOME=${KARTFRAME_HOME:-$HOME/.local/share/KartFrame}
+EXE=$KFHOME/bin/kartframe
+case $NAME in *\'* | *\\*) echo "the shortcut name cannot hold a quote or backslash" >&2; exit 2 ;; esac
 STEAM=${KARTFRAME_STEAM_DIR:-$HOME/.local/share/Steam}
 
 if [ -z "$KARTFRAME_SKIP_STEAM" ] && [ -z "$KARTFRAME_STEAM_DIR" ]; then
@@ -63,29 +62,36 @@ if [ -z "$KARTFRAME_SKIP_STEAM" ] && [ -z "$KARTFRAME_STEAM_DIR" ]; then
     }
 fi
 
-# The program. TODO(lane B / lane F): the release tarball's layout and the kit files are not final.
-# The wrapper looks for the kit fingerprint in kit/kit.json or kit.fingerprint and for the built
-# game's record in kartframe.fingerprint, all in the app folder; a tarball is unpacked as it comes.
-mkdir -p "$APP/tools" "$KFHOME"
+# Layout (LANE_RULES.md "Install layout"): the app dir holds the wrapper, tools and, from a release
+# tarball, kit/ toolchain/ translator/ setup.sh. The game's own files live in $KFHOME: bin/kartframe
+# plus its resources, portable.txt, UserData/. A release install does not make bin/ (setup.sh builds
+# it from the user's disc); --dev and a build-tree install copy the build's binary there.
+mkdir -p "$APP/tools" "$KFHOME/bin"
+: > "$KFHOME/portable.txt"
+copy_build() {  # BUILD_DIR: the binary and the resources the game wants beside its executable
+    local B=$1 r
+    [ -x "$B/kartframe" ] || { echo "no kartframe in $B" >&2; exit 1; }
+    cp "$B/kartframe" "$KFHOME/bin/kartframe.new" && mv "$KFHOME/bin/kartframe.new" "$KFHOME/bin/kartframe"   # the game may be running
+    for r in dsp_coef.bin initial_pipeline_cache.db wii_bootstrap resources kartframe.fingerprint; do
+        [ -e "$B/$r" ] && { rm -rf "${KFHOME:?}/bin/$r"; cp -r "$B/$r" "$KFHOME/bin/$r"; }
+    done
+    return 0
+}
 if [ "$DEV" = 1 ]; then
-    echo "dev install: the shortcut runs $EXE in place"
+    echo "dev install: copying the build in $BUILD to $KFHOME/bin (run again after a rebuild)"
+    copy_build "$BUILD"
 elif [ -d "$SRC" ]; then
     echo "installing the build in $SRC"
-    [ -x "$SRC/kartframe" ] || { echo "no kartframe in $SRC" >&2; exit 1; }
-    cp "$SRC/kartframe" "$APP/kartframe.new" && mv "$APP/kartframe.new" "$APP/kartframe"   # the game may be running
-    for r in dsp_coef.bin initial_pipeline_cache.db wii_bootstrap resources; do
-        [ -e "$SRC/$r" ] && { rm -rf "${APP:?}/$r"; cp -r "$SRC/$r" "$APP/$r"; }
-    done
-    for r in kartframe.fingerprint kit.fingerprint kit; do
-        [ -e "$SRC/$r" ] && { rm -rf "${APP:?}/$r"; cp -r "$SRC/$r" "$APP/$r"; }
-    done
+    copy_build "$SRC"
 else
-    echo "installing $SRC"
+    echo "installing $SRC into $APP"
     TOPS=$(tar -tzf "$SRC" | sed 's|^\./||; s|/.*||' | sort -u | wc -l)
-    STRIP=0; [ "$TOPS" = 1 ] && [ -z "$(tar -tzf "$SRC" | sed 's|^\./||' | grep -m1 '^kartframe$')" ] && STRIP=1
+    STRIP=0; [ "$TOPS" = 1 ] && [ -z "$(tar -tzf "$SRC" | sed 's|^\./||' | grep -m1 '^kartframe.sh$')" ] && STRIP=1
     tar -xzf "$SRC" -C "$APP" --strip-components=$STRIP
-    [ -x "$APP/kartframe" ] || { echo "the tarball has no kartframe binary" >&2; exit 1; }
 fi
+# Seed the game's Config.toml if there is none.
+mkdir -p "$KFHOME/UserData"
+[ -f "$KFHOME/UserData/Config.toml" ] || sed "s|@DVD_ROOT@|$KFHOME/game/DATA|" "$HERE/Config.frame.toml" > "$KFHOME/UserData/Config.toml"
 cp "$HERE/kartframe.sh" "$APP/kartframe.sh"
 cp "$HERE/Config.frame.toml" "$APP/Config.frame.toml"
 for t in vrtiming.py session-report.py; do cp "$HERE/tools/$t" "$APP/tools/$t"; done
@@ -108,7 +114,7 @@ elif [ -n "$KARTFRAME_STEAM_DIR" ]; then
     for CFG in "$STEAM"/userdata/*/config; do
         [ -d "$CFG" ] || continue
         APPID=$(python3 "$HERE/steam-cef.py" --vdf "$CFG/shortcuts.vdf" --name "$NAME" --exe "\"$EXE\"" \
-            --startdir "\"$(dirname "$EXE")\"" --opts "$LAUNCH")
+            --startdir "\"$KFHOME/bin\"" --opts "$LAUNCH")
         echo "shortcut '$NAME' written to $CFG/shortcuts.vdf (appid $APPID)"
         GRID=$CFG/grid
     done
@@ -119,9 +125,9 @@ else
     if [ "$EXISTING" != "0" ] && [ -n "$EXISTING" ]; then
         APPID=$EXISTING
         echo "Steam already has a '$NAME' shortcut (appid $APPID): updating it"
-        $CEF "(() => { SteamClient.Apps.SetShortcutExe($APPID, '\"$EXE\"'); SteamClient.Apps.SetShortcutStartDir($APPID, '\"$(dirname "$EXE")\"'); return 1; })()" > /dev/null
+        $CEF "(() => { SteamClient.Apps.SetShortcutExe($APPID, '\"$EXE\"'); SteamClient.Apps.SetShortcutStartDir($APPID, '\"$KFHOME/bin\"'); return 1; })()" > /dev/null
     else
-        APPID=$($CEF "(async () => { const id = await SteamClient.Apps.AddShortcut('$NAME', '$EXE', '$(dirname "$EXE")', ''); SteamClient.Apps.SetShortcutName(id, '$NAME'); return id; })()")
+        APPID=$($CEF "(async () => { const id = await SteamClient.Apps.AddShortcut('$NAME', '$EXE', '$KFHOME/bin', ''); SteamClient.Apps.SetShortcutName(id, '$NAME'); return id; })()")
         echo "added the '$NAME' shortcut (appid $APPID)"
     fi
     $CEF "(() => { SteamClient.Apps.SetShortcutLaunchOptions($APPID, '$LAUNCH'); return 1; })()" > /dev/null

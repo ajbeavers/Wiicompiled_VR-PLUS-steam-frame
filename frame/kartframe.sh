@@ -39,12 +39,12 @@ fi
 [ -n "$KARTFRAME_PACING" ] && { export KARTFRAME_PACING; log "KARTFRAME_PACING=$KARTFRAME_PACING"; }
 
 # The game: Steam's %command% (the binary the shortcut names), else the installed one.
-EXE=${KARTFRAME_EXE:-${1:-$HERE/kartframe}}
+EXE=${KARTFRAME_EXE:-${1:-$KFHOME/bin/kartframe}}
 [ $# -gt 0 ] && shift
-[ -x "$EXE" ] || { log "REFUSING TO START: no game binary at $EXE (run install.sh)"; exit 1; }
+[ -x "$EXE" ] || { log "REFUSING TO START: no game binary at $EXE (run frame/setup.sh)"; exit 1; }
 
 # Kit check: the installed binary must have been built against the kit that is installed now.
-# TODO(lane B): the file names and formats below are placeholders until setup.sh's layout is final.
+# Installed kit: <app>/kit/kit.json "fingerprint"; the built game's record: $KFHOME/bin/kartframe.fingerprint.
 # kit_fingerprint FILE prints the "fingerprint" of a kit.json, or the first line of a plain file.
 kit_fingerprint() {
     python3 -I -c '
@@ -56,9 +56,9 @@ except Exception:
     print(t.split("\n")[0].strip())' "$1" 2> /dev/null
 }
 kit_check() {  # prints the reason and returns 1 when the binary and the kit disagree
-    local kit= built= f
-    for f in "$HERE/kit/kit.json" "$HERE/kit.fingerprint"; do [ -f "$f" ] && { kit=$f; break; }; done
-    for f in "$HERE/kartframe.fingerprint" "$KFHOME/build/kartframe.fingerprint"; do [ -f "$f" ] && { built=$f; break; }; done
+    local kit= built=
+    [ -f "$HERE/kit/kit.json" ] && kit=$HERE/kit/kit.json
+    [ -f "$KFHOME/bin/kartframe.fingerprint" ] && built=$KFHOME/bin/kartframe.fingerprint
     [ -n "$kit" ] || { log "kit check: no kit fingerprint installed (development build), skipped"; return 0; }
     [ -n "$built" ] || { echo "no record of the kit this binary was built against; run frame/setup.sh again"; return 1; }
     local k b
@@ -69,10 +69,10 @@ kit_check() {  # prints the reason and returns 1 when the binary and the kit dis
 if ! why=$(kit_check); then log "REFUSING TO START: $why"; exit 78; fi
 [ -n "$why" ] && echo "$why"
 
-# State folder (the game's Config.toml, NAND, Logs), where runtime_config.h looks for it.
-STATE=${XDG_DATA_HOME:-$HOME/.local/share}/WiiCompiled
+# Portable mode: portable.txt in KFHOME (a parent of bin/) makes the game's root $KFHOME/UserData.
+STATE=$KFHOME/UserData
+mkdir -p "$STATE"; [ -f "$KFHOME/portable.txt" ] || : > "$KFHOME/portable.txt"
 if [ ! -f "$STATE/Config.toml" ] && [ -f "$HERE/Config.frame.toml" ]; then
-    mkdir -p "$STATE"
     sed "s|@DVD_ROOT@|$KFHOME/game/DATA|" "$HERE/Config.frame.toml" > "$STATE/Config.toml" &&
         log "seeded $STATE/Config.toml"
 fi

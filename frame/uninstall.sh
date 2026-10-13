@@ -5,8 +5,7 @@
 #   frame/uninstall.sh [--dev] [--name NAME] [--purge]
 #
 # Environment: KARTFRAME_APP, KARTFRAME_HOME, KARTFRAME_SKIP_STEAM, KARTFRAME_STEAM_DIR as in install.sh.
-# --purge also removes $KARTFRAME_HOME and the game's own state (~/.local/share/WiiCompiled, which
-# holds the NAND and Config.toml), and says so first; there is no undo.
+# --purge also removes $KARTFRAME_HOME (game files, saves, Config.toml); there is no undo.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 DEV=0; NAME=; PURGE=0
@@ -27,7 +26,7 @@ else
 fi
 KFHOME=${KARTFRAME_HOME:-$HOME/.local/share/KartFrame}
 STEAM=${KARTFRAME_STEAM_DIR:-$HOME/.local/share/Steam}
-if pgrep -f "^$APP/kartframe( |$)" > /dev/null 2>&1; then echo "the game is running; quit it first" >&2; exit 1; fi
+if pgrep -f "^${KARTFRAME_HOME:-$HOME/.local/share/KartFrame}/bin/kartframe( |$)" > /dev/null 2>&1; then echo "the game is running; quit it first" >&2; exit 1; fi
 
 if [ -n "$KARTFRAME_SKIP_STEAM" ]; then
     echo "KARTFRAME_SKIP_STEAM set: Steam left alone"
@@ -52,9 +51,8 @@ fi
 
 [ -d "$APP" ] && { rm -rf "$APP"; echo "removed $APP"; }
 if [ "$PURGE" = 1 ]; then
-    STATE=${XDG_DATA_HOME:-$HOME/.local/share}/WiiCompiled
-    echo "--purge: removing $KFHOME and $STATE (game files, saves, config, logs)"
-    rm -rf "$KFHOME" "$STATE"
+    echo "--purge: removing $KFHOME (game files, built game, saves, config, logs)"
+    rm -rf "$KFHOME"
 else
-    echo "kept your data in $KFHOME (and the game's state folder); --purge removes it"
+    echo "kept your data in $KFHOME; --purge removes it"
 fi
