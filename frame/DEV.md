@@ -69,4 +69,5 @@ Mock: MOCK_XR_BUSY_MS (exact released-unfinished check), MOCK_XR_FOCUS_BLIP=<ms>
 MOCK_XR_PROFILE, MOCK_XR_EYE, MOCK_XR_TIME_OFFSET_S, MOCK_XR_DUMP=<dir> (released images as PPM at
 MOCK_XR_DUMP_AT seconds); mockrun seeds welcome/tutorial done so the demo race starts by itself
 (KF_MOCKRUN_INTRO=1 shows them). KARTFRAME_FPSLOG=1 logs the game frame rate every 5 s;
-KARTFRAME_SYNC_WINDOW=1 restores aurora's per-frame SDL_SyncWindow (10 ms a game frame on X11).
+KARTFRAME_SYNC_WINDOW=1 restores aurora's per-frame SDL_SyncWindow (10 ms a game frame on X11);
+KARTFRAME_HUD_CLIP=0 stops clipping the race's 2D layer to the frame and the game's scissor.
