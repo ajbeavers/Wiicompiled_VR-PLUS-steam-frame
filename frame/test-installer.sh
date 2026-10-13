@@ -57,6 +57,15 @@ import importlib.util, sys
 s = importlib.util.spec_from_file_location("c", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 d = m.vdf_load(sys.argv[2])["shortcuts"]
 print(next(v[sys.argv[4]] for v in d.values() if v.get("AppName") == sys.argv[3]))' "$HERE/steam-cef.py" "$VDF" "$@"; }
+# The copy of the owner's Steam config may already hold KartFrame shortcuts (a real dev install):
+# remove them from the copy so the counts below start from a clean state.
+python3 -I -c '
+import importlib.util, sys
+s = importlib.util.spec_from_file_location("c", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+data = m.vdf_load(sys.argv[2]); d = data["shortcuts"]
+keep = [v for v in d.values() if not str(v.get("AppName", "")).startswith("KartFrame")]
+data["shortcuts"] = {str(i): v for i, v in enumerate(keep)}
+m.vdf_save(sys.argv[2], data)' "$HERE/steam-cef.py" "$VDF"
 BEFORE=$(count)
 BUILD=$T/build; mkdir -p "$BUILD/resources" "$BUILD/wii_bootstrap"
 printf '#!/bin/bash\necho fake game\n' > "$BUILD/kartframe"; chmod +x "$BUILD/kartframe"

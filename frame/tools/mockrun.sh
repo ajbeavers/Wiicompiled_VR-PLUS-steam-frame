@@ -43,6 +43,8 @@ DATA=$GAME; [ -f "$GAME/sys/fst.bin" ] || DATA=$GAME/DATA
 # The game binary only (bin/kartframe, build-linux/kartframe, a bare kartframe), not toolchain
 # or build processes under ~/.cache/kartframe.
 RUNNING='SteamLaunch|lepton|waydroid|(^|[ /])kartframe( |$)'
+M0=$HOME/.cache/headset-in-use
+while [ -f "$M0" ] && kill -0 "$(awk '{print $2}' "$M0" 2>/dev/null)" 2>/dev/null; do echo "mockrun: headset in use, waiting" >&2; sleep 60; done
 if pgrep -af "$RUNNING" | grep -Ev "pgrep|mockrun" >/dev/null; then
   pgrep -af "$RUNNING" | grep -Ev "pgrep|mockrun" >&2
   die "a game is running; wait for it"
@@ -116,8 +118,16 @@ STOP=$SECONDS_RUN; [ $FLAT = 0 ] && STOP=$((SECONDS_RUN + 8))
 PID=$!
 ( sleep "$STOP"; kill -TERM $PID 2>/dev/null; sleep 15; kill -KILL $PID 2>/dev/null ) &
 WATCH=$!
+# The owner may put the headset on mid-run (frame/kartframe.sh writes this file while a game runs):
+# a headless run must not compete with it, so it stops at once.
+MARK=$HOME/.cache/headset-in-use
+( while kill -0 $PID 2>/dev/null; do
+    if [ -f "$MARK" ] && kill -0 "$(awk '{print $2}' "$MARK" 2>/dev/null)" 2>/dev/null; then
+      echo "mockrun: headset in use, stopping this run" >&2; kill -KILL $PID 2>/dev/null; break; fi
+    sleep 2; done ) &
+HWATCH=$!
 wait $PID; RC=$?
-kill $WATCH 2>/dev/null
+kill $WATCH $HWATCH 2>/dev/null
 echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
 grep -a 'xrmock: summary\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|xrmock: stamps\|vr pacing totals' "$LOG" || true
 echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
