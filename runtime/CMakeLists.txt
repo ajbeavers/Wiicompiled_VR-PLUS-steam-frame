@@ -133,12 +133,10 @@ set(MKW_TRANSLATED_COMPILE_JOBS 0 CACHE STRING
 Scheduling only - never affects output bytes, so it is deliberately outside the canonical flag fingerprint.")
 set(MKW_CPPWINRT_INCLUDE_DIR "" CACHE PATH "Optional self-contained C++/WinRT include directory")
 
-# The functional backend is currently Windows D3D12, so only Windows defaults
-# to carrying the loader. Linux keeps the capability-gated Vulkan scaffold
-# available to explicit developer builds without making a nonfunctional SDK
-# fetch part of every normal build.
+# Windows (D3D12 or Vulkan), Android (Quest) and desktop Linux (the shared-device
+# Vulkan bridge, with the patched Dawn linked statically) carry the loader by default.
 set(MKW_ENABLE_OPENXR_DEFAULT OFF)
-if(MKW_PLATFORM_WINDOWS OR MKW_PLATFORM_ANDROID)
+if(MKW_PLATFORM_WINDOWS OR MKW_PLATFORM_ANDROID OR MKW_PLATFORM_LINUX)
     set(MKW_ENABLE_OPENXR_DEFAULT ON)
 endif()
 option(MKW_ENABLE_OPENXR "Build OpenXR VR support" ${MKW_ENABLE_OPENXR_DEFAULT})
@@ -181,6 +179,24 @@ else()
         if(NOT AURORA_SDL3_PROVIDER OR AURORA_SDL3_PROVIDER STREQUAL "auto")
             set(AURORA_SDL3_PROVIDER vendor CACHE STRING "" FORCE)
         endif()
+    endif()
+    if(MKW_PLATFORM_LINUX)
+        # Desktop Linux runs aurora on Dawn's Vulkan backend patched with aurora-main/patches/dawn
+        # (frame/build-dawn.sh builds the package), linked statically so the patched Aurora Vulkan ABI
+        # resolves at link time. SDL3 is built from source so the audio and video backends are the ones
+        # this machine has headers for.
+        set(MKW_DAWN_PACKAGE_DIR "$ENV{KARTFRAME_DAWN_DIR}" CACHE PATH
+            "Patched Dawn install tree from frame/build-dawn.sh (holds aurora-dawn.json)")
+        if(NOT MKW_DAWN_PACKAGE_DIR OR NOT EXISTS "${MKW_DAWN_PACKAGE_DIR}/aurora-dawn.json")
+            message(FATAL_ERROR
+                "No patched Dawn package: run frame/build-dawn.sh and pass -DMKW_DAWN_PACKAGE_DIR=<package dir> "
+                "(MKW_DAWN_PACKAGE_DIR='${MKW_DAWN_PACKAGE_DIR}')")
+        endif()
+        set(AURORA_DAWN_PROVIDER package CACHE STRING "" FORCE)
+        set(AURORA_DAWN_LINKAGE static CACHE STRING "" FORCE)
+        set(FETCHCONTENT_SOURCE_DIR_DAWN_PREBUILT "${MKW_DAWN_PACKAGE_DIR}" CACHE PATH "" FORCE)
+        set(AURORA_SDL3_PROVIDER vendor CACHE STRING "" FORCE)
+        set(AURORA_SDL3_LINKAGE static CACHE STRING "" FORCE)
     endif()
     set(DAWN_ENABLE_D3D11 OFF CACHE BOOL "" FORCE)
     if(MKW_PLATFORM_WINDOWS)
@@ -286,7 +302,7 @@ if(MKW_PROJECT_COMPILE_DEFINITIONS)
     add_compile_definitions(${MKW_PROJECT_COMPILE_DEFINITIONS})
 endif()
 
-if(MKW_PLATFORM_WINDOWS AND MKW_ENABLE_OPENXR)
+if((MKW_PLATFORM_WINDOWS OR MKW_PLATFORM_LINUX) AND MKW_ENABLE_OPENXR)
     include(FetchContent)
     FetchContent_Declare(vulkan_headers
         URL "https://github.com/KhronosGroup/Vulkan-Headers/archive/015e25c3c91b70eb1a754d36fb14c4ba6ad9b0b9.tar.gz"
@@ -302,7 +318,9 @@ if(MKW_ENABLE_OPENXR)
         set(MKW_ENABLE_OPENXR OFF)
     else()
         # An installer-supplied SDK must win over any developer machine package.
-        if(NOT MKW_OPENXR_SDK_DIR AND NOT FETCHCONTENT_SOURCE_DIR_OPENXR)
+        # Linux always takes the pinned static loader: a distribution package may be a different version
+        # and the headers must match the one the bridge was written against.
+        if(NOT MKW_OPENXR_SDK_DIR AND NOT FETCHCONTENT_SOURCE_DIR_OPENXR AND NOT MKW_PLATFORM_LINUX)
             find_package(OpenXR CONFIG QUIET)
         endif()
         if(NOT TARGET OpenXR::openxr_loader AND NOT TARGET openxr_loader)
@@ -621,7 +639,27 @@ if(MKW_BUILD_PRODUCTS)
             "Missing translator-owned shard manifest: ${MKW_TRANSLATED_SHARD_MANIFEST}. "
             "Run Translator.Cli emit-build-shards first; see translator/README.md.")
     endif()
-    include("${MKW_TRANSLATED_SHARD_MANIFEST}")
+    # The manifest spells every shard as an absolute path under MKW_TRANSLATED_SHARD_ROOT, the place it
+    # was generated. A translation made elsewhere and moved here (the development copy) is pointed at
+    # the directory the manifest sits in instead; a relocated copy is written to the build tree.
+    file(READ "${MKW_TRANSLATED_SHARD_MANIFEST}" MKW_SHARD_MANIFEST_TEXT)
+    if(MKW_SHARD_MANIFEST_TEXT MATCHES "set\\(MKW_TRANSLATED_SHARD_ROOT \"([^\"]+)\"\\)")
+        set(MKW_SHARD_MANIFEST_ROOT "${CMAKE_MATCH_1}")
+        get_filename_component(MKW_SHARD_MANIFEST_DIR "${MKW_TRANSLATED_SHARD_MANIFEST}" DIRECTORY)
+        get_filename_component(MKW_SHARD_MANIFEST_DIR "${MKW_SHARD_MANIFEST_DIR}" REALPATH)
+        if(NOT MKW_SHARD_MANIFEST_ROOT STREQUAL MKW_SHARD_MANIFEST_DIR)
+            string(REPLACE "${MKW_SHARD_MANIFEST_ROOT}" "${MKW_SHARD_MANIFEST_DIR}"
+                MKW_SHARD_MANIFEST_TEXT "${MKW_SHARD_MANIFEST_TEXT}")
+            set(MKW_TRANSLATED_SHARD_MANIFEST_USED "${CMAKE_BINARY_DIR}/shards_relocated.cmake")
+            file(WRITE "${MKW_TRANSLATED_SHARD_MANIFEST_USED}" "${MKW_SHARD_MANIFEST_TEXT}")
+            message(STATUS "Shard manifest relocated: ${MKW_SHARD_MANIFEST_ROOT} -> ${MKW_SHARD_MANIFEST_DIR}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MKW_TRANSLATED_SHARD_MANIFEST}")
+        endif()
+    endif()
+    if(NOT MKW_TRANSLATED_SHARD_MANIFEST_USED)
+        set(MKW_TRANSLATED_SHARD_MANIFEST_USED "${MKW_TRANSLATED_SHARD_MANIFEST}")
+    endif()
+    include("${MKW_TRANSLATED_SHARD_MANIFEST_USED}")
     set(MKW_HAVE_RETRO_REWIND ${MKW_HAVE_RETRO_REWIND_SHARDS})
     message(STATUS
         "Translator graph: ${MKW_SHARED_BASE_FUNCTION_COUNT}/${MKW_BASE_FUNCTION_COUNT} base functions shared; "

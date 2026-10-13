@@ -13,7 +13,7 @@ get_filename_component(MKW_GENERATED_PARENT_DIR "${MKW_GENERATED_DIR}" DIRECTORY
 
 set(DATA_INIT_FILE "${MKW_GENERATED_DIR}/data_sections_init.cpp")
 set(DATA_INIT_BLOB_ASM "${MKW_GENERATED_DIR}/data_sections_init_blobs.S")
-if(MKW_PLATFORM_ANDROID AND EXISTS "${DATA_INIT_BLOB_ASM}")
+if((MKW_PLATFORM_ANDROID OR MKW_PLATFORM_LINUX) AND EXISTS "${DATA_INIT_BLOB_ASM}")
     # The Windows installer generates the blob assembly for PE/COFF. The payload
     # is byte-identical on every platform (the .S only wraps .incbin
     # directives), so rewrite the section syntax for ELF here rather than
@@ -22,9 +22,20 @@ if(MKW_PLATFORM_ANDROID AND EXISTS "${DATA_INIT_BLOB_ASM}")
     file(READ "${DATA_INIT_BLOB_ASM}" MKW_ANDROID_BLOB_ASM_TEXT)
     string(REPLACE ".section .rdata,\"dr\"" ".section .rodata,\"a\",@progbits"
         MKW_ANDROID_BLOB_ASM_ELF "${MKW_ANDROID_BLOB_ASM_TEXT}")
+    # The .incbin paths are absolute where the translation was made; point them at this tree.
+    if(MKW_PLATFORM_LINUX)
+        get_filename_component(MKW_BLOB_DIR_REAL "${MKW_GENERATED_DIR}" REALPATH)
+        string(REGEX REPLACE "\\.incbin \"[^\"]*/data_sections_init_blobs/"
+            ".incbin \"${MKW_BLOB_DIR_REAL}/data_sections_init_blobs/"
+            MKW_ANDROID_BLOB_ASM_ELF "${MKW_ANDROID_BLOB_ASM_ELF}")
+    endif()
     if(NOT MKW_ANDROID_BLOB_ASM_ELF STREQUAL MKW_ANDROID_BLOB_ASM_TEXT)
         string(APPEND MKW_ANDROID_BLOB_ASM_ELF "\n.section .note.GNU-stack,\"\",@progbits\n")
-        set(DATA_INIT_BLOB_ASM "${CMAKE_CURRENT_BINARY_DIR}/data_sections_init_blobs_android.S")
+        if(MKW_PLATFORM_LINUX)
+            set(DATA_INIT_BLOB_ASM "${CMAKE_CURRENT_BINARY_DIR}/data_sections_init_blobs_elf.S")
+        else()
+            set(DATA_INIT_BLOB_ASM "${CMAKE_CURRENT_BINARY_DIR}/data_sections_init_blobs_android.S")
+        endif()
         file(WRITE "${DATA_INIT_BLOB_ASM}" "${MKW_ANDROID_BLOB_ASM_ELF}")
         message(STATUS "Rewrote the PE/COFF blob assembly for ELF: ${DATA_INIT_BLOB_ASM}")
     endif()
@@ -387,6 +398,9 @@ if(MKW_PLATFORM_ANDROID)
     set_target_properties(WiiCompiled PROPERTIES OUTPUT_NAME main)
 else()
     add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})
+    if(MKW_PLATFORM_LINUX)
+        set_target_properties(WiiCompiled PROPERTIES OUTPUT_NAME kartframe)
+    endif()
 endif()
 mkw_configure_product(WiiCompiled)
 target_precompile_headers(WiiCompiled PRIVATE
