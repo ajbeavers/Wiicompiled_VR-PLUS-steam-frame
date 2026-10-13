@@ -6,8 +6,8 @@
 
 A session is the game's log (the runtime log, holding the "vr pacing:" lines) and, when present,
 the vrtiming.log of the same session (SteamVR's compositor timing, one line a second, written by
-frame/tools/vrtiming.py; its format is documented there). In a folder the game's log is the newest
-*.log that is not vrtiming.log. Several sessions are columns of the same table, so a baseline and
+frame/tools/vrtiming.py; its format is documented there). In a folder (a frame/kartframe.sh session
+folder) the game's log is the *.log other than vrtiming.log with the most pacing lines. Several sessions are columns of the same table, so a baseline and
 a later run line up; a mock run (frame/tools/mockrun.sh) has no vrtiming.log.
 
 The game's numbers come from the line it logs every second (runtime/include/vr/openxr_diagnostics.h
@@ -35,11 +35,16 @@ def parse_game_log(path):
     r = {"name": os.path.basename(path), "seconds": 0, "t_last": 0.0, "hz": None, "modes": set(), "ticks": 0, "rendered": 0,
          "interp": 0, "late": 0, "missed": 0, "repeats": 0, "g50": [], "g99": [], "e50": [], "e99": [],
          "totals": None, "half": 0, "full": 0, "hitch": 0, "hitch_notes": [], "refresh_note": None,
-         "worst_late": (0, 0), "race": None}
+         "worst_late": (0, 0), "race": None, "in_race": False,
+         "parts": {k: {"seconds": 0, "rendered": 0, "late": 0, "ticks": 0, "g50": [], "g99": [], "e50": []} for k in ("menus", "race")}}
     with open(path, errors="replace") as f:
         for line in f:
-            if "entered RaceScene" in line and r["race"] is None:
-                r["race"] = r["t_last"]
+            if "entered RaceScene" in line:
+                r["in_race"] = True
+                if r["race"] is None:
+                    r["race"] = r["t_last"]
+            elif "exited RaceScene" in line:
+                r["in_race"] = False
             m = PACING.search(line)
             if m:
                 d = m.groupdict()
@@ -57,6 +62,12 @@ def parse_game_log(path):
                     r["worst_late"] = (int(d["late"]), due)
                 for k in ("g50", "g99", "e50", "e99"):
                     r[k].append(float(d[k]))
+                part = r["parts"]["race" if r["in_race"] else "menus"]
+                part["seconds"] += 1
+                for k in ("rendered", "late", "ticks"):
+                    part[k] += int(d[k])
+                for k in ("g50", "g99", "e50"):
+                    part[k].append(float(d[k]))
                 worst = max(float(d["g99"]), float(d["e99"]))
                 if worst > HITCH_MS:
                     r["hitch"] += 1
@@ -155,6 +166,15 @@ def build(sessions):
     add("encode ms p50 / p99 (session)", lambda g, v: "%s / %s" % (tot(g, "e50"), tot(g, "e99")) if tot(g, "e50") else
         "%s / %s" % (fmt(median(g["e50"]), "%.2f"), fmt(max(g["e99"]) if g["e99"] else None, "%.2f")) if g else "-")
     add("first race at (s)", lambda g, v: fmt(g["race"], "%.0f") if g else "-")
+    for name in ("menus", "race"):
+        def part(g, name=name):
+            return g["parts"][name]
+        add("%s: seconds, sets shown / s, late" % name, lambda g, v, part=part: "%d, %s, %s" % (
+            part(g)["seconds"], fmt(part(g)["rendered"] / part(g)["seconds"]) if part(g)["seconds"] else "-",
+            pct(part(g)["late"], part(g)["rendered"] + part(g)["late"])) if g else "-")
+        add("%s: GPU ms p50 (median s) / p99 (worst s), encode p50" % name, lambda g, v, part=part: "%s / %s, %s" % (
+            fmt(median(part(g)["g50"]), "%.2f"), fmt(max(part(g)["g99"]) if part(g)["g99"] else None, "%.2f"),
+            fmt(median(part(g)["e50"]), "%.2f")) if g else "-")
     add("compositor seconds logged", lambda g, v: str(v["seconds"]) if v else "no vrtiming.log")
     add("compositor frames", lambda g, v: str(v["frames"]) if v else "-")
     add("  app frames reused", lambda g, v: "%d (%s)" % (v["reused"], pct(v["reused"], v["frames"])) if v else "-")
@@ -168,8 +188,13 @@ def build(sessions):
 
 
 def game_log_in(d):
+    """The session's log holding the pacing lines (game.log or stdout.log in a wrapper session)."""
     logs = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".log") and not f.startswith("vrtiming")]
-    return max(logs, key=os.path.getmtime) if logs else None
+
+    def pacing_lines(path):
+        with open(path, errors="replace") as f:
+            return sum(1 for line in f if "vr pacing" in line)
+    return max(logs, key=lambda p: (pacing_lines(p), os.path.getmtime(p))) if logs else None
 
 
 def main(argv):
