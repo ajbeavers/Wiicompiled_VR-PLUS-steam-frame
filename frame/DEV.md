@@ -71,3 +71,13 @@ MOCK_XR_DUMP_AT seconds); mockrun seeds welcome/tutorial done so the demo race s
 (KF_MOCKRUN_INTRO=1 shows them). KARTFRAME_FPSLOG=1 logs the game frame rate every 5 s;
 KARTFRAME_SYNC_WINDOW=1 restores aurora's per-frame SDL_SyncWindow (10 ms a game frame on X11);
 KARTFRAME_HUD_CLIP=0 stops clipping the race's 2D layer to the frame and the game's scissor.
+
+## Lane G switches
+KARTFRAME_SCENE_CLOCK=0 restores the old interpolation rule (scene sampled at the display time;
+with pipelined pacing that pinned the weight to the newest frame). KARTFRAME_END_TIME=cycle ends
+layers at the cycle's predicted time instead of their poses' locate time. KARTFRAME_MENU_ENV=over
+puts the menu environment layer (controllers, lasers) over the screen quad; =0 turns it off.
+KARTFRAME_FRAME_STAMP=1 (tests) stamps each eye image with its locate time. Mock: MOCK_XR_STAMP,
+MOCK_XR_PREDICT_JITTER, MOCK_XR_FOV (default Frame-like asymmetric), MOCK_XR_HANDS, MOCK_XR_PRESS
+(scripted presses; frame/perf/hudrace.sh drives a real Grand Prix race). Log lines: "vr display
+times" and "VR interpolation weights" every 10 s, eye fields of view once. Details in frame/perf/H2.md.
