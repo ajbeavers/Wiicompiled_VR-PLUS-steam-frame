@@ -22,7 +22,9 @@ for kv in "$@"; do export "$kv"; done
 export KF_MOCKRUN_HOME=$HOMEDIR KARTFRAME_PACING_SAMPLES=$D/samples.txt KARTFRAME_FPSLOG=${KARTFRAME_FPSLOG:-1}
 printf '%s\n' "$@" > "$D/env.txt"
 EXE=${KF_BUILD:-$(cd "$HERE/../.." && pwd)/build-linux}/kartframe
-busy() { pgrep -af 'SteamLaunch|lepton|waydroid|(^|[ /])kartframe( |$)' | grep -Ev 'pgrep|mockrun|perf/run.sh' ; }
+# A game process (the binary itself, a Steam launch, Lepton/Waydroid), not a shell whose command line
+# merely mentions one (an agent's "kfbuild.sh . kartframe" kept this waiting forever).
+busy() { pgrep -x kartframe || pgrep -f '^[^ ]*reaper SteamLaunch' || pgrep -x waydroid || pgrep -f '^/bin/bash [^ ]*/lepton '; }
 exec 9>"$HOME/Games/KartFrame/.build.lock"
 while :; do
   while busy >/dev/null; do echo "perf: $NAME: a game is running, retrying in 5 min"; sleep 300; done
