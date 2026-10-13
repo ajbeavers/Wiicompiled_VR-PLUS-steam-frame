@@ -235,6 +235,45 @@ unmodified, with their license texts, in the installer's `licenses/` folder.
 
 ---
 
+## Native Linux Arm64 build for the Steam Frame (KartFrame)
+
+The KartFrame release tarball carries a kit, a toolchain and a translator so that the game can be
+built on the user's own Steam Frame from the user's own disc. Pins and the build of each are in
+`frame/SETUP.md`; license texts for the kit are in the kit's `licenses/` folder.
+
+| Component | Version | License | Upstream |
+| --- | --- | --- | --- |
+| LLVM clang, lld, llvm-ar, llvm-ranlib (portable toolchain, linux-aarch64) | 22.1.8 | Apache-2.0 WITH LLVM-exception | <https://github.com/llvm/llvm-project> |
+| CMake (portable toolchain) | 4.3.3 | BSD-3-Clause | <https://cmake.org/> |
+| Ninja (portable toolchain) | 1.13.2 | Apache-2.0 | <https://ninja-build.org/> |
+| .NET 8 runtime (inside the self-contained `Translator.Cli`) | 8.0 | MIT | <https://github.com/dotnet/runtime> |
+| YamlDotNet (inside `Translator.Cli`) | as pinned by the translator | MIT | <https://github.com/aaubry/YamlDotNet> |
+| nodtool (disc image extraction, fetched on the user's machine at setup, not redistributed) | v2.0.0-alpha.10 | MIT OR Apache-2.0 | <https://github.com/encounter/nod> |
+| Dawn and Tint, SDL3, OpenXR-SDK with its loader, abseil, zlib, libpng, FreeType, Dear ImGui, {fmt}, Zstandard, SQLite, Tracy (prebuilt static in the kit) | as listed above | as listed above | as listed above |
+
+The kit also carries a minimal sysroot made unmodified from the packages of the Frame it was built
+on, used only to compile and link the user's game against, with their license texts in the kit
+(`sysroot/LICENSES`):
+
+| Component | License | Upstream |
+| --- | --- | --- |
+| glibc headers, crt objects, link-time copies of `libc`, `libm` and the dynamic loader | LGPL-2.1-or-later | <https://www.gnu.org/software/libc/> |
+| GCC runtime: libstdc++ headers and library, `libgcc`, `libgcc_eh`, `libgcc_s`, `crtbegin` and `crtend` objects | GPL-3.0-or-later WITH GCC-exception (Runtime Library Exception) | <https://gcc.gnu.org/> |
+| Linux kernel API headers | GPL-2.0 WITH Linux-syscall-note | <https://www.kernel.org/> |
+
+The built game links the user's own glibc, libstdc++ and libgcc_s dynamically. Complete corresponding
+source for the glibc and GCC parts is available from the upstream projects at the versions recorded
+in `sysroot/LICENSES`, and this project will supply it on request for the exact version shipped.
+
+Test tools in `frame/tools` (`xrmock`, `xrprobe`) are not part of the game. `xrprobe` is GPLv3
+(`frame/tools/xrprobe/LICENSE`). The release tarball carries only `vrtiming.py` and `session-report.py`.
+
+Valve's Steam Frame controller models are read from the user's own SteamVR install at install time,
+simplified and written to the user's data folder. They are never copied into the repository or a
+release.
+
+---
+
 ## Development-only dependencies
 
 Not redistributed in any release artifact.
