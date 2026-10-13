@@ -126,16 +126,21 @@ fi
 
 # Not exec: the wrapper stays to stop the logger and write the report. A signal for the wrapper
 # (Steam stopping the app) goes on to the game.
+# The headset is in use: development builds and headless GPU runs on this machine wait while this
+# file exists (KartFrame's build script does; other projects can check the same file).
+HEADSET_MARK=${XDG_CACHE_HOME:-$HOME/.cache}/headset-in-use
 log "starting $EXE"
 touch "$SESSION/.start"
 "$EXE" "$@" > "$SESSION/stdout.log" 2>&1 &
 GAME_PID=$!
+echo "kartframe $GAME_PID" > "$HEADSET_MARK" 2> /dev/null
 trap 'kill -TERM "$GAME_PID" 2> /dev/null' TERM INT HUP
 rc=0
 while kill -0 "$GAME_PID" 2> /dev/null; do
     wait "$GAME_PID"; rc=$?
 done
 trap - TERM INT HUP
+rm -f "$HEADSET_MARK"
 log "game exited with status $rc"
 [ -n "$VRT_PID" ] && { kill "$VRT_PID" 2> /dev/null; wait "$VRT_PID" 2> /dev/null; }
 
