@@ -137,8 +137,11 @@ echo "kartframe $GAME_PID" > "$HEADSET_MARK" 2> /dev/null
 # KARTFRAME_RECORD=raw records both panels as scanned out (framecorder; about 1.6 ms of GPU a frame)
 # into the session folder, for questions the logs cannot settle (per-eye ghosting, flicker).
 REC_PID=
-if [ -n "$KARTFRAME_RECORD" ] && command -v framecorder > /dev/null; then
-    ( sleep 8; exec framecorder --view "${KARTFRAME_RECORD}" --fps "${KARTFRAME_RECORD_FPS:-120}" --qp 18 "$SESSION/panels.mkv" ) \
+# Steam starts games with a short PATH (no ~/.local/bin), so look for the recorder by its full path too.
+FRAMECORDER=$(command -v framecorder 2> /dev/null || ls "$HOME/.local/bin/framecorder" 2> /dev/null)
+if [ -n "$KARTFRAME_RECORD" ] && [ -z "$FRAMECORDER" ]; then log "RECORDING NOT POSSIBLE: framecorder not found"; fi
+if [ -n "$KARTFRAME_RECORD" ] && [ -n "$FRAMECORDER" ]; then
+    ( sleep 8; exec "$FRAMECORDER" --view "${KARTFRAME_RECORD}" --fps "${KARTFRAME_RECORD_FPS:-120}" --qp 18 "$SESSION/panels.mkv" ) \
         > "$SESSION/framecorder.log" 2>&1 &
     REC_PID=$!
     log "recording the panels (framecorder --view $KARTFRAME_RECORD) into panels.mkv"
