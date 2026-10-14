@@ -445,6 +445,7 @@ static int gPoseAge[6];  // display time minus locate time in refreshes: <0, 0, 
 static int gPoseSets = 0, gPoseSameTime = 0, gPoseEarlier = 0, gPoseLater = 0, gPoseSplit = 0, gPoseUnknown = 0, gPoseNear = 0;
 static int checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh);
 static XrTime locateTime(int i);
+static int posedBy(const XrCompositionLayerProjection* p, XrTime t);
 static void locateInfo(int i, int* frame, double* callMs);
 // lane O: the types in a next chain, for the detail trace.
 static void nextTypes(const void* next, char* out, size_t n) {
@@ -1488,7 +1489,7 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
             int freshPose = gStampFresh && fresh && p->viewCount == 2 && p->views[0].subImage.swapchain != p->views[1].subImage.swapchain;
             if (freshPose) {
                 gFreshPoseLayers++;
-                if (located < 0 || locateTime(located) != ei->displayTime) {
+                if (located < 0 || (locateTime(located) != ei->displayTime && !posedBy(p, ei->displayTime))) {
                     gFreshPoseBad++;
                     if (gFreshPoseBad <= 20)
                         trace("ERROR fresh-pose layer's poses are not a locate for its display time (%s)", located < 0 ? "no locate" : "another time");
@@ -1662,11 +1663,19 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
 }
 
 static XrTime locateTime(int i) { return gLocates[i].time; }
+static int samePose(const XrPosef* a, const XrPosef* b) { return !memcmp(a, b, sizeof(XrPosef)); }
+// Lane R: a locate for time t gave both eyes of the layer exactly (checkPoses picks one of several locates
+// with equal poses, as at the sway's turning points, where two nearby times can give the same floats).
+static int posedBy(const XrCompositionLayerProjection* p, XrTime t) {
+    for (int i = 0; i < LOCATES; i++)
+        if (gLocates[i].time == t && samePose(&gLocates[i].pose[0], &p->views[0].pose) && samePose(&gLocates[i].pose[1], &p->views[1].pose))
+            return 1;
+    return 0;
+}
 static void locateInfo(int i, int* frame, double* callMs) {
     *frame = gLocates[i].frame;
     *callMs = gLocates[i].callMs;
 }
-static int samePose(const XrPosef* a, const XrPosef* b) { return !memcmp(a, b, sizeof(XrPosef)); }
 // Largest component difference of two poses (metres, quaternion units).
 static double poseDiff(const XrPosef* a, const XrPosef* b) {
     const float d[7] = {a->position.x - b->position.x, a->position.y - b->position.y, a->position.z - b->position.z,
