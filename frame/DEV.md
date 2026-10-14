@@ -148,3 +148,10 @@ written, the frustum, draws filled from another packet; same=1 when the eyes agr
 (10 s)" and "VR eye uniform probe (10 s)" summaries (KARTFRAME_UNIFORM_PROBE=1 for the probe alone);
 the stamp is a 64x15 one-pixel-per-bit block; the mock reads back and decodes before its xrWaitFrame
 sleep so end-after-wake-up is not inflated. In the mock both eyes always used the same packet and pose.
+
+## Lane Q switches
+KARTFRAME_RACE_QUAD=1|cycle|0 (default 1: a transparent 16x16 quad listed after every projection-only
+layer; cycle also acquires and releases one of its images every frame), KARTFRAME_FIRST_WRITE_BARRIER=
+all|dawn (default all: GalaxyFrame's ALL_COMMANDS / MEMORY_WRITE to MEMORY_READ|WRITE barrier on every
+image of a set before its writes, submitted by the bridge). XRF lines end in n=<layers>; xrmock prints
+"layer lists per xrEndFrame". Plan: frame/perf/session-h11/README.md.
