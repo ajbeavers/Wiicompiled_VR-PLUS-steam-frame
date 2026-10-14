@@ -1150,7 +1150,8 @@ static int checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime,
             if (samePose(&gLocates[i].pose[1], &p->views[1].pose)) both = i;
         }
     }
-    if (both < 0 && left < 0) {
+    if (both < 0) {
+        // Recomposed poses (fixed eye offsets) can match one eye exactly and the other only to rounding.
         int nl = nearestLocate(&p->views[0].pose, 0), nr = nearestLocate(&p->views[1].pose, 1);
         if (nl >= 0 && nl == nr) {
             both = nl;
