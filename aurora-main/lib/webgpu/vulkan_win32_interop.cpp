@@ -23,6 +23,7 @@ int AuroraDawnVulkanDrain(void* handle);
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -37,7 +38,25 @@ Module Log("aurora::vulkan_win32");
 // and compares it with the locate the layer's poses came from. Layout, 4x4 pixel cells, white = 1:
 // row 0 the 64 bits of the display time (steady clock ns, bit 0 first), row 1 their complement,
 // row 2: cell 0 the eye (1 = right), cell 1 its complement, cells 2-5 the marker 1 0 1 0.
+// Lane L, the scene state this eye's draws used (stereo::EyeScene), rows 3 and 5 two 64-bit words, rows 4
+// and 6 their complements (the block is 256x28 pixels):
+// row 3: bits 0-15 weight x 65535, 16-31 previous game frame (low 16 bits), 32-47 current game frame,
+//        48 valid, 49 late (filled at the set's sample time), 50 anchored, 51 continuous, 56-63 set (low 8);
+// row 5: perspective draws filled from the pair (bits 0-15), filled current-only (16-31), drawn with the
+//        recorded uniform (32-47), drawn with a range outside this set's fill (48-63).
 constexpr uint32_t kStampCell = 4;
+constexpr uint32_t kStampRows = 7;
+std::array<uint64_t, 2> SceneWords(const stereo::EyeScene& scene) {
+  if (!scene.valid) return {0, 0};
+  const uint64_t weight = static_cast<uint64_t>(std::lround(std::clamp(scene.weight, 0.f, 1.f) * 65535.f));
+  const uint64_t a = weight | (static_cast<uint64_t>(scene.previousFrame & 0xffffu) << 16) |
+                     (static_cast<uint64_t>(scene.currentFrame & 0xffffu) << 32) | (1ull << 48) |
+                     (scene.late ? 1ull << 49 : 0) | (scene.anchored ? 1ull << 50 : 0) |
+                     (scene.continuous ? 1ull << 51 : 0) | (static_cast<uint64_t>(scene.set & 0xffu) << 56);
+  const uint64_t b = static_cast<uint64_t>(scene.interpolated) | (static_cast<uint64_t>(scene.current) << 16) |
+                     (static_cast<uint64_t>(scene.recorded) << 32) | (static_cast<uint64_t>(scene.outside) << 48);
+  return {a, b};
+}
 bool StampEnabled() {
   static const bool enabled = [] {
     const char* env = std::getenv("KARTFRAME_FRAME_STAMP");
@@ -45,41 +64,36 @@ bool StampEnabled() {
   }();
   return enabled;
 }
-// A 2x1 cell texture: black, then white.
-wgpu::Texture StampPalette(wgpu::TextureFormat format) {
-  static wgpu::Texture palette;
-  static wgpu::TextureFormat paletteFormat = wgpu::TextureFormat::Undefined;
-  if (palette && paletteFormat == format) return palette;
-  const wgpu::Extent3D size{2 * kStampCell, kStampCell, 1};
-  const wgpu::TextureDescriptor descriptor{.label = "Frame stamp palette",
-                                           .usage = wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst,
-                                           .dimension = wgpu::TextureDimension::e2D,
-                                           .size = size,
-                                           .format = format,
-                                           .mipLevelCount = 1,
-                                           .sampleCount = 1};
-  palette = webgpu::g_device.CreateTexture(&descriptor);
-  paletteFormat = format;
-  std::array<uint8_t, 2 * kStampCell * kStampCell * 4> pixels{};
-  for (uint32_t y = 0; y < kStampCell; ++y)
-    for (uint32_t x = 0; x < 2 * kStampCell; ++x)
-      for (uint32_t c = 0; c < 4; ++c) pixels[(y * 2 * kStampCell + x) * 4 + c] = x >= kStampCell || c == 3 ? 255 : 0;
-  const wgpu::TexelCopyTextureInfo destination{.texture = palette};
-  const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = 2 * kStampCell * 4, .rowsPerImage = kStampCell};
-  webgpu::g_queue.WriteTexture(&destination, pixels.data(), pixels.size(), &layout, &size);
-  return palette;
-}
+// The whole block is built on the CPU and written into a small texture per eye (queue.WriteTexture runs
+// before this set's submission and after the last one's, so reusing it per eye is safe), then copied into
+// the eye image with one copy (the 4x4 cell copies of the first version were 400 commands a set).
 void WriteStamp(wgpu::CommandEncoder& encoder, const wgpu::Texture& target, wgpu::TextureFormat format, uint64_t value,
-                uint32_t eye) {
-  const auto palette = StampPalette(format);
+                uint32_t eye, const stereo::EyeScene& scene) {
+  constexpr uint32_t kWidth = 64 * kStampCell, kHeight = kStampRows * kStampCell;
+  static std::array<wgpu::Texture, 2> blocks;
+  static std::array<wgpu::TextureFormat, 2> blockFormats{};
+  const uint32_t slot = eye == 1 ? 1 : 0;
+  const wgpu::Extent3D size{kWidth, kHeight, 1};
+  if (!blocks[slot] || blockFormats[slot] != format) {
+    const wgpu::TextureDescriptor descriptor{.label = "Frame stamp block",
+                                             .usage = wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst,
+                                             .dimension = wgpu::TextureDimension::e2D,
+                                             .size = size,
+                                             .format = format,
+                                             .mipLevelCount = 1,
+                                             .sampleCount = 1};
+    blocks[slot] = webgpu::g_device.CreateTexture(&descriptor);
+    blockFormats[slot] = format;
+  }
+  static std::vector<uint8_t> pixels;
+  pixels.assign(static_cast<size_t>(kWidth) * kHeight * 4, 0);
   const auto cell = [&](uint32_t column, uint32_t row, bool one) {
-    wgpu::TexelCopyTextureInfo source, destination;
-    source.texture = palette;
-    source.origin = {one ? kStampCell : 0u, 0, 0};
-    destination.texture = target;
-    destination.origin = {column * kStampCell, row * kStampCell, 0};
-    const wgpu::Extent3D size{kStampCell, kStampCell, 1};
-    encoder.CopyTextureToTexture(&source, &destination, &size);
+    for (uint32_t y = 0; y < kStampCell; ++y)
+      for (uint32_t x = 0; x < kStampCell; ++x) {
+        auto* p = &pixels[((row * kStampCell + y) * kWidth + column * kStampCell + x) * 4];
+        p[0] = p[1] = p[2] = one ? 255 : 0;
+        p[3] = 255;
+      }
   };
   for (uint32_t bit = 0; bit < 64; ++bit) {
     const bool one = ((value >> bit) & 1u) != 0;
@@ -89,6 +103,19 @@ void WriteStamp(wgpu::CommandEncoder& encoder, const wgpu::Texture& target, wgpu
   cell(0, 2, eye == 1);
   cell(1, 2, eye != 1);
   for (uint32_t k = 0; k < 4; ++k) cell(2 + k, 2, (k & 1u) == 0);
+  const auto words = SceneWords(scene);
+  for (uint32_t word = 0; word < 2; ++word) {
+    for (uint32_t bit = 0; bit < 64; ++bit) {
+      const bool one = ((words[word] >> bit) & 1u) != 0;
+      cell(bit, 3 + 2 * word, one);
+      cell(bit, 4 + 2 * word, !one);
+    }
+  }
+  const wgpu::TexelCopyTextureInfo block{.texture = blocks[slot]};
+  const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = kWidth * 4, .rowsPerImage = kHeight};
+  webgpu::g_queue.WriteTexture(&block, pixels.data(), pixels.size(), &layout, &size);
+  const wgpu::TexelCopyTextureInfo destination{.texture = target};
+  encoder.CopyTextureToTexture(&block, &destination, &size);
 }
 // Set on the frame worker around the submitted callback (see aurora_vulkan_win32_submitting_retained).
 thread_local bool submittingRetained = false;
@@ -344,8 +371,8 @@ public:
       }
       if (StampEnabled() && frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && i < count && count == 2 &&
           targets[i].width >= 64 * kStampCell &&
-          targets[i].height >= 3 * kStampCell)
-        WriteStamp(encoder, active[i], active[i].GetFormat(), frame.displayTimeNanos, i);
+          targets[i].height >= kStampRows * kStampCell)
+        WriteStamp(encoder, active[i], active[i].GetFormat(), frame.displayTimeNanos, i, frame.scene[i]);
     }
     encoded = true;
     return true;

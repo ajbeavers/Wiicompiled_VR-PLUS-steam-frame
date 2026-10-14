@@ -1168,6 +1168,39 @@ struct PendingStereoSink {
   void* userdata = nullptr;
 };
 
+// Lane L: the scene state each eye of this set used (gfx::EyeSceneRecord), into the sink frame (the
+// frame stamp) and, with KARTFRAME_FRAME_LOG=1, one line per set:
+// XRS t=<display time, steady ms> s=<set> f=<previous>/<current game frame> w=<weight> late=<0 seal fill, 1
+// sample-time fill> L=<interpolated>/<current>/<recorded>/<outside> R=<same> (perspective draws: filled from the
+// pair, filled current-only, drawn with the recorded uniform, drawn with a range outside this set's fill).
+void take_eye_scene(stereo::SinkFrame& frame) noexcept {
+  static uint32_t sets = 0;
+  auto& record = gfx::eye_scene_record();
+  if (frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && record.valid) {
+    ++sets;
+    for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT && eye < 2; ++eye) {
+      frame.scene[eye] = {.valid = true, .late = record.late, .anchored = record.anchored,
+                          .continuous = record.continuous, .weight = record.weight,
+                          .previousFrame = record.previousFrame, .currentFrame = record.currentFrame, .set = sets,
+                          .interpolated = record.interpolated[eye], .current = record.current[eye],
+                          .recorded = record.recorded[eye], .outside = record.outside[eye]};
+    }
+    static const bool logSets = [] {
+      const char* env = std::getenv("KARTFRAME_FRAME_LOG");
+      return env != nullptr && env[0] == '1';
+    }();
+    if (logSets) {
+      const auto& l = frame.scene[0];
+      const auto& r = frame.scene[1];
+      Log.info("XRS t={:.3f} s={} f={}/{} w={:.4f} late={} L={}/{}/{}/{} R={}/{}/{}/{}",
+               static_cast<double>(frame.displayTimeNanos) / 1e6, sets, l.previousFrame, l.currentFrame, l.weight,
+               l.late ? 1 : 0, l.interpolated, l.current, l.recorded, l.outside, r.interpolated, r.current, r.recorded,
+               r.outside);
+    }
+  }
+  record = {};
+}
+
 std::optional<PendingStereoSink> run_stereo_sink(wgpu::CommandEncoder& encoder, uint64_t frameToken,
                                                  uint32_t logicalFrame, AuroraStereoFrameMode mode,
                                                  bool retained = false, uint64_t displayTimeNanos = 0) noexcept {
@@ -1187,6 +1220,7 @@ std::optional<PendingStereoSink> run_stereo_sink(wgpu::CommandEncoder& encoder, 
       .retained = retained,
       .displayTimeNanos = displayTimeNanos,
   };
+  take_eye_scene(frame);
   const int orientation = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY ? webgpu::g_RaceOutputCopyMode : 0;
   const bool correction = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && webgpu::g_RaceOutputNeedsCopy;
   const auto directEyes = std::exchange(g_directEyes, {});
@@ -2254,6 +2288,7 @@ struct RetainedStereoContext {
   StereoSceneAnchor anchor;
   StereoSceneAnchor previousAnchor;
   bool continuous = false;
+  uint32_t previousLogicalFrame = 0;  // the game frame before logicalFrame (lane L's scene stamp)
 } g_retainedStereo;
 
 gfx::StereoReplayFrame interpolated_stereo_frame(const AuroraStereoFrame& input, float& weight) {
@@ -2275,6 +2310,14 @@ gfx::StereoReplayFrame interpolated_stereo_frame(const AuroraStereoFrame& input,
     std::memcpy(&replay.currentAnchor, retained.anchor.anchorFromScene.data(), sizeof(replay.currentAnchor));
   }
   return replay;
+}
+
+// The game frames of the transform pair the last fill used (lane L's scene stamp).
+void note_scene_frames() noexcept {
+  auto& scene = gfx::eye_scene_record();
+  scene.continuous = g_retainedStereo.continuous;
+  scene.currentFrame = g_retainedStereo.logicalFrame;
+  scene.previousFrame = g_retainedStereo.continuous ? g_retainedStereo.previousLogicalFrame : g_retainedStereo.logicalFrame;
 }
 
 void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
@@ -2351,6 +2394,7 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
     gfx::gpu_timing_end_frame(encoder);  // closes the slot; nothing was recorded on the GPU
     return;
   }
+  note_scene_frames();
   if (g_directEyesCalibration.choose() == 1 && !use_direct_eye_targets(replay, *input)) {
     g_directEyesCalibration.not_applied();  // a trial set that could not go straight in: not a sample
   }
@@ -2464,9 +2508,10 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx, u
                           ctx.scheduleBaseNanos - g_retainedStereo.boundary <= ctx.scheduleIntervalNanos * 3 / 2 &&
                           g_retainedStereo.anchor.active == sceneAnchor.active;
   const auto previousAnchor = g_retainedStereo.anchor;
+  const auto previousLogicalFrame = g_retainedStereo.logicalFrame;
   g_retainedStereo = {contentTag,       ctx.scheduleBaseNanos, ctx.scheduleIntervalNanos,
                       ctx.logicalFrame, sceneAnchor,           previousAnchor,
-                      continuous};
+                      continuous,       previousLogicalFrame};
   gfx::expire_bind_group_cache();
 }
 
@@ -2613,7 +2658,9 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     if (ctx.retainStereo && ctx.stereoInput) {
       float weight;
       ctx.stereoReplay = interpolated_stereo_frame(*ctx.stereoInput, weight);
-      gfx::prepare_late_stereo_replay(sealedFrame, encoder, *ctx.stereoReplay, weight);
+      if (gfx::prepare_late_stereo_replay(sealedFrame, encoder, *ctx.stereoReplay, weight)) note_scene_frames();
+    } else if (auto& scene = gfx::eye_scene_record(); scene.valid && !scene.late) {
+      scene.currentFrame = scene.previousFrame = ctx.logicalFrame;  // filled at the seal: current transforms
     }
     if (ctx.stereoInput && g_directEyesCalibration.decided() == 1) {
       use_direct_eye_targets(*ctx.stereoReplay, *ctx.stereoInput);

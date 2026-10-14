@@ -408,6 +408,175 @@ static struct {
 static int gStampPendingCount = 0;
 static int gStampChecked = 0, gStampMatch = 0, gStampOther = 0, gStampOtherEye = 0, gStampNone = 0, gStampLost = 0, gStampUnknownPose = 0;
 static int gStampOff[5];  // stamp minus locate in refreshes: <=-2, -1, between, +1, >=+2
+// Lane L: the scene words (the scene state each eye's draws used) of every fresh projection layer's eye
+// images, reported at the end (sceneReport): eyes of one set compared, weights per eye, scene steps.
+typedef struct {
+    uint64_t value, a, b;
+    int eye;
+} SceneRec;
+static SceneRec* gScene = NULL;
+static int gSceneN = 0, gSceneCap = 0, gSceneBroken = 0, gSceneAbsent = 0;
+static void sceneAdd(uint64_t value, int eye, int slot, unsigned gen) {
+    if (!gGfx->stamp_scene) return;
+    uint64_t a = 0, b = 0;
+    int r = gGfx->stamp_scene(slot, gen, &a, &b);
+    if (r < 0) {
+        gSceneBroken++;
+        trace("ERROR stamp: eye %d image's scene words are broken", eye);
+        gErrors++;
+        return;
+    }
+    if (r == 0) {
+        gSceneAbsent++;
+        return;
+    }
+    if (gSceneN == gSceneCap) {
+        gSceneCap = gSceneCap ? 2 * gSceneCap : 4096;
+        gScene = (SceneRec*)realloc(gScene, (size_t)gSceneCap * sizeof(SceneRec));
+    }
+    gScene[gSceneN++] = (SceneRec){value, a, b, eye};
+}
+static int sceneCmp(const void* x, const void* y) {
+    const SceneRec* p = (const SceneRec*)x;
+    const SceneRec* q = (const SceneRec*)y;
+    if (p->value != q->value) return p->value < q->value ? -1 : 1;
+    return p->eye - q->eye;
+}
+#define SC_VALID(a) (((a) >> 48) & 1)
+#define SC_LATE(a) (((a) >> 49) & 1)
+#define SC_W(a) ((double)((a) & 0xffff) / 65535.0)
+#define SC_PREV(a) ((unsigned)(((a) >> 16) & 0xffff))
+#define SC_CUR(a) ((unsigned)(((a) >> 32) & 0xffff))
+#define SC_N(b, k) ((unsigned)(((b) >> (16 * (k))) & 0xffff))
+static void sceneReport(void) {
+    if (!gStampOn) return;
+    if (!gSceneN) {
+        fprintf(stderr, "xrmock: scene stamps: none (%d without scene words, %d broken)\n", gSceneAbsent, gSceneBroken);
+        return;
+    }
+    qsort(gScene, (size_t)gSceneN, sizeof(SceneRec), sceneCmp);
+    // Eyes of one set (same display time): weight, game-frame pair, fill kind, draw counts.
+    int sets = 0, single = 0, diffW = 0, diffPair = 0, diffLate = 0, diffCounts = 0, diffAny = 0, invalid = 0;
+    int whist[2][11];
+    double draws[2][4];
+    int lateSets = 0, sealSets = 0;
+    memset(whist, 0, sizeof(whist));
+    memset(draws, 0, sizeof(draws));
+    // Scene position per set in display order (game frames): previous + weight x (current - previous).
+    double* pos = (double*)malloc((size_t)gSceneN * sizeof(double));
+    uint64_t* when = (uint64_t*)malloc((size_t)gSceneN * sizeof(uint64_t));
+    double* wt = (double*)malloc((size_t)gSceneN * sizeof(double));
+    int npos = 0;
+    long unwrap = 0;
+    unsigned lastCur = 0;
+    int haveCur = 0;
+    for (int i = 0; i < gSceneN;) {
+        int j = i;
+        while (j < gSceneN && gScene[j].value == gScene[i].value) j++;
+        const SceneRec* l = NULL;
+        const SceneRec* r = NULL;
+        for (int k = i; k < j; k++) {
+            if (gScene[k].eye == 0 && !l) l = &gScene[k];
+            if (gScene[k].eye == 1 && !r) r = &gScene[k];
+        }
+        i = j;
+        if (!l || !r) {
+            single++;
+            continue;
+        }
+        if (!SC_VALID(l->a) || !SC_VALID(r->a)) {
+            invalid++;
+            continue;
+        }
+        sets++;
+        const SceneRec* e[2] = {l, r};
+        for (int v = 0; v < 2; v++) {
+            double w = SC_W(e[v]->a);
+            whist[v][w >= 1.0 ? 10 : (int)(w * 10.0)]++;
+            for (int k = 0; k < 4; k++) draws[v][k] += SC_N(e[v]->b, k);
+        }
+        if (SC_LATE(l->a)) lateSets++;
+        else sealSets++;
+        int dw = (l->a & 0xffff) != (r->a & 0xffff);
+        int dp = SC_PREV(l->a) != SC_PREV(r->a) || SC_CUR(l->a) != SC_CUR(r->a);
+        int dl = SC_LATE(l->a) != SC_LATE(r->a);
+        int dc = l->b != r->b;
+        diffW += dw;
+        diffPair += dp;
+        diffLate += dl;
+        diffCounts += dc;
+        if (dw || dp || dl || dc) {
+            diffAny++;
+            if (diffAny <= 10)
+                trace("ERROR scene: eyes of the set for %.3f ms differ: L w=%.4f f=%u/%u n=%u/%u/%u/%u, R w=%.4f f=%u/%u n=%u/%u/%u/%u",
+                      (double)l->value / 1e6, SC_W(l->a), SC_PREV(l->a), SC_CUR(l->a), SC_N(l->b, 0), SC_N(l->b, 1), SC_N(l->b, 2),
+                      SC_N(l->b, 3), SC_W(r->a), SC_PREV(r->a), SC_CUR(r->a), SC_N(r->b, 0), SC_N(r->b, 1), SC_N(r->b, 2), SC_N(r->b, 3));
+            gErrors++;
+        }
+        // Left eye's scene position, game frames unwrapped from 16 bits.
+        unsigned cur = SC_CUR(l->a), prev = SC_PREV(l->a);
+        if (haveCur) unwrap += (long)(short)(unsigned short)(cur - lastCur);
+        else unwrap = cur;
+        lastCur = cur;
+        haveCur = 1;
+        long prevU = unwrap - (long)(unsigned short)(cur - prev);
+        pos[npos] = (double)prevU + SC_W(l->a) * (double)(unwrap - prevU);
+        when[npos] = l->value;
+        wt[npos] = SC_W(l->a);
+        npos++;
+    }
+    fprintf(stderr,
+            "xrmock: scene stamps: %d sets with both eyes (%d filled at the sample time, %d at the seal), %d without a scene (menus), %d one eye "
+            "only, %d without scene words, %d broken\n",
+            sets, lateSets, sealSets, invalid, single, gSceneAbsent, gSceneBroken);
+    fprintf(stderr, "xrmock: scene stamps: eyes of one set differ: %d (weight %d, game-frame pair %d, fill %d, draw counts %d)\n", diffAny, diffW,
+            diffPair, diffLate, diffCounts);
+    for (int v = 0; v < 2; v++) {
+        double filled = draws[v][0] + draws[v][1];
+        fprintf(stderr,
+                "xrmock: scene stamps %s eye: weight 0-.1 %d, .1-.2 %d, .2-.3 %d, .3-.4 %d, .4-.5 %d, .5-.6 %d, .6-.7 %d, .7-.8 %d, .8-.9 %d, "
+                ".9-1 %d, 1: %d; perspective draws a set %.1f: from the pair %.1f %%, current only %.1f %%, drawn with the recorded "
+                "uniform %.0f, with a range outside the set's fill %.0f\n",
+                v ? "right" : "left", whist[v][0], whist[v][1], whist[v][2], whist[v][3], whist[v][4], whist[v][5], whist[v][6], whist[v][7],
+                whist[v][8], whist[v][9], whist[v][10], sets ? filled / sets : 0.0, filled > 0 ? 100.0 * draws[v][0] / filled : 0.0,
+                filled > 0 ? 100.0 * draws[v][1] / filled : 0.0, draws[v][2], draws[v][3]);
+    }
+    // Scene steps between sets one refresh apart (game frames; 0.5 is even at 120 Hz with a 60 fps game).
+    int step[8], pairs = 0, alt = 0, altN = 0;
+    memset(step, 0, sizeof(step));
+    double sum = 0, sum2 = 0;
+    for (int k = 1; k < npos; k++) {
+        double refreshes = (double)(when[k] - when[k - 1]) / (double)gPeriod;
+        if (fabs(refreshes - 1.0) > 0.1) continue;
+        double d = pos[k] - pos[k - 1];
+        pairs++;
+        sum += d;
+        sum2 += d * d;
+        step[d < -0.05 ? 0 : d < 0.05 ? 1 : d < 0.35 ? 2 : d < 0.65 ? 3 : d < 0.95 ? 4 : d < 1.05 ? 5 : d < 1.5 ? 6 : 7]++;
+        if (k >= 2 && fabs((double)(when[k - 1] - when[k - 2]) / (double)gPeriod - 1.0) < 0.1) {
+            double d0 = pos[k - 1] - pos[k - 2];
+            altN++;
+            if (fabs(d - d0) >= 0.3) alt++;
+        }
+    }
+    double mean = pairs ? sum / pairs : 0, sd = pairs ? sqrt(fmax(0.0, sum2 / pairs - mean * mean)) : 0;
+    fprintf(stderr,
+            "xrmock: scene steps (game frames, sets one refresh apart): %d, mean %.3f, sd %.3f; back %d, 0: %d, 0.05-0.35 %d, 0.35-0.65 %d, "
+            "0.65-0.95 %d, 1: %d, 1.05-1.5 %d, more %d; consecutive steps differing by 0.3 or more %d of %d\n",
+            pairs, mean, sd, step[0], step[1], step[2], step[3], step[4], step[5], step[6], step[7], alt, altN);
+    // MOCK_XR_SCENE_DUMP=<file>: the left eye's sequence (display ns, weight, scene position) for plots.
+    const char* dump = getenv("MOCK_XR_SCENE_DUMP");
+    if (dump && *dump) {
+        FILE* f = fopen(dump, "w");
+        if (f) {
+            for (int k = 0; k < npos; k++) fprintf(f, "%llu %.5f %.5f\n", (unsigned long long)when[k], wt[k], pos[k]);
+            fclose(f);
+        }
+    }
+    free(pos);
+    free(when);
+    free(wt);
+}
 static void stampPoll(int wait) {
     for (int i = 0; i < gStampPendingCount;) {
         uint64_t value = 0;
@@ -423,7 +592,10 @@ static void stampPoll(int wait) {
         else {
             int64_t diff = (int64_t)value - (int64_t)(gStampPending[i].expect - gTimeOffset);
             int sameTime = diff > -200000 && diff < 200000;
-            if (sameTime && eye == gStampPending[i].eye) gStampMatch++;
+            if (sameTime && eye == gStampPending[i].eye) {
+                gStampMatch++;
+                if (gStampPending[i].fresh) sceneAdd(value, eye, gStampPending[i].slot, gStampPending[i].gen);
+            }
             else if (sameTime) {
                 gStampOtherEye++;
                 trace("ERROR stamp: eye %d image carries the other eye's stamp", gStampPending[i].eye);
@@ -857,6 +1029,7 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
                 "not read back, %d layers with poses from no locate\n",
                 gStampChecked, gStampMatch, gStampOther, gStampOff[0], gStampOff[1], gStampOff[2], gStampOff[3], gStampOff[4], gStampOtherEye,
                 gStampNone, gStampLost, gStampUnknownPose);
+        sceneReport();
     }
     if (gReleases) {
         fprintf(stderr, "xrmock: queue drain time at the releases: <0.5 ms %d, 0.5-1 %d, 1-2 %d, 2-4 %d, >4 %d\n", gWaitHist[0], gWaitHist[1], gWaitHist[2],
