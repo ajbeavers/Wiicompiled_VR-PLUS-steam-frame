@@ -62,6 +62,12 @@
 //   MOCK_XR_FOV=<l>,<r>,<u>,<d>  the left eye's field of view in degrees (the right eye mirrors it);
 //                             default the Frame's own, per eye (left -59.08,50.39,49.47,-60.00, right
 //                             -50.29,59.16,49.88,-59.55), "sym" the old symmetric +-48.1
+//   MOCK_XR_TRACE_DETAIL=1    (lane O) every trace line ends in "@<ms>" after the frame's scheduled wake-up,
+//                             and the trace adds: refSpace (type), locate (space, display time against
+//                             the frame's predicted one, in refreshes), waitImage (timeout), and per
+//                             xrEndFrame the blend mode, display time, and per layer its space, flags,
+//                             rects, array indices, next chain and the locate its poses came from (frame,
+//                             call time, refreshes before) -- the hand-over as a runtime sees it
 // Every xrEndFrame must carry the predictedDisplayTime of the xrWaitFrame its xrBeginFrame followed
 // (ERROR otherwise; summary line "end times").
 //   MOCK_XR_HANDS=1           controllers held in front of the player (left and right action
@@ -95,6 +101,8 @@
 #include "xrmock_gfx.h"
 
 static FILE* gTrace;
+static int gDetail;               // MOCK_XR_TRACE_DETAIL
+static int64_t gDetailWake;       // the scheduled wake-up of the current frame (CLOCK_MONOTONIC ns)
 static int gFrame = 0;
 static void trace(const char* fmt, ...) {
     if (!gTrace) return;
@@ -102,6 +110,11 @@ static void trace(const char* fmt, ...) {
     va_start(ap, fmt);
     fprintf(gTrace, "f%d ", gFrame);
     vfprintf(gTrace, fmt, ap);
+    if (gDetail) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(gTrace, " @%.2f", (double)((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec - gDetailWake) / 1e6);
+    }
     fputc('\n', gTrace);
     va_end(ap);
     fflush(gTrace);
@@ -250,11 +263,34 @@ static XrResult XRAPI_CALL mCreateSession(XrInstance i, const XrSessionCreateInf
 static XrResult XRAPI_CALL mDestroySession(XrSession s) { (void)s; return XR_SUCCESS; }
 static int gSpaces = 0;
 static int gSpaceView[256];  // the VIEW reference space (the head) follows the views (mLocateViews)
+static int gSpaceType[256];  // lane O: the reference space type (0: an action space)
+static void trace(const char* fmt, ...);
+// "s<id>:<type>" of a space handle, for the detail trace (VIEW 1, LOCAL 2, STAGE 3, action a).
+static const char* spaceName(XrSpace sp) {
+    static char b[4][24];
+    static int k = 0;
+    char* o = b[k++ & 3];
+    const int id = (int)((uintptr_t)sp - 100);
+    if (!sp) snprintf(o, 24, "null");
+    else if (id < 0 || id >= 256 || id >= gSpaces) snprintf(o, 24, "?%p", (void*)sp);
+    else if (gSpaceType[id] == 1) snprintf(o, 24, "s%d:VIEW", id);
+    else if (gSpaceType[id] == 2) snprintf(o, 24, "s%d:LOCAL", id);
+    else if (gSpaceType[id] == 3) snprintf(o, 24, "s%d:STAGE", id);
+    else if (gSpaceType[id]) snprintf(o, 24, "s%d:type%d", id, gSpaceType[id]);
+    else snprintf(o, 24, "s%d:action", id);
+    return o;
+}
 static XrResult XRAPI_CALL mCreateRefSpace(XrSession s, const XrReferenceSpaceCreateInfo* ci, XrSpace* out) {
     (void)s;
     int id = gSpaces++;
     if (id < 256) gSpaceView[id] = ci->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_VIEW;
+    if (id < 256) gSpaceType[id] = (int)ci->referenceSpaceType;
     *out = (XrSpace)(uintptr_t)(100 + id);
+    if (gDetail) {
+        const XrPosef* p = &ci->poseInReferenceSpace;
+        trace("refSpace %s pose=(%.3f %.3f %.3f | %.3f %.3f %.3f %.3f)", spaceName(*out), p->position.x, p->position.y, p->position.z,
+              p->orientation.x, p->orientation.y, p->orientation.z, p->orientation.w);
+    }
     return XR_SUCCESS;
 }
 // MOCK_XR_HANDS: which hand each action space belongs to (-1: none).
@@ -402,6 +438,17 @@ static int gPoseAge[6];  // display time minus locate time in refreshes: <0, 0, 
 static int gPoseSets = 0, gPoseSameTime = 0, gPoseEarlier = 0, gPoseLater = 0, gPoseSplit = 0, gPoseUnknown = 0, gPoseNear = 0;
 static int checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh);
 static XrTime locateTime(int i);
+static void locateInfo(int i, int* frame, double* callMs);
+// lane O: the types in a next chain, for the detail trace.
+static void nextTypes(const void* next, char* out, size_t n) {
+    out[0] = 0;
+    for (const XrBaseInStructure* x = (const XrBaseInStructure*)next; x; x = x->next) {
+        char t[24];
+        snprintf(t, sizeof(t), "%s%d", out[0] ? "," : "", (int)x->type);
+        if (strlen(out) + strlen(t) + 1 < n) strcat(out, t);
+    }
+    if (!out[0]) snprintf(out, n, "-");
+}
 // Frames by what they showed: a projection layer whose eye images were both released since
 // the last xrEndFrame (fresh), one shown again (repeat), none.
 static int gEnds = 0, gFreshSets = 0, gFreshSame = 0, gFreshEarlier = 0, gFreshLater = 0, gRepeatSets = 0, gQuadEnds = 0, gEmptyEnds = 0;
@@ -898,6 +945,10 @@ static XrResult XRAPI_CALL mWaitImage(XrSwapchain sc, const XrSwapchainImageWait
         return XR_ERROR_CALL_ORDER_INVALID;
     }
     c->waited++;
+    if (gDetail) {
+        if (wi && wi->timeout == XR_INFINITE_DURATION) trace("waitImage sc%d timeout=infinite", chainId(sc));
+        else trace("waitImage sc%d timeout=%.3fms", chainId(sc), wi ? (double)wi->timeout / 1e6 : -1.0);
+    }
     return XR_SUCCESS;
 }
 // MOCK_XR_DUMP (see the top): the image being released, written at the dump times.
@@ -1134,6 +1185,7 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
     }
     gFrame++;
     gLastWakeNs = nowNs();
+    gDetailWake = wake;
     trace("waitFrame");
     if (gStampOn && gGfx && gGfx->stamp_read) stampPoll(0);
     compResolve(0);
@@ -1161,6 +1213,8 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
     char buf[1024] = "";
     const XrCompositionLayerProjection* eyesLayer = NULL;
     int eyesLocated = -1;
+    int layerLocated[16];
+    for (int k = 0; k < 16; k++) layerLocated[k] = -1;
     for (uint32_t i = 0; i < ei->layerCount; i++) {
         const XrCompositionLayerBaseHeader* l = ei->layers[i];
         char t[256];
@@ -1173,6 +1227,7 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
                 else gRepeatSets++;
             }
             int located = checkPoses(p, ei->displayTime, fresh);
+            if (i < 16) layerLocated[i] = located;
             if (!eyesLayer && p->viewCount == 2 && p->views[0].subImage.swapchain != p->views[1].subImage.swapchain) {
                 eyesLayer = p;
                 eyesLocated = located;
@@ -1217,6 +1272,45 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
         }
     }
     trace("endFrame layers=%u%s", ei->layerCount, buf);
+    if (gDetail) {
+        char nx[96];
+        nextTypes(ei->next, nx, sizeof(nx));
+        trace("  endInfo blend=%d display=%+.4fms vs predicted next=%s", (int)ei->environmentBlendMode,
+              gBegunPredicted ? (double)(ei->displayTime - gBegunPredicted) / 1e6 : 0.0, nx);
+        for (uint32_t i = 0; i < ei->layerCount && i < 16; i++) {
+            const XrCompositionLayerBaseHeader* l = ei->layers[i];
+            nextTypes(l->next, nx, sizeof(nx));
+            if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+                const XrCompositionLayerProjection* p = (const XrCompositionLayerProjection*)l;
+                char src[128] = "poses from no known locate";
+                if (layerLocated[i] >= 0) {
+                    int f = 0;
+                    double ms = 0;
+                    locateInfo(layerLocated[i], &f, &ms);
+                    snprintf(src, sizeof(src), "poses from the locate in f%d @%.2f for display %+.3f refreshes", f, ms,
+                             (double)(locateTime(layerLocated[i]) - ei->displayTime) / (double)gPeriod);
+                }
+                trace("  layer%u proj space=%s flags=0x%llx next=%s %s", i, spaceName(p->space), (unsigned long long)p->layerFlags, nx, src);
+                for (uint32_t v = 0; v < p->viewCount && v < 4; v++) {
+                    const XrCompositionLayerProjectionView* pv = &p->views[v];
+                    char vn[96];
+                    nextTypes(pv->next, vn, sizeof(vn));
+                    trace("    view%u sc%d rect=%d,%d %dx%d array=%u next=%s fov=%.4f,%.4f,%.4f,%.4f", v, chainId(pv->subImage.swapchain),
+                          pv->subImage.imageRect.offset.x, pv->subImage.imageRect.offset.y, pv->subImage.imageRect.extent.width,
+                          pv->subImage.imageRect.extent.height, pv->subImage.imageArrayIndex, vn, pv->fov.angleLeft, pv->fov.angleRight,
+                          pv->fov.angleUp, pv->fov.angleDown);
+                }
+            } else if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                const XrCompositionLayerQuad* q = (const XrCompositionLayerQuad*)l;
+                trace("  layer%u quad space=%s flags=0x%llx next=%s sc%d rect=%d,%d %dx%d array=%u eye=%d size=%.3fx%.3f", i, spaceName(q->space),
+                      (unsigned long long)q->layerFlags, nx, chainId(q->subImage.swapchain), q->subImage.imageRect.offset.x,
+                      q->subImage.imageRect.offset.y, q->subImage.imageRect.extent.width, q->subImage.imageRect.extent.height,
+                      q->subImage.imageArrayIndex, (int)q->eyeVisibility, q->size.width, q->size.height);
+            } else {
+                trace("  layer%u type=%d next=%s", i, (int)l->type, nx);
+            }
+        }
+    }
     compEnd(eyesLayer, ei->displayTime, eyesLocated);
     // Display times increase from one xrEndFrame to the next (the app keeps them so; a runtime may
     // take an older one for a frame it already showed).
@@ -1251,6 +1345,8 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
 static struct {
     XrTime time;
     XrPosef pose[2];
+    int frame;        // lane O: the frame (waitFrame count) it was called in
+    double callMs;    // and when, after that frame's scheduled wake-up
 } gLocates[LOCATES];
 static int gLocateNext = 0;
 static void headPose(XrTime displayTime, float* yaw, XrPosef* pose) {
@@ -1280,11 +1376,20 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
         gLocates[gLocateNext].pose[e] = v[e].pose;
     }
     gLocates[gLocateNext].time = li->displayTime;
+    gLocates[gLocateNext].frame = gFrame;
+    gLocates[gLocateNext].callMs = (double)(nowNs() - gDetailWake) / 1e6;
+    if (gDetail)
+        trace("locate space=%s config=%d display=%+.3f refreshes after this frame's predicted time", spaceName(li->space),
+              (int)li->viewConfigurationType, (double)(li->displayTime - gWaitPredicted) / (double)gPeriod);
     gLocateNext = (gLocateNext + 1) % LOCATES;
     return XR_SUCCESS;
 }
 
 static XrTime locateTime(int i) { return gLocates[i].time; }
+static void locateInfo(int i, int* frame, double* callMs) {
+    *frame = gLocates[i].frame;
+    *callMs = gLocates[i].callMs;
+}
 static int samePose(const XrPosef* a, const XrPosef* b) { return !memcmp(a, b, sizeof(XrPosef)); }
 // Largest component difference of two poses (metres, quaternion units).
 static double poseDiff(const XrPosef* a, const XrPosef* b) {
@@ -1579,6 +1684,7 @@ static void init(void) {
     done = 1;
     const char* tp = getenv("MOCK_XR_TRACE");
     if (tp) gTrace = fopen(tp, "w");
+    gDetail = getenv("MOCK_XR_TRACE_DETAIL") != NULL && getenv("MOCK_XR_TRACE_DETAIL")[0] == '1';
     const char* hz = getenv("MOCK_XR_HZ");
     if (hz) gPeriod = (int64_t)(1e9 / atof(hz));
     const char* eye = getenv("MOCK_XR_EYE");
