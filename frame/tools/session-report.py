@@ -35,7 +35,7 @@ def parse_game_log(path):
     r = {"name": os.path.basename(path), "seconds": 0, "t_last": 0.0, "hz": None, "modes": set(), "ticks": 0, "rendered": 0,
          "interp": 0, "late": 0, "missed": 0, "repeats": 0, "g50": [], "g99": [], "e50": [], "e99": [],
          "totals": None, "half": 0, "full": 0, "hitch": 0, "hitch_notes": [], "refresh_note": None,
-         "worst_late": (0, 0), "race": None, "in_race": False,
+         "worst_late": (0, 0), "race": None, "in_race": False, "end50": [], "end99": [], "pairwait": 0, "pairs": None,
          "parts": {k: {"seconds": 0, "rendered": 0, "late": 0, "ticks": 0, "g50": [], "g99": [], "e50": []} for k in ("menus", "race")}}
     with open(path, errors="replace") as f:
         for line in f:
@@ -64,6 +64,12 @@ def parse_game_log(path):
                     r["worst_late"] = (int(d["late"]), due)
                 for k in ("g50", "g99", "e50", "e99"):
                     r[k].append(float(d[k]))
+                # Lane J: xrEndFrame after the wake-up (p50/p99 a second) and refreshes without a free eye pair.
+                ex = re.search(r"end_ms=([\d.]+)/([\d.]+) pairwait=(\d+)", line)
+                if ex and int(d["rendered"]):
+                    r["end50"].append(float(ex.group(1)))
+                    r["end99"].append(float(ex.group(2)))
+                    r["pairwait"] += int(ex.group(3))
                 part = r["parts"]["race" if r["in_race"] else "menus"]
                 part["seconds"] += 1
                 for k in ("rendered", "late", "ticks"):
@@ -75,6 +81,9 @@ def parse_game_log(path):
                     r["hitch"] += 1
                     r["hitch_notes"].append("t=%s %.0f ms" % (d["t"], worst))
                 continue
+            ep = re.search(r"OpenXR eye swapchain pairs: (\d+)", line)
+            if ep:
+                r["pairs"] = ep.group(1)
             if "rendering every second refresh" in line:
                 r["half"] += 1
             elif "rendering every refresh again" in line:
@@ -167,6 +176,8 @@ def build(sessions):
         "%s / %s" % (fmt(median(g["g50"]), "%.2f"), fmt(max(g["g99"]) if g["g99"] else None, "%.2f")) if g else "-")
     add("encode ms p50 / p99 (session)", lambda g, v: "%s / %s" % (tot(g, "e50"), tot(g, "e99")) if tot(g, "e50") else
         "%s / %s" % (fmt(median(g["e50"]), "%.2f"), fmt(max(g["e99"]) if g["e99"] else None, "%.2f")) if g else "-")
+    add("eye swapchain pairs, refreshes without one free", lambda g, v: "%s, %d" % (g["pairs"] or "2 (old build)", g["pairwait"]) if g else "-")
+    add("xrEndFrame after wake-up ms: median of p50 / worst p99", lambda g, v: "%s / %s" % (fmt(median(g["end50"]), "%.2f"), fmt(max(g["end99"]), "%.2f")) if g and g["end50"] else "-")
     add("first race at (s)", lambda g, v: fmt(g["race"], "%.0f") if g else "-")
     for name in ("menus", "race"):
         def part(g, name=name):
