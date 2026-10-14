@@ -612,8 +612,8 @@ void Info(std::string_view text) {
 namespace mkw::vr::pacing {
 namespace {
 struct Window {
-    uint32_t ticks = 0, rendered = 0, interpolated = 0, late = 0, missed = 0, repeats = 0;
-    std::vector<float> gpu, encode;
+    uint32_t ticks = 0, rendered = 0, interpolated = 0, late = 0, missed = 0, repeats = 0, pairwait = 0;
+    std::vector<float> gpu, encode, end_ms;
     void Clear() { *this = {}; }
 };
 struct State {
@@ -644,15 +644,16 @@ float Percentile(std::vector<float>& values, double p) {
     return values[k];
 }
 std::string Format(const char* head, double t, float hz, const std::string& mode, Window& w) {
-    char line[384];
+    char line[448];
     const float g50 = Percentile(w.gpu, 0.50), g99 = Percentile(w.gpu, 0.99);
     const float e50 = Percentile(w.encode, 0.50), e99 = Percentile(w.encode, 0.99);
+    const float n50 = Percentile(w.end_ms, 0.50), n99 = Percentile(w.end_ms, 0.99);
     std::snprintf(line, sizeof(line),
                   "%s t=%.0f hz=%.0f mode=%s ticks=%u rendered=%u interpolated=%u late=%u missed=%u repeats=%u "
-                  "gpu_ms=%.2f/%.2f encode_ms=%.2f/%.2f",
+                  "gpu_ms=%.2f/%.2f encode_ms=%.2f/%.2f end_ms=%.2f/%.2f pairwait=%u",
                   head, t, static_cast<double>(hz), mode.c_str(), w.ticks, w.rendered, w.interpolated, w.late, w.missed,
                   w.repeats, static_cast<double>(g50), static_cast<double>(g99), static_cast<double>(e50),
-                  static_cast<double>(e99));
+                  static_cast<double>(e99), static_cast<double>(n50), static_cast<double>(n99), w.pairwait);
     return line;
 }
 } // namespace
@@ -725,6 +726,14 @@ void OnLate() {
 void OnRepeat() {
     std::lock_guard lock(S().mutex);
     ++S().window.repeats;
+}
+void OnEndAfterWake(double ms) {
+    std::lock_guard lock(S().mutex);
+    S().window.end_ms.push_back(static_cast<float>(ms));
+}
+void OnPairWait() {
+    std::lock_guard lock(S().mutex);
+    ++S().window.pairwait;
 }
 void NoteSetConsumed() { S().consumed_ns.store(diagnostics::detail::NowNs(), std::memory_order_relaxed); }
 void OnSetSubmitted(int64_t now_ns, bool retained) {
@@ -810,8 +819,9 @@ void Flush() {
             auto& w = s.window;
             auto& t = s.total;
             t.ticks += w.ticks; t.rendered += w.rendered; t.interpolated += w.interpolated;
-            t.late += w.late; t.missed += w.missed; t.repeats += w.repeats;
+            t.late += w.late; t.missed += w.missed; t.repeats += w.repeats; t.pairwait += w.pairwait;
             t.gpu.insert(t.gpu.end(), w.gpu.begin(), w.gpu.end());
+            t.end_ms.insert(t.end_ms.end(), w.end_ms.begin(), w.end_ms.end());
             t.encode.insert(t.encode.end(), w.encode.begin(), w.encode.end());
             line = Format("vr pacing:", static_cast<double>(now - s.session_start_ns) / 1.0e9, s.hz, s.mode, w);
             WriteSamples(static_cast<double>(now - s.session_start_ns) / 1.0e9, w);

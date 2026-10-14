@@ -279,10 +279,13 @@ public:
         uint32_t height = 0;
         std::vector<XrSwapchainImageVulkanKHR> images;
         uint32_t acquired_index = 0;
+        int32_t released_index = -1;  // the image released last (frame log)
+        uint32_t pair_id = 0;         // which eye swapchain pair (frame log)
         bool acquired = false;
         bool waited = false;
         bool release_forbidden = false;
     };
+    using EyePair = std::array<EyeSwapchain, kOpenXREyeCount>;
 
     static uint32_t VkVersion(XrVersion v) {
         return VK_MAKE_API_VERSION(0, XR_VERSION_MAJOR(v), XR_VERSION_MINOR(v), XR_VERSION_PATCH(v));
@@ -587,8 +590,8 @@ public:
         render_space_serial_ = runtime_->LastReferenceSpaceChange().serial;
 
         for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
-            frame.render_width[eye] = eye_swapchains_[eye].width;
-            frame.render_height[eye] = eye_swapchains_[eye].height;
+            frame.render_width[eye] = eye_width_[eye];
+            frame.render_height[eye] = eye_height_[eye];
         }
 
         if (!frame.xr_frame.should_render) {
@@ -609,6 +612,13 @@ public:
 
     // Both pacing paths retain ownership until completion or cancellation.
     OpenXRWindowsVulkanBeginStatus PrepareTargets(OpenXRWindowsVulkanFrame& frame) {
+        // Lane J: no eye pair has cooled off long enough (see RotateEyePairs): nothing is rendered this
+        // refresh, the cycle repeats the retained layer.
+        if (!TakeCooledPair()) {
+            pacing::OnPairWait();
+            frame.expects_gpu_submission = false;
+            return OpenXRWindowsVulkanBeginStatus::Ready;
+        }
         const bool virtual_screen = frame.presentation.mode == OpenXRWindowsVulkanFrameMode::VirtualScreen;
         // The menus' environment: target 1 is the packed two-eye environment image, not the right eye.
         const bool environment = virtual_screen && frame.presentation.menu_environment && EnsureEnvSwapchains();
@@ -704,8 +714,8 @@ public:
         packet.xr_frame.predicted_display_period = last_display_period_;
         packet.xr_frame.should_render = last_should_render_;
         for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
-            packet.render_width[eye] = eye_swapchains_[eye].width;
-            packet.render_height[eye] = eye_swapchains_[eye].height;
+            packet.render_width[eye] = eye_width_[eye];
+            packet.render_height[eye] = eye_height_[eye];
         }
         if (!packet.xr_frame.should_render) return OpenXRBeginStatus::Ready;
         if (!runtime_->LocateViewsAt(packet.xr_frame.predicted_display_time, packet.xr_frame)) {
@@ -716,7 +726,7 @@ public:
         render_session_serial_ = runtime_->SessionRunSerial();
         render_space_serial_ = runtime_->LastReferenceSpaceChange().serial;
         const auto status = PrepareTargets(packet);
-        if (status == OpenXRBeginStatus::Ready) pending_packet_serial_ = packet.xr_frame.serial;
+        if (status == OpenXRBeginStatus::Ready && packet.expects_gpu_submission) pending_packet_serial_ = packet.xr_frame.serial;
         return status;
     }
 
@@ -749,6 +759,8 @@ public:
 
     OpenXRBeginStatus BeginCompositorCycle() {
         const auto status = runtime_->WaitFrame(active_frame_);
+        wake_ = std::chrono::steady_clock::now();
+        ++cycle_count_;
         if (status != OpenXRFrameStatus::Ready) {
             if (status == OpenXRFrameStatus::Error) Fail(WindowsVkBeginStatusOperation(status));
             return status == OpenXRFrameStatus::SessionNotRunning ? OpenXRBeginStatus::SessionNotRunning
@@ -858,8 +870,8 @@ public:
         set.xr_frame.predicted_display_period = cycle.predicted_display_period;
         set.xr_frame.should_render = cycle.should_render;
         for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
-            set.render_width[eye] = eye_swapchains_[eye].width;
-            set.render_height[eye] = eye_swapchains_[eye].height;
+            set.render_width[eye] = eye_width_[eye];
+            set.render_height[eye] = eye_height_[eye];
         }
         if (!set.xr_frame.should_render) {
             set.xr_frame.predicted_display_time = display_time;
@@ -874,7 +886,7 @@ public:
         render_space_serial_ = runtime_->LastReferenceSpaceChange().serial;
         // A failure here is fatal for the session (the caller ends it).
         const auto status = PrepareTargets(set);
-        if (status == OpenXRBeginStatus::Ready) pending_packet_serial_ = set.xr_frame.serial;
+        if (status == OpenXRBeginStatus::Ready && set.expects_gpu_submission) pending_packet_serial_ = set.xr_frame.serial;
         return status;
     }
 
@@ -1081,7 +1093,7 @@ public:
             // xrEndFrame references the MOST RECENTLY RELEASED image of a
             // swapchain, not an explicit image index. Keep the displayed pair
             // separate from the pair Aurora can write or cancel next.
-            std::swap(eye_swapchains_, retained_swapchains_);
+            RotateEyePairs();
             if (frame.presentation.panel.requested) {
                 std::swap(panel_swapchain_, retained_panel_swapchain_);
             }
@@ -1166,6 +1178,8 @@ public:
             return runtime_->EndFrameWithoutLayers(active_frame_);
         }
         diagnostics::OnLayer(fresh);
+        retained_ref_cycle_ = cycle_count_;
+        LogFrame(fresh);
         const auto& frame = retained_frame_;
         if (frame.presentation.mode == OpenXRWindowsVulkanFrameMode::VirtualScreen) {
             XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
@@ -1288,10 +1302,98 @@ public:
             OpenXRFrame located = active_frame_;
             located.predicted_display_time = retained_locate_time_;
             last_end_display_time_ = retained_locate_time_;
-            return runtime_->EndFrame(located, layers, count);
+            const bool ok = runtime_->EndFrame(located, layers, count);
+            NoteEndAfterWake();
+            return ok;
         }
         last_end_display_time_ = std::max(last_end_display_time_, active_frame_.predicted_display_time);
-        return runtime_->EndFrame(active_frame_, layers, count);
+        const bool ok = runtime_->EndFrame(active_frame_, layers, count);
+        NoteEndAfterWake();
+        return ok;
+    }
+
+    void NoteEndAfterWake() {
+        if (wake_ == std::chrono::steady_clock::time_point{}) return;
+        pacing::OnEndAfterWake(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wake_).count());
+    }
+
+    // ---- Eye swapchain pairs (lane J) ----
+    //
+    // The panel recording of the eighth headset session showed, in races, one eye at a time displaying
+    // a whole image it had shown 3 to 5 refreshes earlier (10 % of the left eye's refreshes, 7 % of the
+    // right's), the race timer on the virtual screen stepping back and forth between game frames, and
+    // menus (frames ended right at the wake-up) clean. With two pairs the pair a frame showed is
+    // acquired and written again one refresh later, while SteamVR, which predicts a frame's display 3
+    // refreshes after its wake-up, may still compose that frame: it evidently resolves each eye's image
+    // when it composes, not when the frame was ended (frame/perf/PANELS.md; the mock's compositor
+    // model reproduces the pattern with two pairs). So a pair is written again only
+    // KARTFRAME_EYE_PAIRS - 1 refreshes after the last frame that showed it (default 6 pairs: 5
+    // refreshes, beyond SteamVR's lead plus the refresh a frame stays on show); =2 restores the old
+    // alternation. The pairs between the retained one and the one written cool off in cooling_pairs_.
+    void RotateEyePairs() {
+        if (cooling_pairs_.empty() && eye_pairs_wanted_ <= 2) {
+            std::swap(eye_swapchains_, retained_swapchains_);
+            return;
+        }
+        cooling_pairs_.push_back(std::move(retained_swapchains_));
+        cooling_since_.push_back(retained_ref_cycle_);
+        retained_swapchains_ = std::move(eye_swapchains_);
+        eye_swapchains_ = {};
+        eye_pair_ready_ = false;
+        TakeCooledPair();
+    }
+
+    // Moves the pair that cooled longest into eye_swapchains_ when it has cooled long enough.
+    bool TakeCooledPair() {
+        if (eye_pair_ready_) return true;
+        if (cooling_pairs_.empty()) return false;
+        size_t best = 0;
+        for (size_t i = 1; i < cooling_since_.size(); ++i)
+            if (cooling_since_[i] < cooling_since_[best]) best = i;
+        const uint64_t hold = eye_pairs_wanted_ - 1;
+        if (cycle_count_ < cooling_since_[best] + hold) return false;
+        eye_swapchains_ = std::move(cooling_pairs_[best]);
+        cooling_pairs_.erase(cooling_pairs_.begin() + static_cast<std::ptrdiff_t>(best));
+        cooling_since_.erase(cooling_since_.begin() + static_cast<std::ptrdiff_t>(best));
+        eye_pair_ready_ = true;
+        return true;
+    }
+
+    static uint32_t EyePairsSetting() {
+        static const uint32_t pairs = [] {
+            const char* env = std::getenv("KARTFRAME_EYE_PAIRS");
+            const long v = env != nullptr && *env != '\0' ? std::strtol(env, nullptr, 10) : 6;
+            return static_cast<uint32_t>(std::clamp(v, 2l, 8l));
+        }();
+        return pairs;
+    }
+
+    // KARTFRAME_FRAME_LOG=1: one line per xrEndFrame with a layer (a test-session log: about 50 MB an hour
+    // at 120 Hz). XRF c=<cycle> w=<wake-up, ms since the first> e=<xrEndFrame after the wake-up, ms, at the
+    // call> f=<1 a newly rendered set, 0 the retained layer again> p=<eye pair> i=<released image index
+    // left/right> d=<display time step from the last frame, refreshes> l=<display time minus the poses'
+    // locate time, refreshes>. The panel recording (KARTFRAME_RECORD=raw) lines up with it frame by frame.
+    void LogFrame(bool fresh) {
+        static const bool enabled = [] {
+            const char* env = std::getenv("KARTFRAME_FRAME_LOG");
+            return env != nullptr && env[0] == '1';
+        }();
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (log_epoch_ == std::chrono::steady_clock::time_point{}) log_epoch_ = wake_;
+        const double period = active_frame_.predicted_display_period > 0
+                                  ? static_cast<double>(active_frame_.predicted_display_period) : 8'333'333.0;
+        const double step = log_last_display_ ? static_cast<double>(active_frame_.predicted_display_time - log_last_display_) / period : 0.0;
+        log_last_display_ = active_frame_.predicted_display_time;
+        const double located = retained_locate_time_ ? static_cast<double>(active_frame_.predicted_display_time - retained_locate_time_) / period : 0.0;
+        char line[192];
+        std::snprintf(line, sizeof(line), "XRF c=%llu w=%.3f e=%.2f f=%d p=%u i=%d/%d d=%.2f l=%.2f",
+                      static_cast<unsigned long long>(cycle_count_),
+                      std::chrono::duration<double, std::milli>(wake_ - log_epoch_).count(),
+                      std::chrono::duration<double, std::milli>(now - wake_).count(), fresh ? 1 : 0,
+                      retained_swapchains_[0].pair_id, retained_swapchains_[0].released_index,
+                      retained_swapchains_[1].released_index, step, located);
+        Log(OpenXRLogLevel::Info, line);
     }
 
     bool Shutdown() {
@@ -1391,12 +1493,36 @@ private:
     }
 
     bool CreateSwapchains() {
-        return CreateSwapchainPair(eye_swapchains_) && CreateSwapchainPair(retained_swapchains_);
+        eye_pairs_wanted_ = EyePairsSetting();
+        cooling_pairs_.clear();
+        cooling_since_.clear();
+        eye_pair_ready_ = true;
+        if (!CreateSwapchainPair(eye_swapchains_, 0) || !CreateSwapchainPair(retained_swapchains_, 1)) return false;
+        for (uint32_t pair = 2; pair < eye_pairs_wanted_; ++pair) {
+            EyePair extra{};
+            if (!CreateSwapchainPair(extra, pair)) {
+                Log(OpenXRLogLevel::Warning, "OpenXR could not make another eye swapchain pair; using fewer");
+                break;
+            }
+            cooling_pairs_.push_back(std::move(extra));
+            cooling_since_.push_back(0);
+        }
+        eye_pairs_wanted_ = static_cast<uint32_t>(cooling_pairs_.size()) + 2;
+        std::ostringstream message;
+        message << "OpenXR eye swapchain pairs: " << eye_pairs_wanted_
+                << (eye_pairs_wanted_ > 2 ? " (a pair is written again " + std::to_string(eye_pairs_wanted_ - 1) +
+                                                " refreshes after the last frame that showed it; KARTFRAME_EYE_PAIRS)"
+                                          : std::string(" (alternating; KARTFRAME_EYE_PAIRS)"));
+        Log(OpenXRLogLevel::Info, message.str());
+        return true;
     }
 
-    bool CreateSwapchainPair(std::array<EyeSwapchain, kOpenXREyeCount>& pair) {
+    bool CreateSwapchainPair(std::array<EyeSwapchain, kOpenXREyeCount>& pair, uint32_t id) {
         for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+            pair[eye].pair_id = id;
             const auto& view = runtime_->ViewConfiguration()[eye];
+            eye_width_[eye] = view.render_width;
+            eye_height_[eye] = view.render_height;
             if (!CreateSwapchain(pair[eye], view.render_width, view.render_height,
                                  eye == 0 ? "left eye" : "right eye")) {
                 return false;
@@ -1526,6 +1652,7 @@ private:
         if (XR_FAILED(result)) {
             return Fail("xrReleaseSwapchainImage failed for an Vulkan swapchain");
         }
+        swapchain.released_index = static_cast<int32_t>(swapchain.acquired_index);
         swapchain.acquired = false;
         swapchain.waited = false;
         return true;
@@ -1629,6 +1756,10 @@ private:
         DestroyEnvSwapchains();
         DestroySwapchainPair(eye_swapchains_);
         DestroySwapchainPair(retained_swapchains_);
+        for (auto& pair : cooling_pairs_) DestroySwapchainPair(pair);
+        cooling_pairs_.clear();
+        cooling_since_.clear();
+        eye_pair_ready_ = true;
         have_retained_frame_ = false;
         retained_frame_ = {};
         retained_locate_time_ = 0;
@@ -1727,6 +1858,18 @@ private:
     OpenXRWindowsVulkanGraphicsRequirements requirements_{};
     std::array<EyeSwapchain, kOpenXREyeCount> eye_swapchains_{};
     std::array<EyeSwapchain, kOpenXREyeCount> retained_swapchains_{};
+    // Lane J: pairs cooling off after they were last shown, and the cycle each was last shown in.
+    std::vector<EyePair> cooling_pairs_;
+    std::vector<uint64_t> cooling_since_;
+    uint32_t eye_pairs_wanted_ = 2;
+    bool eye_pair_ready_ = true;  // eye_swapchains_ holds a pair that may be written
+    uint64_t cycle_count_ = 0;
+    uint64_t retained_ref_cycle_ = 0;
+    std::chrono::steady_clock::time_point wake_{};
+    std::chrono::steady_clock::time_point log_epoch_{};
+    XrTime log_last_display_ = 0;
+    uint32_t eye_width_[kOpenXREyeCount]{};
+    uint32_t eye_height_[kOpenXREyeCount]{};
     // The settings panel's layer: written like the eyes into panel_swapchain_,
     // shown from retained_panel_swapchain_ (see FinishFrame).
     EyeSwapchain env_swapchain_{};
