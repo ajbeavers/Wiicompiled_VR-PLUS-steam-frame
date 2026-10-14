@@ -459,6 +459,7 @@ static struct {
     int slot, eye, fresh;
     unsigned gen;
     XrTime expect;  // the time the layer's poses were located for
+    XrQuaternionf sub;  // lane P: the orientation the layer submitted for this eye
 } gStampPending[STAMP_PENDING];
 static int gStampPendingCount = 0;
 static int gStampChecked = 0, gStampMatch = 0, gStampOther = 0, gStampOtherEye = 0, gStampNone = 0, gStampLost = 0, gStampUnknownPose = 0;
@@ -490,6 +491,140 @@ static void sceneAdd(uint64_t value, int eye, int slot, unsigned gen) {
         gScene = (SceneRec*)realloc(gScene, (size_t)gSceneCap * sizeof(SceneRec));
     }
     gScene[gSceneN++] = (SceneRec){value, a, b, eye};
+}
+// Lane P: the head pose each eye's uniform fill wrote (pose words), against the pose the layer submitted
+// for that eye, per eye image (all checked stamps) and per set (fresh layers: left against right).
+typedef struct {
+    uint64_t value, poseTime;
+    uint32_t token;
+    int eye, mixed;
+    double err;      // degrees between the stamped and the submitted eye orientation
+    double offRefr;  // that error in refreshes of the mock's head motion at the submitted time (0: none)
+} PoseRec;
+static PoseRec* gPose = NULL;
+static int gPoseN = 0, gPoseCap = 0;
+static int gPoseImages = 0, gPoseAbsent = 0, gPoseBroken = 0, gPoseTimeOff = 0, gPoseMixedImages = 0;
+static int gPoseErrHist[4];  // <0.01 deg, 0.01-0.1, 0.1-1, >=1
+static int gPoseSlow = 0;    // images at the sway's turning points (motion under 0.02 deg a refresh)
+static float headYawAt(XrTime t) {
+    float yaw;
+    XrPosef pose;
+    headPose(t, &yaw, &pose);
+    return yaw;
+}
+static void poseAdd(uint64_t value, int eye, int slot, unsigned gen, XrQuaternionf sub, XrTime expect, int fresh) {
+    if (!gGfx->stamp_pose) return;
+    uint64_t w[3] = {0, 0, 0};
+    int r = gGfx->stamp_pose(slot, gen, w);
+    if (r < 0) {
+        gPoseBroken++;
+        trace("ERROR stamp: eye %d image's pose words are broken", eye);
+        gErrors++;
+        return;
+    }
+    if (r == 0 || !((w[2] >> 48) & 1)) {
+        gPoseAbsent++;
+        return;
+    }
+    gPoseImages++;
+    double q[4];
+    for (int k = 0; k < 4; k++) q[k] = (double)(int16_t)(uint16_t)((w[1] >> (16 * k)) & 0xffff) / 32767.0;
+    // The angle of the relative rotation stamped x conj(submitted), both normalised, from its vector part
+    // (acos of a dot product near 1 turns the float quaternion's 1e-7 norm error into 0.03 degrees).
+    double n = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    double u[4] = {sub.x, sub.y, sub.z, sub.w};
+    double m = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2] + u[3] * u[3]);
+    double err = 180.0;
+    if (n > 0 && m > 0) {
+        for (int k = 0; k < 4; k++) q[k] /= n, u[k] /= m;
+        // d = q * conj(u)
+        double dw = q[3] * u[3] + q[0] * u[0] + q[1] * u[1] + q[2] * u[2];
+        double dx = -q[3] * u[0] + q[0] * u[3] - q[1] * u[2] + q[2] * u[1];
+        double dy = -q[3] * u[1] + q[1] * u[3] - q[2] * u[0] + q[0] * u[2];
+        double dz = -q[3] * u[2] + q[2] * u[3] - q[0] * u[1] + q[1] * u[0];
+        err = 2.0 * atan2(sqrt(dx * dx + dy * dy + dz * dz), fabs(dw)) * 180.0 / 3.14159265358979;
+    }
+    // Signed: the stamped yaw minus the submitted one, in refreshes of head motion at the submitted time.
+    double yawStamp = 2.0 * atan2(q[1], q[3]);
+    double yawSub = 2.0 * atan2((double)sub.y, (double)sub.w);
+    double rate = ((double)headYawAt(expect + gPeriod / 2) - (double)headYawAt(expect - gPeriod / 2));  // rad a refresh
+    double off = 0;
+    if (fabs(rate) * 180.0 / 3.14159265358979 < 0.02) gPoseSlow++;
+    else off = (yawStamp - yawSub) / rate;
+    gPoseErrHist[err < 0.01 ? 0 : err < 0.1 ? 1 : err < 1.0 ? 2 : 3]++;
+    int mixed = (int)(w[2] & 0xffff);
+    if (mixed) gPoseMixedImages++;
+    int64_t dt = (int64_t)w[0] - (int64_t)(expect - gTimeOffset);
+    if (dt <= -200000 || dt >= 200000) gPoseTimeOff++;
+    if (err >= 0.01 || mixed || dt <= -200000 || dt >= 200000) {
+        static int traced = 0;
+        if (++traced <= 20)
+        trace("ERROR pose: eye %d image filled with a pose %.4f deg (%.2f refreshes of motion) off the submitted one, packet %+.3f ms from the "
+              "layer's locate, %d mixed draws%s (stamped %.5f %.5f %.5f %.5f, submitted %.5f %.5f %.5f %.5f)",
+              eye, err, off, (double)dt / 1e6, mixed, fresh ? "" : " (repeat)", q[0], q[1], q[2], q[3], (double)sub.x, (double)sub.y,
+              (double)sub.z, (double)sub.w);
+        gErrors++;
+    }
+    if (!fresh) return;
+    if (gPoseN == gPoseCap) {
+        gPoseCap = gPoseCap ? 2 * gPoseCap : 4096;
+        gPose = (PoseRec*)realloc(gPose, (size_t)gPoseCap * sizeof(PoseRec));
+    }
+    gPose[gPoseN++] = (PoseRec){value, w[0], (uint32_t)((w[2] >> 16) & 0xffffffffu), eye, mixed, err, off};
+}
+static int poseCmp(const void* x, const void* y) {
+    const PoseRec* p = (const PoseRec*)x;
+    const PoseRec* q = (const PoseRec*)y;
+    if (p->value != q->value) return p->value < q->value ? -1 : 1;
+    return p->eye - q->eye;
+}
+static void poseReport(void) {
+    if (!gStampOn) return;
+    fprintf(stderr,
+            "xrmock: pose stamps: %d eye images with the pose their fill wrote (%d without, %d broken): against the submitted eye pose "
+            "<0.01 deg %d, 0.01-0.1 %d, 0.1-1 %d, >=1 %d; packet time not the layer's locate %d; with mixed draws %d; at the sway's turning "
+            "points %d\n",
+            gPoseImages, gPoseAbsent, gPoseBroken, gPoseErrHist[0], gPoseErrHist[1], gPoseErrHist[2], gPoseErrHist[3], gPoseTimeOff,
+            gPoseMixedImages, gPoseSlow);
+    if (!gPoseN) return;
+    qsort(gPose, (size_t)gPoseN, sizeof(PoseRec), poseCmp);
+    int sets = 0, diffPacket = 0, rightOff = 0, leftOff = 0, bothOff = 0, single = 0;
+    double offSum[2] = {0, 0};
+    for (int i = 0; i < gPoseN;) {
+        int j = i;
+        while (j < gPoseN && gPose[j].value == gPose[i].value) j++;
+        const PoseRec* l = NULL;
+        const PoseRec* r = NULL;
+        for (int k = i; k < j; k++) {
+            if (gPose[k].eye == 0 && !l) l = &gPose[k];
+            if (gPose[k].eye == 1 && !r) r = &gPose[k];
+        }
+        i = j;
+        if (!l || !r) {
+            single++;
+            continue;
+        }
+        sets++;
+        int dp = l->poseTime != r->poseTime || l->token != r->token;
+        int lo = l->err >= 0.01 || l->mixed, ro = r->err >= 0.01 || r->mixed;
+        diffPacket += dp;
+        leftOff += lo && !ro;
+        rightOff += ro && !lo;
+        bothOff += lo && ro;
+        if (lo) offSum[0] += fabs(l->offRefr);
+        if (ro) offSum[1] += fabs(r->offRefr);
+        if (dp) {
+            if (diffPacket <= 10)
+                trace("ERROR pose: eyes of the set for %.3f ms filled from different packets: L %.3f ms (token %u), R %.3f ms (token %u)",
+                      (double)l->value / 1e6, (double)l->poseTime / 1e6, l->token, (double)r->poseTime / 1e6, r->token);
+            gErrors++;
+        }
+    }
+    fprintf(stderr,
+            "xrmock: pose stamps per set: %d sets with both eyes (%d one eye only): eyes from different packets %d; eye pose off the submitted "
+            "one: right only %d, left only %d, both %d (mean |offset| L %.2f, R %.2f refreshes of motion)\n",
+            sets, single, diffPacket, rightOff, leftOff, bothOff, leftOff + bothOff ? offSum[0] / (leftOff + bothOff) : 0.0,
+            rightOff + bothOff ? offSum[1] / (rightOff + bothOff) : 0.0);
 }
 static int sceneCmp(const void* x, const void* y) {
     const SceneRec* p = (const SceneRec*)x;
@@ -650,6 +785,8 @@ static void stampPoll(int wait) {
             if (sameTime && eye == gStampPending[i].eye) {
                 gStampMatch++;
                 if (gStampPending[i].fresh) sceneAdd(value, eye, gStampPending[i].slot, gStampPending[i].gen);
+                poseAdd(value, eye, gStampPending[i].slot, gStampPending[i].gen, gStampPending[i].sub, gStampPending[i].expect,
+                        gStampPending[i].fresh);
             }
             else if (sameTime) {
                 gStampOtherEye++;
@@ -1090,6 +1227,7 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
                 gStampChecked, gStampMatch, gStampOther, gStampOff[0], gStampOff[1], gStampOff[2], gStampOff[3], gStampOff[4], gStampOtherEye,
                 gStampNone, gStampLost, gStampUnknownPose);
         sceneReport();
+        poseReport();
     }
     if (gReleases) {
         fprintf(stderr, "xrmock: queue drain time at the releases: <0.5 ms %d, 0.5-1 %d, 1-2 %d, 2-4 %d, >4 %d\n", gWaitHist[0], gWaitHist[1], gWaitHist[2],
@@ -1245,6 +1383,7 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
                         gStampPending[gStampPendingCount].eye = v;
                         gStampPending[gStampPendingCount].fresh = fresh;
                         gStampPending[gStampPendingCount].expect = locateTime(located);
+                        gStampPending[gStampPendingCount].sub = p->views[v].pose.orientation;
                         gStampPendingCount++;
                     } else
                         gStampLost++;

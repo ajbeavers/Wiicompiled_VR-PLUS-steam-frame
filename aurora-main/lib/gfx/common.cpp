@@ -370,6 +370,23 @@ static std::atomic_uint64_t g_replayBufferGeneration{0};
 static LateStereoData g_pendingLateStereo;
 static thread_local EyeSceneRecord t_eyeScene;
 EyeSceneRecord& eye_scene_record() noexcept { return t_eyeScene; }
+// Lane P: the head pose an eye's uniform fill writes, at the fill itself (both fill sites call this right
+// before write_stereo_uniform with the same eye transform).
+static void note_eye_pose(uint32_t eye, const StereoReplayEye& view, const StereoReplayFrame& frame) noexcept {
+  if (eye >= 2) return;
+  auto& scene = t_eyeScene;
+  if (!scene.posed[eye]) {
+    scene.posed[eye] = true;
+    scene.poseTime[eye] = frame.displayTimeNanos;
+    scene.poseToken[eye] = frame.frameToken;
+    scene.pose[eye] = view.viewFromCenter;
+    return;
+  }
+  if (scene.poseTime[eye] != frame.displayTimeNanos || scene.poseToken[eye] != frame.frameToken ||
+      std::memcmp(&scene.pose[eye], &view.viewFromCenter, sizeof(Mat3x4<float>)) != 0) {
+    if (scene.poseMixed[eye] != UINT16_MAX) ++scene.poseMixed[eye];
+  }
+}
 static void count_eye_scene(uint16_t& counter) noexcept {
   if (counter != UINT16_MAX) ++counter;
 }
@@ -1979,6 +1996,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
           if (layout.perspective) count_eye_scene(scene.current[eyeIndex]);
         }
         std::memcpy(eyeUniform.data(), sourceUniform.data(), range.size);
+        note_eye_pose(eyeIndex, eye, stereoFrame);
         write_stereo_uniform({eyeUniform.data(), range.size}, layout, eye, gameProjection, drawViewport, uniformRegion,
                              hudScreen, false, drawScissor, clipOffset);
         std::memcpy(uniform.data(), eyeUniform.data(), range.size);
@@ -2606,6 +2624,7 @@ bool prepare_late_stereo_replay(SealedFrame& frame, wgpu::CommandEncoder& cmd, c
     }
     const bool interpolated = layout.perspective && hasPrevious && weight < 1.0f;
     for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
+      note_eye_pose(eye, stereoFrame.eyes[eye], stereoFrame);
       write_stereo_uniform({bytes + saved.eyes[eye].offset - data.uploadOffset, saved.eyes[eye].size}, layout,
                            stereoFrame.eyes[eye], projection, saved.viewport, saved.displayRegion, data.hudScreen,
                            stereoFrame.interpolateInAnchor, saved.scissor, saved.clipOffset);

@@ -465,18 +465,18 @@ static int dumpImage(void* images, int index, int width, int height, int64_t for
     return ok;
 }
 
-// MOCK_XR_STAMP: the app's stamp block (see the app's vulkan_win32_interop.cpp), 256x28 pixels in
-// the top left corner (rows 0-2 the display time and eye, 3-6 lane L's scene words), copied at the
-// release into one of STAMP_SLOTS host-visible slots.
+// MOCK_XR_STAMP: the app's stamp block (see the app's vulkan_win32_interop.cpp), 256x52 pixels in
+// the top left corner (rows 0-2 the display time and eye, 3-6 lane L's scene words, 7-12 lane P's pose
+// words), copied at the release into one of STAMP_SLOTS host-visible slots.
 #define STAMP_W 256
-#define STAMP_H 28
+#define STAMP_H 52
 #define STAMP_SLOTS 64
 static struct {
     VkFence fence;
     VkCommandBuffer cb;
     unsigned gen;
-    int submitted, decoded, result, eye, scene;
-    uint64_t value, sceneA, sceneB;
+    int submitted, decoded, result, eye, scene, pose;
+    uint64_t value, sceneA, sceneB, poseW[3];
 } gStamp[STAMP_SLOTS];
 static VkBuffer gStampBuf;
 static VkDeviceMemory gStampMem;
@@ -573,6 +573,21 @@ static int stampDecode(int i) {
     gStamp[i].scene = any ? scene : 0;
     gStamp[i].sceneA = words[0];
     gStamp[i].sceneB = words[1];
+    // Lane P's pose words (rows 7, 9, 11 and their complements); all-zero pairs read as none.
+    uint64_t pw[3] = {0, 0, 0};
+    int pose = 1, anyPose = 0;
+    for (int w = 0; w < 3 && pose == 1; w++)
+        for (int bit = 0; bit < 64; bit++) {
+            int one = stampBit(i, bit, 7 + 2 * w), other = stampBit(i, bit, 8 + 2 * w);
+            anyPose |= one | other;
+            if (one == other) {
+                pose = -1;
+                break;
+            }
+            if (one) pw[w] |= 1ull << bit;
+        }
+    gStamp[i].pose = anyPose ? pose : 0;
+    for (int w = 0; w < 3; w++) gStamp[i].poseW[w] = pw[w];
     return 1;
 }
 
@@ -658,5 +673,11 @@ static int stampScene(int i, unsigned gen, uint64_t* a, uint64_t* b) {
     return gStamp[i].scene;
 }
 
+static int stampPose(int i, unsigned gen, uint64_t* words) {
+    if (i < 0 || i >= STAMP_SLOTS || gStamp[i].gen != gen || !gStamp[i].decoded || gStamp[i].result != 1) return -1;
+    for (int w = 0; w < 3; w++) words[w] = gStamp[i].poseW[w];
+    return gStamp[i].pose;
+}
+
 const MockGfx kMockGfxVk = {"vk", ownsBinding, describeBinding, getProc, formats, formatOf, createImages, fillImages, releaseWaitMs,
-                            releaseSnapshot, pollSnapshots, snapshotsChecked, dumpImage, stampCapture, stampRead, stampScene};
+                            releaseSnapshot, pollSnapshots, snapshotsChecked, dumpImage, stampCapture, stampRead, stampScene, stampPose};

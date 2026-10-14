@@ -332,6 +332,10 @@ struct StereoReplayFrame {
   // The immersive window (AuroraStereoFrame::window): each eye is masked to the
   // 2D layer's screen after its last draw (gfx/window_mask.hpp).
   bool window = false;
+  // Lane P: the packet these eye transforms came from (AuroraStereoFrame::displayTimeNanos and
+  // frameToken), recorded per eye where the eye uniforms are filled (EyeSceneRecord::pose*).
+  uint64_t displayTimeNanos = 0;
+  uint64_t frameToken = 0;
 };
 
 void end_frame(const wgpu::CommandEncoder& cmd);
@@ -391,6 +395,13 @@ struct EyeSceneRecord {
   // current transforms only; drawn with the recorded uniform (no eye range), drawn with an eye range
   // outside this fill (one some other set or frame wrote).
   std::array<uint16_t, 2> interpolated{}, current{}, recorded{}, outside{};
+  // Lane P: per eye, the head pose its uniform fill actually wrote: the packet (display time, token) and
+  // the eye transform (viewFromCenter) of the first draw filled for that eye, and how many later draws of
+  // the eye were filled with a different packet or transform.
+  std::array<bool, 2> posed{};
+  std::array<uint64_t, 2> poseTime{}, poseToken{};
+  std::array<Mat3x4<float>, 2> pose{};
+  std::array<uint16_t, 2> poseMixed{};
 };
 EyeSceneRecord& eye_scene_record() noexcept;
 

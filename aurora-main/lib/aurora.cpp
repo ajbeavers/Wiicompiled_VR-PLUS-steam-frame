@@ -837,6 +837,8 @@ gfx::StereoReplayFrame make_stereo_replay_frame(const AuroraStereoFrame& input, 
   gfx::StereoReplayFrame replay{};
   replay.cockpit = input.cockpit;
   replay.window = input.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && input.window;
+  replay.displayTimeNanos = input.displayTimeNanos;
+  replay.frameToken = input.frameToken;
   // The sealed guest frame owns its scale. The packet may have been sampled
   // just before a change of scale (a character swap, a lightning strike), so
   // only its head/IPD translation is rescaled to the frame's.
@@ -1173,6 +1175,31 @@ struct PendingStereoSink {
 // XRS t=<display time, steady ms> s=<set> f=<previous>/<current game frame> w=<weight> late=<0 seal fill, 1
 // sample-time fill> L=<interpolated>/<current>/<recorded>/<outside> R=<same> (perspective draws: filled from the
 // pair, filled current-only, drawn with the recorded uniform, drawn with a range outside this set's fill).
+// Lane P: an eye's orientation (x, y, z, w) from the view transform written into its uniforms: the view
+// rotation is the inverse of the eye's orientation (lean aside), so this is the conjugate of its quaternion.
+std::array<float, 4> eye_orientation(const Mat3x4<float>& view) noexcept {
+  const float m00 = view.m0[0], m01 = view.m0[1], m02 = view.m0[2];
+  const float m10 = view.m1[0], m11 = view.m1[1], m12 = view.m1[2];
+  const float m20 = view.m2[0], m21 = view.m2[1], m22 = view.m2[2];
+  float x, y, z, w;
+  const float trace = m00 + m11 + m22;
+  if (trace > 0.f) {
+    const float s = std::sqrt(trace + 1.f) * 2.f;
+    w = 0.25f * s, x = (m21 - m12) / s, y = (m02 - m20) / s, z = (m10 - m01) / s;
+  } else if (m00 > m11 && m00 > m22) {
+    const float s = std::sqrt(1.f + m00 - m11 - m22) * 2.f;
+    w = (m21 - m12) / s, x = 0.25f * s, y = (m01 + m10) / s, z = (m02 + m20) / s;
+  } else if (m11 > m22) {
+    const float s = std::sqrt(1.f + m11 - m00 - m22) * 2.f;
+    w = (m02 - m20) / s, x = (m01 + m10) / s, y = 0.25f * s, z = (m12 + m21) / s;
+  } else {
+    const float s = std::sqrt(1.f + m22 - m00 - m11) * 2.f;
+    w = (m10 - m01) / s, x = (m02 + m20) / s, y = (m12 + m21) / s, z = 0.25f * s;
+  }
+  const float sign = w < 0.f ? -1.f : 1.f;  // canonical: w >= 0
+  return {-x * sign, -y * sign, -z * sign, w * sign};
+}
+
 void take_eye_scene(stereo::SinkFrame& frame) noexcept {
   static uint32_t sets = 0;
   auto& record = gfx::eye_scene_record();
@@ -1184,6 +1211,37 @@ void take_eye_scene(stereo::SinkFrame& frame) noexcept {
                           .previousFrame = record.previousFrame, .currentFrame = record.currentFrame, .set = sets,
                           .interpolated = record.interpolated[eye], .current = record.current[eye],
                           .recorded = record.recorded[eye], .outside = record.outside[eye]};
+      if (record.posed[eye]) {
+        frame.scene[eye].poseTime = record.poseTime[eye];
+        frame.scene[eye].poseToken = record.poseToken[eye];
+        frame.scene[eye].poseOrientation = eye_orientation(record.pose[eye]);
+        frame.scene[eye].poseMixed = record.poseMixed[eye];
+      }
+    }
+    {
+      // Lane P: every set's eyes must be filled from the set's own packet, one transform per eye. Counted
+      // always (a headset log shows it without the test stamp): sets checked, sets whose eyes used
+      // different packets, sets with an eye filled from a packet other than the set's, sets with an eye
+      // whose draws were filled with more than one transform.
+      static uint32_t checked = 0, split = 0, foreign = 0, mixed = 0;
+      static auto since = std::chrono::steady_clock::now();
+      const auto& l = record;
+      if (l.posed[0] && l.posed[1]) {
+        ++checked;
+        split += l.poseTime[0] != l.poseTime[1] || l.poseToken[0] != l.poseToken[1] ? 1 : 0;
+        foreign += l.poseTime[0] != frame.displayTimeNanos || l.poseTime[1] != frame.displayTimeNanos ||
+                           l.poseToken[0] != frame.frameToken || l.poseToken[1] != frame.frameToken
+                       ? 1
+                       : 0;
+        mixed += l.poseMixed[0] != 0 || l.poseMixed[1] != 0 ? 1 : 0;
+      }
+      if (const auto now = std::chrono::steady_clock::now(); now - since >= std::chrono::seconds(10) && checked != 0) {
+        Log.info("VR eye poses (10 s): {} sets, eyes from different packets {}, an eye not from the set's packet {}, "
+                 "an eye filled with more than one transform {}",
+                 checked, split, foreign, mixed);
+        checked = split = foreign = mixed = 0;
+        since = now;
+      }
     }
     static const bool logSets = [] {
       const char* env = std::getenv("KARTFRAME_FRAME_LOG");
@@ -1196,6 +1254,17 @@ void take_eye_scene(stereo::SinkFrame& frame) noexcept {
                static_cast<double>(frame.displayTimeNanos) / 1e6, sets, l.previousFrame, l.currentFrame, l.weight,
                l.late ? 1 : 0, l.interpolated, l.current, l.recorded, l.outside, r.interpolated, r.current, r.recorded,
                r.outside);
+      // Lane P: the packet and head pose each eye's uniform fill used (XRP t=<set's display time, steady ms>
+      // tL/tR=<packet time per eye, ms> kL/kR=<packet token> yL/yR=<eye yaw, degrees> mL/mR=<draws filled
+      // with another packet or transform> same=<1 both eyes from one packet>).
+      const auto yaw = [](const stereo::EyeScene& e) {
+        const auto& q = e.poseOrientation;
+        return std::atan2(2.f * (q[3] * q[1] + q[0] * q[2]), 1.f - 2.f * (q[1] * q[1] + q[0] * q[0])) * 57.29578f;
+      };
+      Log.info("XRP t={:.3f} tL={:.3f} tR={:.3f} kL={} kR={} yL={:.4f} yR={:.4f} mL={} mR={} same={}",
+               static_cast<double>(frame.displayTimeNanos) / 1e6, static_cast<double>(l.poseTime) / 1e6,
+               static_cast<double>(r.poseTime) / 1e6, l.poseToken, r.poseToken, yaw(l), yaw(r), l.poseMixed,
+               r.poseMixed, l.poseTime == r.poseTime && l.poseToken == r.poseToken ? 1 : 0);
     }
   }
   record = {};

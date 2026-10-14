@@ -44,8 +44,14 @@ Module Log("aurora::vulkan_win32");
 //        48 valid, 49 late (filled at the set's sample time), 50 anchored, 51 continuous, 56-63 set (low 8);
 // row 5: perspective draws filled from the pair (bits 0-15), filled current-only (16-31), drawn with the
 //        recorded uniform (32-47), drawn with a range outside this set's fill (48-63).
+// Lane P, the head pose this eye's uniform fill wrote (stereo::EyeScene::pose*), rows 7, 9 and 11 three
+// 64-bit words, rows 8, 10 and 12 their complements (the block is 256x52 pixels):
+// row 7: the display time (steady ns) of the packet whose eye transform the fill wrote (0: none);
+// row 9: the eye's orientation recovered from that transform, x, y, z, w as signed 16-bit (x 32767);
+// row 11: bits 0-15 draws of this eye filled with another packet or transform, 16-47 the packet's token
+//         (low 32 bits), 48 a pose was recorded.
 constexpr uint32_t kStampCell = 4;
-constexpr uint32_t kStampRows = 7;
+constexpr uint32_t kStampRows = 13;
 std::array<uint64_t, 2> SceneWords(const stereo::EyeScene& scene) {
   if (!scene.valid) return {0, 0};
   const uint64_t weight = static_cast<uint64_t>(std::lround(std::clamp(scene.weight, 0.f, 1.f) * 65535.f));
@@ -56,6 +62,16 @@ std::array<uint64_t, 2> SceneWords(const stereo::EyeScene& scene) {
   const uint64_t b = static_cast<uint64_t>(scene.interpolated) | (static_cast<uint64_t>(scene.current) << 16) |
                      (static_cast<uint64_t>(scene.recorded) << 32) | (static_cast<uint64_t>(scene.outside) << 48);
   return {a, b};
+}
+std::array<uint64_t, 3> PoseWords(const stereo::EyeScene& scene) {
+  if (!scene.valid || scene.poseTime == 0) return {0, 0, 0};
+  uint64_t q = 0;
+  for (uint32_t k = 0; k < 4; ++k) {
+    const auto v = static_cast<int16_t>(std::lround(std::clamp(scene.poseOrientation[k], -1.f, 1.f) * 32767.f));
+    q |= static_cast<uint64_t>(static_cast<uint16_t>(v)) << (16 * k);
+  }
+  const uint64_t e = static_cast<uint64_t>(scene.poseMixed) | ((scene.poseToken & 0xffffffffull) << 16) | (1ull << 48);
+  return {scene.poseTime, q, e};
 }
 bool StampEnabled() {
   static const bool enabled = [] {
@@ -109,6 +125,14 @@ void WriteStamp(wgpu::CommandEncoder& encoder, const wgpu::Texture& target, wgpu
       const bool one = ((words[word] >> bit) & 1u) != 0;
       cell(bit, 3 + 2 * word, one);
       cell(bit, 4 + 2 * word, !one);
+    }
+  }
+  const auto pose = PoseWords(scene);
+  for (uint32_t word = 0; word < 3; ++word) {
+    for (uint32_t bit = 0; bit < 64; ++bit) {
+      const bool one = ((pose[word] >> bit) & 1u) != 0;
+      cell(bit, 7 + 2 * word, one);
+      cell(bit, 8 + 2 * word, !one);
     }
   }
   const wgpu::TexelCopyTextureInfo block{.texture = blocks[slot]};

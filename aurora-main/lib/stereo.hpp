@@ -26,6 +26,13 @@ struct EyeScene {
   uint32_t previousFrame = 0, currentFrame = 0;  // game (logical) frames of the transform pair
   uint32_t set = 0;  // sets encoded so far
   uint16_t interpolated = 0, current = 0, recorded = 0, outside = 0;
+  // Lane P: the head pose this eye's uniform fill wrote (gfx::EyeSceneRecord::pose*): the packet's
+  // display time (steady ns, 0 none) and token, the eye's orientation recovered from the transform written
+  // (x, y, z, w; the inverse of the view rotation), and draws filled with another packet or transform.
+  uint64_t poseTime = 0;
+  uint64_t poseToken = 0;
+  std::array<float, 4> poseOrientation{0.f, 0.f, 0.f, 1.f};
+  uint16_t poseMixed = 0;
 };
 
 struct SinkFrame {
