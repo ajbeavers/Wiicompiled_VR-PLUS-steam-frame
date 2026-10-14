@@ -55,7 +55,11 @@
 //                             layer's poses came from (summary line "stamps"); lane P: plus the
 //                             packet, eye orientation and frustum each eye's uniform fill wrote,
 //                             against the layer's submitted pose and fov and the other eye (lines
-//                             "pose stamps")
+//                             "pose stamps"); MOCK_XR_STAMP=fresh (lane R, the app's
+//                             KARTFRAME_SUBMIT_POSE=fresh): a layer that shows newly released
+//                             images must carry the poses of a locate for its own display time,
+//                             and each image is checked against the locate of its own stamp
+//                             (rendered pose) instead (summary line "fresh-pose stamps")
 //   MOCK_XR_PREDICT_JITTER=<ms>  predictedDisplayTime is off its refresh by up to +-<ms> (uniform,
 //                             at most 3; default 0.02, SteamVR's on the Frame in the third headset
 //                             session), as SteamVR's prediction is not always exactly one period
@@ -480,9 +484,12 @@ static void noteLayerShape(const char* shape) {
 static int gEnds = 0, gFreshSets = 0, gFreshSame = 0, gFreshEarlier = 0, gFreshLater = 0, gRepeatSets = 0, gQuadEnds = 0, gEmptyEnds = 0;
 // MOCK_XR_STAMP: eye images of submitted projection layers waiting for their stamp read-back.
 static int gStampOn = 0;
+static int gStampFresh = 0;  // MOCK_XR_STAMP=fresh (lane R)
 #define STAMP_PENDING 256
 static struct {
     int slot, eye, fresh;
+    int freshPose;      // lane R: the layer carried fresh poses; expect is its display time
+
     unsigned gen;
     XrTime expect;  // the time the layer's poses were located for
     XrQuaternionf sub;  // lane P: the orientation the layer submitted for this eye
@@ -491,6 +498,10 @@ static struct {
 static int gStampPendingCount = 0;
 static int gStampChecked = 0, gStampMatch = 0, gStampOther = 0, gStampOtherEye = 0, gStampNone = 0, gStampLost = 0, gStampUnknownPose = 0;
 static int gStampOff[5];  // stamp minus locate in refreshes: <=-2, -1, between, +1, >=+2
+// Lane R (MOCK_XR_STAMP=fresh): images of fresh-pose layers by the refreshes between their stamp (the
+// rendered pose's locate) and the layer's display time: 0, 1, 2, >=3, rendered for a later time (error),
+// stamp at no refresh (between, error); fresh-pose layers whose poses are not a locate for their time.
+static int gFreshAge[6], gFreshPoseLayers = 0, gFreshPoseBad = 0;
 // Lane L: the scene words (the scene state each eye's draws used) of every fresh projection layer's eye
 // images, reported at the end (sceneReport): eyes of one set compared, weights per eye, scene steps.
 typedef struct {
@@ -827,7 +838,36 @@ static void stampPoll(int wait) {
         gStampChecked++;
         if (r == -2) gStampLost++;
         else if (r < 0) gStampNone++;
-        else {
+        else if (gStampPending[i].freshPose) {
+            // The image keeps its rendered pose: the stamp names that locate's time, and the pose its fill
+            // wrote must be the mock's head pose for that time (each eye's orientation is the head's).
+            XrTime own = (XrTime)value + gTimeOffset;
+            int64_t age = (int64_t)(gStampPending[i].expect - own);
+            double k = (double)age / (double)gPeriod;
+            long n = lround(k);
+            if (eye != gStampPending[i].eye) {
+                gStampOtherEye++;
+                trace("ERROR stamp: eye %d image carries the other eye's stamp", gStampPending[i].eye);
+                gErrors++;
+            } else if (age < -200000) {
+                gFreshAge[4]++;
+                trace("ERROR stamp: eye %d image of a fresh-pose layer rendered for %.2f ms after its display time", eye, -(double)age / 1e6);
+                gErrors++;
+            } else if (fabs(k - (double)n) * (double)gPeriod > 200000.0) {
+                gFreshAge[5]++;
+                trace("ERROR stamp: eye %d image of a fresh-pose layer rendered for no refresh (%.2f refreshes before)", eye, k);
+                gErrors++;
+            } else {
+                gStampMatch++;
+                gFreshAge[n <= 0 ? 0 : n >= 3 ? 3 : n]++;
+                float yaw;
+                XrPosef head;
+                headPose(own, &yaw, &head);
+                if (gStampPending[i].fresh) sceneAdd(value, eye, gStampPending[i].slot, gStampPending[i].gen);
+                poseAdd(value, eye, gStampPending[i].slot, gStampPending[i].gen, head.orientation, gStampPending[i].fov, own,
+                        gStampPending[i].fresh);
+            }
+        } else {
             int64_t diff = (int64_t)value - (int64_t)(gStampPending[i].expect - gTimeOffset);
             int sameTime = diff > -200000 && diff < 200000;
             if (sameTime && eye == gStampPending[i].eye) {
@@ -1286,6 +1326,11 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
                 "not read back, %d layers with poses from no locate\n",
                 gStampChecked, gStampMatch, gStampOther, gStampOff[0], gStampOff[1], gStampOff[2], gStampOff[3], gStampOff[4], gStampOtherEye,
                 gStampNone, gStampLost, gStampUnknownPose);
+        if (gStampFresh)
+            fprintf(stderr,
+                    "xrmock: fresh-pose stamps: %d layers with new images, %d of them not posed by a locate for their display time; images "
+                    "rendered for that display time %d, 1 refresh before %d, 2 %d, >=3 %d, a later time %d, no refresh %d\n",
+                    gFreshPoseLayers, gFreshPoseBad, gFreshAge[0], gFreshAge[1], gFreshAge[2], gFreshAge[3], gFreshAge[4], gFreshAge[5]);
         sceneReport();
         poseReport();
     }
@@ -1439,6 +1484,17 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
             }
             int located = checkPoses(p, ei->displayTime, fresh);
             if (i < 16) layerLocated[i] = located;
+            // Lane R: with MOCK_XR_STAMP=fresh a layer showing new eye images carries a locate for its own time.
+            int freshPose = gStampFresh && fresh && p->viewCount == 2 && p->views[0].subImage.swapchain != p->views[1].subImage.swapchain;
+            if (freshPose) {
+                gFreshPoseLayers++;
+                if (located < 0 || locateTime(located) != ei->displayTime) {
+                    gFreshPoseBad++;
+                    if (gFreshPoseBad <= 20)
+                        trace("ERROR fresh-pose layer's poses are not a locate for its display time (%s)", located < 0 ? "no locate" : "another time");
+                    gErrors++;
+                }
+            }
             if (!eyesLayer && p->viewCount == 2 && p->views[0].subImage.swapchain != p->views[1].subImage.swapchain) {
                 eyesLayer = p;
                 eyesLocated = located;
@@ -1448,14 +1504,15 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
                 p->views[0].subImage.swapchain != p->views[1].subImage.swapchain) {
                 for (int v = 0; v < 2; v++) {
                     Chain* ch = chainOf(p->views[v].subImage.swapchain);
-                    if (located < 0) gStampUnknownPose++;
+                    if (located < 0 && !freshPose) gStampUnknownPose++;
                     else if (ch->stampSlot < 0) gStampNone++;
                     else if (gStampPendingCount < STAMP_PENDING) {
                         gStampPending[gStampPendingCount].slot = ch->stampSlot;
                         gStampPending[gStampPendingCount].gen = ch->stampGen;
                         gStampPending[gStampPendingCount].eye = v;
                         gStampPending[gStampPendingCount].fresh = fresh;
-                        gStampPending[gStampPendingCount].expect = locateTime(located);
+                        gStampPending[gStampPendingCount].freshPose = freshPose;
+                        gStampPending[gStampPendingCount].expect = freshPose ? ei->displayTime : locateTime(located);
                         gStampPending[gStampPendingCount].sub = p->views[v].pose.orientation;
                         gStampPending[gStampPendingCount].fov = p->views[v].fov;
                         gStampPendingCount++;
@@ -1919,6 +1976,7 @@ static void init(void) {
     gProfile = getenv("MOCK_XR_PROFILE");
     if (gProfile && !*gProfile) gProfile = NULL;
     gStampOn = getenv("MOCK_XR_STAMP") != NULL;
+    gStampFresh = gStampOn && !strcmp(getenv("MOCK_XR_STAMP"), "fresh");
     gHands = getenv("MOCK_XR_HANDS") != NULL;
     const char* presses = getenv("MOCK_XR_PRESS");
     if (presses) {
