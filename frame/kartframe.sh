@@ -30,6 +30,12 @@ log() { echo "$(date +%T) $*"; }
 log "KartFrame wrapper, session $STAMP, steam appid '${SteamAppId:-unset}'"
 
 # One launch's test environment: VAR=value lines (KARTFRAME_*, DISABLE_VULKAN_FDM_INJECTION_LAYER, ...).
+# A queue of one-launch test settings (KFHOME/session.queue/*.env, taken in name order): when no
+# session.env is waiting, the next queued file becomes this launch's session.env.
+if [ ! -f "$KFHOME/session.env" ] && [ -d "$KFHOME/session.queue" ]; then
+    NEXT=$(ls "$KFHOME/session.queue"/*.env 2> /dev/null | head -1)
+    [ -n "$NEXT" ] && { mv "$NEXT" "$KFHOME/session.env"; log "session.queue: using $(basename "$NEXT")"; }
+fi
 if [ -f "$KFHOME/session.env" ]; then
     log "session.env:"; cat "$KFHOME/session.env"; cp "$KFHOME/session.env" "$SESSION/session.env"
     set -a; . "$KFHOME/session.env"; set +a

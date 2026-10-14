@@ -103,3 +103,14 @@ KARTFRAME_NATIVE_CLIP=0 restore the full native race render (by default it stops
 the eyes sample and is clipped to it; the desktop window is black during races). KARTFRAME_FPSLOG=2
 logs a per-segment GPU profile (frame/perf/gpuprof.py tabulates it). Mock: MOCK_XR_MUTABLE=0.
 Details and the profile in frame/perf/RACE120.md; A/B pairs with frame/perf/abgp.sh.
+
+## Lane J switches
+KARTFRAME_EYE_PAIRS=2..8 (default 6): eye swapchain pairs the per-refresh sets rotate through; a pair is
+acquired again only after the frames that showed it are well past SteamVR's composition (the sixth
+session's recording showed one eye at a time re-showing an image 3 to 4 refreshes old with two pairs).
+KARTFRAME_FRAME_LOG=1 writes one XRF line per frame (wake-up, end after wake-up, pair, image per eye,
+display step). Mock: MOCK_XR_COMPOSITE_MS and MOCK_XR_COMPOSITE_SELECT=spec|lazyrel|lazyacq model when
+SteamVR picks each eye's image. frame/perf/panels/analyse.sh SESSION_DIR analyses a KARTFRAME_RECORD=raw
+recording per eye (stale and held refreshes, eyes out of step) in about 4 minutes; see frame/perf/PANELS.md.
+The wrapper takes one-launch settings from KARTFRAME_HOME/session.queue/*.env in name order when no
+session.env is waiting.
