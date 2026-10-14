@@ -155,3 +155,22 @@ layer; cycle also acquires and releases one of its images every frame), KARTFRAM
 all|dawn (default all: GalaxyFrame's ALL_COMMANDS / MEMORY_WRITE to MEMORY_READ|WRITE barrier on every
 image of a set before its writes, submitted by the bridge). XRF lines end in n=<layers>; xrmock prints
 "layer lists per xrEndFrame". Plan: frame/perf/session-h11/README.md.
+
+## Lane R switches (the pose check, and the two levers)
+GalaxyFrame's pose check (notePoses) runs at every xrEndFrame with located views: lane O's end locate
+(one xrLocateViews for the frame's own display time, in the layer's space, after the release) is now
+that check's locate, made in race and menu frames alike (lane O: race only); KARTFRAME_END_LOCATE=0
+still leaves it out. Every 5 s, and when the scene changes, in GalaxyFrame's words plus the scene and
+the locate's own cost: `vr: views of N sets: M for the display time they went out at (off X ms avg, Y
+max); against a locate then: left eye A mm B deg avg, C mm D deg max; right eye ...; eye distance
+E-F mm; race|menus, S s; that locate G ms avg H max` (frames that show a new set, each once, as
+GalaxyFrame counts them). `vr: poses predicted ahead (N sets, S s, race|menus): display time minus the
+set's locate p50 X ms, max Y` (every set, at its start; sets ahead: two refreshes plus SteamVR's lead).
+XRF lines end in aL=/aR= (degrees between each eye's rendered pose and the check's locate, every frame;
+-1 not checked). session-report.py shows both per scene. KARTFRAME_AHEAD_REFRESHES=1 now starts the
+next set at the wake-up before the frame is ended (GalaxyFrame's order) without waiting for Aurora
+(a set still being encoded: the start waits after the end as before), with 4 eye pairs by default.
+KARTFRAME_SUBMIT_POSE=fresh|rendered (default rendered): fresh submits race frames that show a new set
+with the check's poses (the images stay as rendered; repeats of the retained layer keep their own).
+Mock: MOCK_XR_STAMP=fresh checks such layers (poses from a locate for their own display time; each
+image against the locate of its own stamp: "fresh-pose stamps"). Plan: frame/perf/session-h12/README.md.
