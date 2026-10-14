@@ -141,3 +141,10 @@ KARTFRAME_XR_USAGE=galaxy|kart (default galaxy: COLOR_ATTACHMENT | SAMPLED), KAR
 KARTFRAME_XR_EXTENSIONS=galaxy (GalaxyFrame's extension list: drops hand steering, other headsets'
 profiles and the clock conversion; default stays KartFrame's). Mock: MOCK_XR_TRACE_DETAIL=1.
 Comparison and remaining candidates in frame/perf/H9.md.
+
+## Lane P instrumentation
+With KARTFRAME_FRAME_LOG=1 the XRS line carries XRP fields (per eye: the packet used, the pose
+written, the frustum, draws filled from another packet; same=1 when the eyes agree), "VR eye poses
+(10 s)" and "VR eye uniform probe (10 s)" summaries (KARTFRAME_UNIFORM_PROBE=1 for the probe alone);
+the stamp is a 64x15 one-pixel-per-bit block; the mock reads back and decodes before its xrWaitFrame
+sleep so end-after-wake-up is not inflated. In the mock both eyes always used the same packet and pose.
