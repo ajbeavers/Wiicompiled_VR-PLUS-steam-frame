@@ -105,7 +105,7 @@ logs a per-segment GPU profile (frame/perf/gpuprof.py tabulates it). Mock: MOCK_
 Details and the profile in frame/perf/RACE120.md; A/B pairs with frame/perf/abgp.sh.
 
 ## Lane J switches
-KARTFRAME_EYE_PAIRS=2..8 (default 6): eye swapchain pairs the per-refresh sets rotate through; a pair is
+KARTFRAME_EYE_PAIRS=2..8 (lane J set 6; back to 2 for the old loop, 3 for sets ahead): eye swapchain pairs the per-refresh sets rotate through; a pair is
 acquired again only after the frames that showed it are well past SteamVR's composition (the sixth
 session's recording showed one eye at a time re-showing an image 3 to 4 refreshes old with two pairs).
 KARTFRAME_FRAME_LOG=1 writes one XRF line per frame (wake-up, end after wake-up, pair, image per eye,
@@ -114,3 +114,12 @@ SteamVR picks each eye's image. frame/perf/panels/analyse.sh SESSION_DIR analyse
 recording per eye (stale and held refreshes, eyes out of step) in about 4 minutes; see frame/perf/PANELS.md.
 The wrapper takes one-launch settings from KARTFRAME_HOME/session.queue/*.env in name order when no
 session.env is waiting.
+
+## Lane K switches
+The default `pipelined` loop renders each set two refreshes ahead and ends every frame at SteamVR's
+wake-up with the newest finished set (else the retained layer), never waiting inside the cycle.
+KARTFRAME_PIPELINED=wait restores the old one-set-at-a-time loop. KARTFRAME_EYE_PAIRS defaults to 3 with
+sets ahead (3 to 8) and 2 with wait. KARTFRAME_AHEAD_START_US delays each set's start after the wake-up.
+The pacing line ends with dropped= (finished sets released unshown) and end_late= (ends more than 1 ms
+after the wake-up). Mock: MOCK_XR_LATE_END_MS (1.5) models late ends; KF_MOCKRUN_END_GATE=<percent>
+fails a run with more late ends. Details: frame/perf/H7.md.
