@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace mkw::vr {
@@ -176,6 +177,12 @@ public:
     // them is begun (the standalone backend's render-first pacing). Fills the
     // frame's display time, views, flags and validity; requires a running session.
     bool LocateViewsAt(XrTime display_time, OpenXRFrame& frame);
+    // Called after every xrLocateViews with valid views, with the VIEW space (the head) located in the
+    // app space for the same display time; it may replace the views' poses and fields of view before
+    // anything renders or submits them (KARTFRAME_EYE_OFFSETS=fixed, lane M). No hook: no extra locate.
+    using ViewsHook = std::function<void(XrTime display_time, const XrSpaceLocation& head, bool focused,
+                                         std::array<XrView, kOpenXREyeCount>& views)>;
+    void SetViewsHook(ViewsHook hook) { m_views_hook = std::move(hook); }
     bool EndFrame(
         const OpenXRFrame& frame,
         const XrCompositionLayerBaseHeader* const* layers,
@@ -262,6 +269,7 @@ private:
     std::string ResultString(XrResult result) const;
 
     OpenXRLogCallback m_logger;
+    ViewsHook m_views_hook;
     OpenXRConfig m_config;
     OpenXRError m_last_error;
 

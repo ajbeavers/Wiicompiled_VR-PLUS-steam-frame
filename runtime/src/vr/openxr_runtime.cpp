@@ -798,6 +798,12 @@ bool OpenXRRuntime::LocateViewsForFrame(OpenXRFrame& frame) {
     frame.view_state_flags = view_state.viewStateFlags;
     frame.views_valid =
         (view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+    if (m_views_hook && frame.views_valid && m_view_space != XR_NULL_HANDLE) {
+        XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+        if (XR_SUCCEEDED(xrLocateSpace(m_view_space, m_app_space, frame.predicted_display_time, &head))) {
+            m_views_hook(frame.predicted_display_time, head, IsSessionFocused(), frame.views);
+        }
+    }
     return true;
 }
 

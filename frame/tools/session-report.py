@@ -20,12 +20,23 @@ and from "vr pacing totals:" (same fields, the whole session; its percentiles ar
 "vr pacing: ... rendering every second refresh" / "... every refresh again" (half-rate switches).
 A hitch is a second whose GPU p99 or encode p99 is above 100 ms, or a compositor client frame
 interval above 100 ms.
+
+Lane M: "vr eyes: mono=<s> mode=<located|fixed|fixed-capturing> locates=<n> fixed=<n> nohead=<n>
+dpos_mm L=<p50>/<p99> R=<p50>/<p99> drot_deg L=<p50>/<p99> R=<p50>/<p99> dfov_deg L=<max> R=<max>
+head_dps=<p50>/<p99>" (runtime/src/vr/openxr_integration.cpp, EyeOffsets): per second, the change of
+each eye's LOCATED eye-to-head offset from one locate to the next; turning seconds are those whose head
+speed p99 is above 30 deg/s.
 """
 import os
 import re
 import sys
 
 HITCH_MS = 100.0
+EYES = re.compile(r"vr eyes: mono=[\d.]+ mode=(?P<mode>\S+) locates=\d+ fixed=(?P<fixed>\d+) nohead=\d+ "
+                  r"dpos_mm L=(?P<pl50>[\d.]+)/(?P<pl99>[\d.]+) R=(?P<pr50>[\d.]+)/(?P<pr99>[\d.]+) "
+                  r"drot_deg L=(?P<rl50>[\d.]+)/(?P<rl99>[\d.]+) R=(?P<rr50>[\d.]+)/(?P<rr99>[\d.]+) "
+                  r"dfov_deg L=(?P<fl>[\d.]+) R=(?P<fr>[\d.]+) head_dps=(?P<h50>[\d.]+)/(?P<h99>[\d.]+)")
+TURNING_DPS = 30.0
 PACING = re.compile(r"vr pacing(?P<tot> totals)?: t=(?P<t>[\d.]+) hz=(?P<hz>[\d.]+) mode=(?P<mode>\S+) ticks=(?P<ticks>\d+) "
                     r"rendered=(?P<rendered>\d+) interpolated=(?P<interp>\d+) late=(?P<late>\d+) missed=(?P<missed>\d+) "
                     r"repeats=(?P<repeats>\d+) gpu_ms=(?P<g50>[\d.]+)/(?P<g99>[\d.]+) encode_ms=(?P<e50>[\d.]+)/(?P<e99>[\d.]+)")
@@ -36,7 +47,8 @@ def parse_game_log(path):
          "interp": 0, "late": 0, "missed": 0, "repeats": 0, "g50": [], "g99": [], "e50": [], "e99": [],
          "totals": None, "half": 0, "full": 0, "hitch": 0, "hitch_notes": [], "refresh_note": None,
          "worst_late": (0, 0), "race": None, "in_race": False, "end50": [], "end99": [], "pairwait": 0, "pairs": None,
-         "dropped": 0, "end_late": 0, "end_n": 0,
+         "dropped": 0, "end_late": 0, "end_n": 0, "eyes": {k: [] for k in ("menus", "race")}, "eye_modes": set(),
+         "eye_fixed": None,
          "parts": {k: {"seconds": 0, "rendered": 0, "late": 0, "ticks": 0, "g50": [], "g99": [], "e50": []} for k in ("menus", "race")}}
     with open(path, errors="replace") as f:
         for line in f:
@@ -48,6 +60,16 @@ def parse_game_log(path):
                     r["race"] = r["t_last"]
             elif "exited RaceScene" in line or "presentation=virtual-screen" in line or "presentation=desktop" in line:
                 r["in_race"] = False
+            m = EYES.search(line)
+            if m:
+                d = {k: (v if k == "mode" else float(v)) for k, v in m.groupdict().items()}
+                r["eye_modes"].add(d["mode"])
+                r["eyes"]["race" if r["in_race"] else "menus"].append(d)
+                continue
+            if "OpenXR eye offsets fixed" in line:
+                ef = re.search(r"IPD ([\d.]+) mm.*?\|left x\| - \|right x\| (-?[\d.]+) mm", line)
+                if ef:
+                    r["eye_fixed"] = "IPD %s mm, |L x|-|R x| %s mm" % ef.groups()
             m = PACING.search(line)
             if m:
                 d = m.groupdict()
@@ -197,6 +219,26 @@ def build(sessions):
         add("%s: GPU ms p50 (median s) / p99 (worst s), encode p50" % name, lambda g, v, part=part: "%s / %s, %s" % (
             fmt(median(part(g)["g50"]), "%.2f"), fmt(max(part(g)["g99"]) if part(g)["g99"] else None, "%.2f"),
             fmt(median(part(g)["e50"]), "%.2f")) if g else "-")
+    add("eye offsets (vr eyes lines)", lambda g, v: ",".join(sorted(g["eye_modes"])) + (" (%s)" % g["eye_fixed"] if g["eye_fixed"] else "")
+        if g and g["eye_modes"] else "-")
+    for name in ("menus", "race"):
+        def eyes(g, turning, name=name):
+            return [d for d in g["eyes"][name] if not turning or d["h99"] > TURNING_DPS]
+
+        def eyerow(g, turning, a, b, name=name):
+            xs = eyes(g, turning, name)
+            if not xs:
+                return "-"
+            return "%d s: L %s / %s, R %s / %s" % (len(xs), fmt(median([d[a + "50"] for d in xs]), "%.3f"), fmt(max(d[a + "99"] for d in xs), "%.3f"),
+                                                  fmt(median([d[b + "50"] for d in xs]), "%.3f"), fmt(max(d[b + "99"] for d in xs), "%.3f"))
+        for turning in (False, True):
+            tag = "%s%s" % (name, ", turning" if turning else "")
+            add("%s: eye offset change per locate mm p50 (median s) / p99 (worst s)" % tag,
+                lambda g, v, t=turning, n=name: eyerow(g, t, "pl", "pr", n) if g else "-")
+            add("%s: eye rotation change per locate deg p50 / p99" % tag,
+                lambda g, v, t=turning, n=name: eyerow(g, t, "rl", "rr", n) if g else "-")
+        add("%s: eye fov change max deg L / R" % name, lambda g, v, n=name: "%s / %s" % (
+            fmt(max(d["fl"] for d in g["eyes"][n]), "%.4f"), fmt(max(d["fr"] for d in g["eyes"][n]), "%.4f")) if g and g["eyes"][n] else "-")
     add("compositor seconds logged", lambda g, v: str(v["seconds"]) if v else "no vrtiming.log")
     add("compositor frames", lambda g, v: str(v["frames"]) if v else "-")
     add("  app frames reused", lambda g, v: "%d (%s)" % (v["reused"], pct(v["reused"], v["frames"])) if v else "-")

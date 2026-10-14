@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <deque>
 #include <fstream>
 #include <memory>
@@ -32,6 +33,7 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #if defined(MKW_ENABLE_OPENXR)
@@ -226,6 +228,266 @@ XrPosef ScreenPoseAhead(const OpenXRFrame& frame, float distance) noexcept {
     pose.position = {screen.position[0],screen.position[1],screen.position[2]};
     return pose;
 }
+
+// ---- Eye offsets (lane M) ----
+//
+// The eighth headset session: with sets ahead and every frame ended at the wake-up, the image still
+// zigzagged on head turns, mostly in the right eye, with the kart standing still too. SteamVR on the
+// Frame has gaze-dependent eye positions on (steamvr.gazeDepEyeToHeadEnable): each eye's pose from
+// xrLocateViews moves with the tracked gaze, and the eyes counter-rotate during head turns. If SteamVR
+// composes an eye with a newer gaze sample than the one it gave us ~42 ms earlier, each eye's image is
+// corrected by a different amount each refresh. KARTFRAME_EYE_OFFSETS=fixed renders and submits each eye
+// at the head (VIEW space) pose composed with a fixed eye-to-head offset (the median of the first 120
+// focused locates), with the field of view captured then too, so gaze motion cannot reach the images;
+// =located (default) keeps the runtime's per-locate eye poses. The submitted poses are the rendered
+// ones either way (the frame's views are replaced before anything uses them).
+//
+// Logging: "vr eyes:" once a second (with KARTFRAME_FRAME_LOG=1 or `fixed`): per eye, the change of
+// the LOCATED eye-to-head offset from one locate to the next, p50/p99 in mm and degrees, the largest
+// field-of-view change, and the head's angular speed. KARTFRAME_FRAME_LOG=1 adds one XRE line per locate:
+//   XRE x=<display time, ms since the first locate> m=<L located views used, F fixed, C fixed but still
+//   capturing> h=<head position mm> q=<head orientation x,y,z,w> L=<left eye offset in the head's frame,
+//   mm>/<its rotation, degrees, as a rotation vector> dL=<offset change since the last locate, mm>/<deg>
+//   fL=<largest fov angle change, deg> R=... dR=... fR=...
+class EyeOffsets {
+public:
+    static constexpr size_t kCaptureLocates = 120;
+
+    void Configure() {
+        const char* mode = std::getenv("KARTFRAME_EYE_OFFSETS");
+        fixed_ = mode != nullptr && std::string_view(mode) == "fixed";
+        const char* log = std::getenv("KARTFRAME_FRAME_LOG");
+        frame_log_ = log != nullptr && log[0] == '1';
+        RT_LOG(RT_TAG_RUNTIME) << "OpenXR eye offsets: "
+                               << (fixed_ ? "fixed (head pose with the median eye-to-head offsets of the first "
+                                            "120 focused locates)"
+                                          : "located (the runtime's per-locate eye poses)")
+                               << (Active() ? "; logged per second (vr eyes)" : "") << std::endl;
+    }
+    bool Active() const { return fixed_ || frame_log_; }
+
+    void OnLocate(XrTime display_time, const XrSpaceLocation& head, bool focused,
+                  std::array<XrView, kOpenXREyeCount>& views) {
+        std::lock_guard lock(mutex_);
+        constexpr XrSpaceLocationFlags kValid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        if ((head.locationFlags & kValid) != kValid) {
+            ++second_.fallback;
+            return;
+        }
+        const Q qh = ToQ(head.pose.orientation);
+        const V ph = ToV(head.pose.position);
+        Eye now[kOpenXREyeCount];
+        for (uint32_t e = 0; e < kOpenXREyeCount; ++e) {
+            now[e].pos = Rotate(Conj(qh), Sub(ToV(views[e].pose.position), ph));
+            now[e].rot = Canon(Mul(Conj(qh), ToQ(views[e].pose.orientation)));
+            now[e].fov = views[e].fov;
+        }
+        // Change since the last locate, per eye; the head's angular speed.
+        double dpos[kOpenXREyeCount] = {}, drot[kOpenXREyeCount] = {}, dfov[kOpenXREyeCount] = {};
+        if (have_last_) {
+            for (uint32_t e = 0; e < kOpenXREyeCount; ++e) {
+                dpos[e] = Len(Sub(now[e].pos, last_[e].pos)) * 1000.0;
+                drot[e] = AngleDeg(Mul(Conj(last_[e].rot), now[e].rot));
+                dfov[e] = FovChangeDeg(now[e].fov, last_[e].fov);
+                second_.dpos[e].push_back(dpos[e]);
+                second_.drot[e].push_back(drot[e]);
+                second_.dfov[e] = std::max(second_.dfov[e], dfov[e]);
+            }
+            const double dt = static_cast<double>(display_time - last_time_) / 1e9;
+            if (dt > 1e-4) second_.head_dps.push_back(AngleDeg(Mul(Conj(last_head_), qh)) / dt);
+        }
+        for (uint32_t e = 0; e < kOpenXREyeCount; ++e) last_[e] = now[e];
+        last_head_ = qh;
+        last_time_ = display_time;
+        have_last_ = true;
+        ++second_.locates;
+
+        char mode = 'L';
+        if (fixed_) {
+            if (!captured_) {
+                mode = 'C';
+                if (focused) {
+                    for (uint32_t e = 0; e < kOpenXREyeCount; ++e) capture_[e].push_back(now[e]);
+                    if (capture_[0].size() >= kCaptureLocates) FinishCapture();
+                }
+            }
+            if (captured_) {
+                mode = 'F';
+                for (uint32_t e = 0; e < kOpenXREyeCount; ++e) {
+                    const Q q = Normalize(Mul(qh, fixed_eye_[e].rot));
+                    const V p = Add(ph, Rotate(qh, fixed_eye_[e].pos));
+                    views[e].pose.orientation = {static_cast<float>(q.x), static_cast<float>(q.y), static_cast<float>(q.z),
+                                                 static_cast<float>(q.w)};
+                    views[e].pose.position = {static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z)};
+                    views[e].fov = fixed_eye_[e].fov;
+                }
+                ++second_.fixed;
+            }
+        }
+
+        if (frame_log_) {
+            if (first_time_ == 0) first_time_ = display_time;
+            char line[400];
+            const V l = now[0].pos, r = now[1].pos;
+            const V lr = RotVecDeg(now[0].rot), rr = RotVecDeg(now[1].rot);
+            std::snprintf(line, sizeof(line),
+                          "XRE x=%.3f m=%c h=%.1f,%.1f,%.1f q=%.5f,%.5f,%.5f,%.5f L=%.2f,%.2f,%.2f/%.3f,%.3f,%.3f "
+                          "dL=%.3f/%.4f fL=%.4f R=%.2f,%.2f,%.2f/%.3f,%.3f,%.3f dR=%.3f/%.4f fR=%.4f",
+                          static_cast<double>(display_time - first_time_) / 1e6, mode, ph.x * 1000.0, ph.y * 1000.0,
+                          ph.z * 1000.0, qh.x, qh.y, qh.z, qh.w, l.x * 1000.0, l.y * 1000.0, l.z * 1000.0, lr.x, lr.y,
+                          lr.z, dpos[0], drot[0], dfov[0], r.x * 1000.0, r.y * 1000.0, r.z * 1000.0, rr.x, rr.y, rr.z,
+                          dpos[1], drot[1], dfov[1]);
+            RT_LOG(RT_TAG_RUNTIME) << line << std::endl;
+        }
+
+        const auto wall = std::chrono::steady_clock::now();
+        if (second_start_ == std::chrono::steady_clock::time_point{}) second_start_ = wall;
+        if (wall - second_start_ >= std::chrono::seconds(1)) {
+            LogSecond(wall);
+            second_ = {};
+            second_start_ = wall;
+        }
+    }
+
+private:
+    struct V { double x = 0, y = 0, z = 0; };
+    struct Q { double x = 0, y = 0, z = 0, w = 1; };
+    struct Eye { V pos; Q rot; XrFovf fov{}; };
+    struct Second {
+        std::vector<double> dpos[kOpenXREyeCount], drot[kOpenXREyeCount], head_dps;
+        double dfov[kOpenXREyeCount] = {};
+        uint32_t locates = 0, fixed = 0, fallback = 0;
+    };
+
+    static V ToV(const XrVector3f& v) { return {v.x, v.y, v.z}; }
+    static Q ToQ(const XrQuaternionf& q) { return {q.x, q.y, q.z, q.w}; }
+    static V Sub(V a, V b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+    static V Add(V a, V b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+    static double Len(V a) { return std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z); }
+    static Q Conj(Q q) { return {-q.x, -q.y, -q.z, q.w}; }
+    static Q Mul(Q a, Q b) {
+        return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+    }
+    static Q Normalize(Q q) {
+        const double n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        return n > 0 ? Q{q.x / n, q.y / n, q.z / n, q.w / n} : Q{};
+    }
+    static Q Canon(Q q) { q = Normalize(q); return q.w < 0 ? Q{-q.x, -q.y, -q.z, -q.w} : q; }
+    static V Rotate(Q q, V v) {
+        // v + 2w(u x v) + 2 u x (u x v), u = q's vector part
+        const V u{q.x, q.y, q.z};
+        const V c{u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x};
+        const V cc{u.y * c.z - u.z * c.y, u.z * c.x - u.x * c.z, u.x * c.y - u.y * c.x};
+        return {v.x + 2.0 * (q.w * c.x + cc.x), v.y + 2.0 * (q.w * c.y + cc.y), v.z + 2.0 * (q.w * c.z + cc.z)};
+    }
+    static double AngleDeg(Q q) {
+        q = Canon(q);
+        return 2.0 * std::atan2(std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z), q.w) * 180.0 / 3.14159265358979323846;
+    }
+    static V RotVecDeg(Q q) {
+        q = Canon(q);
+        const double s = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+        if (s < 1e-12) return {};
+        const double k = 2.0 * std::atan2(s, q.w) * 180.0 / 3.14159265358979323846 / s;
+        return {q.x * k, q.y * k, q.z * k};
+    }
+    static double FovChangeDeg(const XrFovf& a, const XrFovf& b) {
+        const double m = std::max({std::fabs(a.angleLeft - b.angleLeft), std::fabs(a.angleRight - b.angleRight),
+                                   std::fabs(a.angleUp - b.angleUp), std::fabs(a.angleDown - b.angleDown)});
+        return m * 180.0 / 3.14159265358979323846;
+    }
+    static double Percentile(std::vector<double>& v, double p) {
+        if (v.empty()) return 0.0;
+        const size_t k = std::min(v.size() - 1, static_cast<size_t>(p * static_cast<double>(v.size() - 1) + 0.5));
+        std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+        return v[k];
+    }
+    static double Median(std::vector<double> v) { return Percentile(v, 0.5); }
+
+    void FinishCapture() {
+        for (uint32_t e = 0; e < kOpenXREyeCount; ++e) {
+            auto& s = capture_[e];
+            auto med = [&](auto get) {
+                std::vector<double> v;
+                v.reserve(s.size());
+                for (const auto& x : s) v.push_back(get(x));
+                return Median(std::move(v));
+            };
+            Eye f;
+            f.pos = {med([](const Eye& x) { return x.pos.x; }), med([](const Eye& x) { return x.pos.y; }),
+                     med([](const Eye& x) { return x.pos.z; })};
+            f.rot = Canon({med([](const Eye& x) { return x.rot.x; }), med([](const Eye& x) { return x.rot.y; }),
+                           med([](const Eye& x) { return x.rot.z; }), med([](const Eye& x) { return x.rot.w; })});
+            f.fov.angleLeft = static_cast<float>(med([](const Eye& x) { return static_cast<double>(x.fov.angleLeft); }));
+            f.fov.angleRight = static_cast<float>(med([](const Eye& x) { return static_cast<double>(x.fov.angleRight); }));
+            f.fov.angleUp = static_cast<float>(med([](const Eye& x) { return static_cast<double>(x.fov.angleUp); }));
+            f.fov.angleDown = static_cast<float>(med([](const Eye& x) { return static_cast<double>(x.fov.angleDown); }));
+            // How far the captured locates strayed from the median (gaze, noise): p50/max, mm and deg.
+            std::vector<double> dp, dr;
+            for (const auto& x : s) {
+                dp.push_back(Len(Sub(x.pos, f.pos)) * 1000.0);
+                dr.push_back(AngleDeg(Mul(Conj(f.rot), x.rot)));
+            }
+            spread_[e][0] = Median(dp);
+            spread_[e][1] = *std::max_element(dp.begin(), dp.end());
+            spread_[e][2] = Median(dr);
+            spread_[e][3] = *std::max_element(dr.begin(), dr.end());
+            fixed_eye_[e] = f;
+            s.clear();
+            s.shrink_to_fit();
+        }
+        captured_ = true;
+        constexpr double kDeg = 180.0 / 3.14159265358979323846;
+        const V l = fixed_eye_[0].pos, r = fixed_eye_[1].pos;
+        const V mid{(l.x + r.x) * 500.0, (l.y + r.y) * 500.0, (l.z + r.z) * 500.0};
+        char line[900];
+        int n = std::snprintf(line, sizeof(line), "OpenXR eye offsets fixed (median of %zu focused locates): IPD %.2f mm, "
+                              "eye midpoint from the head %.2f,%.2f,%.2f mm, |left x| - |right x| %.2f mm",
+                              kCaptureLocates, Len(Sub(r, l)) * 1000.0, mid.x, mid.y, mid.z,
+                              (std::fabs(l.x) - std::fabs(r.x)) * 1000.0);
+        for (uint32_t e = 0; e < kOpenXREyeCount && n > 0 && static_cast<size_t>(n) < sizeof(line); ++e) {
+            const auto& f = fixed_eye_[e];
+            const V rv = RotVecDeg(f.rot);
+            n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n),
+                               "; %s: %.2f,%.2f,%.2f mm, rotation %.3f,%.3f,%.3f deg, fov l/r/u/d %.2f/%.2f/%.2f/%.2f deg, "
+                               "captured spread mm p50/max %.2f/%.2f deg %.3f/%.3f",
+                               e == 0 ? "left" : "right", f.pos.x * 1000.0, f.pos.y * 1000.0, f.pos.z * 1000.0, rv.x, rv.y,
+                               rv.z, f.fov.angleLeft * kDeg, f.fov.angleRight * kDeg, f.fov.angleUp * kDeg,
+                               f.fov.angleDown * kDeg, spread_[e][0], spread_[e][1], spread_[e][2], spread_[e][3]);
+        }
+        RT_LOG(RT_TAG_RUNTIME) << line << std::endl;
+    }
+
+    void LogSecond(std::chrono::steady_clock::time_point wall) {
+        char line[400];
+        const double mono = std::chrono::duration<double>(wall.time_since_epoch()).count();
+        std::snprintf(line, sizeof(line),
+                      "vr eyes: mono=%.3f mode=%s locates=%u fixed=%u nohead=%u dpos_mm L=%.3f/%.3f R=%.3f/%.3f "
+                      "drot_deg L=%.4f/%.4f R=%.4f/%.4f dfov_deg L=%.4f R=%.4f head_dps=%.1f/%.1f",
+                      mono, fixed_ ? (captured_ ? "fixed" : "fixed-capturing") : "located", second_.locates, second_.fixed,
+                      second_.fallback, Percentile(second_.dpos[0], 0.5), Percentile(second_.dpos[0], 0.99),
+                      Percentile(second_.dpos[1], 0.5), Percentile(second_.dpos[1], 0.99), Percentile(second_.drot[0], 0.5),
+                      Percentile(second_.drot[0], 0.99), Percentile(second_.drot[1], 0.5), Percentile(second_.drot[1], 0.99),
+                      second_.dfov[0], second_.dfov[1], Percentile(second_.head_dps, 0.5), Percentile(second_.head_dps, 0.99));
+        RT_LOG(RT_TAG_RUNTIME) << line << std::endl;
+    }
+
+    std::mutex mutex_;
+    bool fixed_ = false;
+    bool frame_log_ = false;
+    bool captured_ = false;
+    bool have_last_ = false;
+    Eye last_[kOpenXREyeCount];
+    Q last_head_;
+    XrTime last_time_ = 0;
+    XrTime first_time_ = 0;
+    std::vector<Eye> capture_[kOpenXREyeCount];
+    Eye fixed_eye_[kOpenXREyeCount];
+    double spread_[kOpenXREyeCount][4] = {};
+    Second second_;
+    std::chrono::steady_clock::time_point second_start_{};
+};
 
 // Hand steering draws the player's hands, in the runtime's own hand mesh where
 // it offers one (XR_FB_hand_tracking_mesh). Only asked for when hand steering
@@ -422,6 +684,13 @@ public:
         }
 #endif
         runtime_ = std::make_unique<OpenXRRuntime>(logger_);
+        eye_offsets_.Configure();
+        if (eye_offsets_.Active()) {
+            runtime_->SetViewsHook([this](XrTime time, const XrSpaceLocation& head, bool focused,
+                                          std::array<XrView, kOpenXREyeCount>& views) {
+                eye_offsets_.OnLocate(time, head, focused, views);
+            });
+        }
 #if defined(_WIN32)
         backend_ = std::make_unique<GraphicsBackend>(logger_, kRequiredAuroraBackend == BACKEND_VULKAN);
 #else
@@ -2652,6 +2921,7 @@ private:
     }
 
     OpenXRLogCallback logger_;
+    EyeOffsets eye_offsets_; // before runtime_: its views hook calls into it
     std::unique_ptr<OpenXRRuntime> runtime_;
     std::unique_ptr<GraphicsBackend> backend_;
 #if defined(__ANDROID__)
