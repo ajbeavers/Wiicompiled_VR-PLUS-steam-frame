@@ -827,12 +827,18 @@ public:
 #endif
         if (pacing_mode_ == PacingMode::Pipelined) {
             RT_LOG(RT_TAG_RUNTIME) << "OpenXR pipelined pacing: "
-                                   << (ahead_ ? "sets rendered two refreshes ahead, every frame ended at its wake-up "
-                                                "with the newest finished set (KARTFRAME_PIPELINED=wait: the old loop)"
+                                   << (ahead_ ? (ahead_lead_ == 1 ? "sets rendered one refresh ahead (KARTFRAME_AHEAD_REFRESHES=1), "
+                                                                    "every frame ended at its wake-up with the newest finished set"
+                                                                  : "sets rendered two refreshes ahead, every frame ended at its wake-up "
+                                                                    "with the newest finished set (KARTFRAME_PIPELINED=wait: the old loop)")
                                               : ahead_wanted_ ? "one set at a time, frames ended when it finishes "
                                                                 "(sets ahead need GPU completion polling)"
                                                               : "one set at a time, frames ended when it finishes "
                                                                 "(KARTFRAME_PIPELINED=wait)")
+                                   << (ahead_ && ahead_start_delay_.count() > 0
+                                           ? "; each set starts " + std::to_string(ahead_start_delay_.count()) +
+                                                 " us after the wake-up (KARTFRAME_AHEAD_START_US)"
+                                           : std::string())
                                    << std::endl;
         }
         running_.store(true, std::memory_order_release);
@@ -1505,6 +1511,11 @@ private:
             start_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
         }
         ahead_start_delay_ = std::chrono::microseconds(start_us);
+        // KARTFRAME_AHEAD_REFRESHES=1 (lane M): each set is located for the next refresh's display time
+        // instead of two refreshes ahead: one refresh less pose prediction (about 33 ms instead of 42),
+        // one refresh less for its encode and GPU work. Up to two sets stay in flight either way.
+        const char* lead_env = std::getenv("KARTFRAME_AHEAD_REFRESHES");
+        ahead_lead_ = lead_env != nullptr && std::string_view(lead_env) == "1" ? 1 : 2;
         // Every refresh by default: a late set repeats the retained layer with its own poses
         // (the compositor reprojects it). Half rate shows 60 Hz content twice on a 120 Hz panel,
         // the judder and head-turn ghosting the owner rejected; in H1 the old auto rule flapped
@@ -1810,7 +1821,7 @@ private:
     // ahead, so each set has the rest of this refresh and all of the next (about 16 ms) for its encode
     // and GPU work while the set before it is shown; one set is on the GPU while the next is encoded.
     // Up to two sets in flight, each on an eye pair of its own (three pairs at least).
-    static constexpr size_t kAheadLead = 2;
+    static constexpr size_t kAheadInFlight = 2;
 
     CycleResult AheadCycle(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
                            uint32_t interpolation_target, bool allow_start, bool& immersive_submission_logged) {
@@ -1923,14 +1934,14 @@ private:
             }
         }
 
-        // The set for two refreshes ahead.
-        const XrTime target = now_display + static_cast<XrDuration>(kAheadLead) * period;
+        // The set for two refreshes ahead (KARTFRAME_AHEAD_REFRESHES=1: the next refresh).
+        const XrTime target = now_display + static_cast<XrDuration>(ahead_lead_) * period;
         st.odd_tick = !st.odd_tick;
         const bool render_tick = (!st.half_rate || st.odd_tick) &&
                                  interpolation_pacing_.ShouldRender(target, interpolation_target);
         const bool covered = !ahead_sets_.empty() &&
                              ahead_sets_.back().set.xr_frame.predicted_display_time >= target - half;
-        if (allow_start && !startup_origin_pending_ && render_tick && !covered && ahead_sets_.size() < kAheadLead) {
+        if (allow_start && !startup_origin_pending_ && render_tick && !covered && ahead_sets_.size() < kAheadInFlight) {
             // Aurora takes one set at a time: the last one must have reached its queue first. Waiting
             // for that is bounded by this cycle's end (the next xrWaitFrame must not start late).
             const auto deadline = backend_->CycleWakeTime() + std::chrono::nanoseconds(period) - pacing_margin_;
@@ -2981,6 +2992,7 @@ private:
     bool ahead_ = false;
     bool ahead_wanted_ = false;
     std::chrono::microseconds ahead_start_delay_{0};
+    size_t ahead_lead_ = 2; // refreshes between a set's start and its display time (KARTFRAME_AHEAD_REFRESHES)
     bool SetsInFlight() const { return set_pacing_.pending || !ahead_sets_.empty(); }
     std::chrono::steady_clock::time_point last_focused_{};
     PacingMode pacing_mode_ = PacingMode::Pipelined;
