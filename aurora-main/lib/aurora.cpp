@@ -907,6 +907,155 @@ const wgpu::TextureView& eye_output_view(uint32_t eye) noexcept {
   return g_directEyes[eye].texture ? g_directEyes[eye].view : g_stereoEyeTargets[eye].output().view;
 }
 
+// Whether a race's eyes render straight into the swapchain images (no copy) or into Aurora's own
+// targets, copied into them. Which is cheaper depends on the runtime's images, not on us: in the mock,
+// images in ordinary device memory took the eyes directly 0.9 ms a set cheaper than the 1.3 to 1.9 ms
+// copy; images in host-visible write-combined memory made the eye passes 1.5 ms dearer than the copy.
+// So the race's refresh sets measure both ways with GPU timestamps (first eye pass to the end of the
+// sink, blocks of 16 sets alternating, after the first 600) and keep the cheaper for the process.
+// KARTFRAME_DIRECT_EYES=1 / 0 forces one way. Frame worker thread, except the readback callback.
+class DirectEyesCalibration {
+public:
+  // The way for this set: 1 straight into the images, 0 copied. Marks the set measured or not.
+  int choose() noexcept {
+    std::lock_guard lock(mutex_);
+    measuring_ = false;
+    if (forced_ >= 0) return forced_;
+    if (decided_ >= 0) return decided_;
+    if (!webgpu::g_timestampQueriesSupported) return decide_locked(true), decided_;
+    const uint32_t n = sets_++;
+    if (n < kSkip) return 0;
+    if (n >= kSkip + kTrialSets || (samples_[0].size() >= kWanted && samples_[1].size() >= kWanted)) {
+      decide_locked(false);
+      return decided_;
+    }
+    measuring_ = true;
+    way_ = static_cast<int>(((n - kSkip) / kBlock) & 1u) ^ 1;
+    return way_;
+  }
+  void begin(wgpu::CommandEncoder& encoder) noexcept { mark(encoder, true); }
+  void end(wgpu::CommandEncoder& encoder) noexcept { mark(encoder, false); }
+  void after_submit() noexcept {
+    if (pending_ < 0) return;
+    auto& slot = slots_[static_cast<size_t>(pending_)];
+    const int way = slot.way;
+    const size_t index = static_cast<size_t>(pending_);
+    pending_ = -1;
+    slot.readback.MapAsync(wgpu::MapMode::Read, 0, 2 * sizeof(uint64_t), wgpu::CallbackMode::AllowSpontaneous,
+                           [this, index, way](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                             auto& slot = slots_[index];
+                             std::lock_guard lock(mutex_);
+                             if (status == wgpu::MapAsyncStatus::Success) {
+                               const auto* t = static_cast<const uint64_t*>(
+                                   slot.readback.GetConstMappedRange(0, 2 * sizeof(uint64_t)));
+                               if (t != nullptr && t[1] > t[0] && decided_ < 0) {
+                                 samples_[way].push_back(static_cast<float>(t[1] - t[0]) / 1e6f);
+                               }
+                               slot.mapped = true;
+                             }
+                             slot.busy = status == wgpu::MapAsyncStatus::Success;
+                             if (!slot.busy) slot.mapped = false;
+                           });
+  }
+  int decided() noexcept {
+    std::lock_guard lock(mutex_);
+    return forced_ >= 0 ? forced_ : decided_;
+  }
+  DirectEyesCalibration() {
+    const char* env = std::getenv("KARTFRAME_DIRECT_EYES");
+    forced_ = env != nullptr && (env[0] == '0' || env[0] == '1') ? env[0] - '0' : -1;
+  }
+
+private:
+  static constexpr uint32_t kSkip = 600, kBlock = 16, kTrialSets = 2400, kWanted = 200;
+  struct Slot {
+    wgpu::QuerySet queries;
+    wgpu::Buffer resolve, readback;
+    int way = 0;
+    bool busy = false, mapped = false;
+  };
+  void decide_locked(bool noTimer) noexcept {
+    const auto median = [](std::vector<float>& v) {
+      if (v.empty()) return 0.f;
+      std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+      return v[v.size() / 2];
+    };
+    const size_t n0 = samples_[0].size(), n1 = samples_[1].size();
+    const float copy = median(samples_[0]), direct = median(samples_[1]);
+    decided_ = !noTimer && n0 >= 30 && n1 >= 30 && direct < copy ? 1 : 0;
+    Log.info("VR eyes: eye passes and output {:.2f} ms a set rendered straight into the swapchain images ({} sets), "
+             "{:.2f} ms rendered apart and copied ({} sets){}: {} for this session",
+             direct, n1, copy, n0, noTimer ? " (no GPU timestamps)" : "",
+             decided_ ? "straight into the images" : "copied");
+    samples_[0].clear();
+    samples_[1].clear();
+  }
+  void mark(wgpu::CommandEncoder& encoder, bool begin) noexcept {
+    if (!measuring_) return;
+    if (begin) {
+      pending_ = -1;
+      for (size_t i = 0; i < slots_.size(); ++i) {
+        std::lock_guard lock(mutex_);
+        auto& slot = slots_[i];
+        if (slot.busy && !slot.mapped) continue;
+        if (slot.mapped) {
+          slot.readback.Unmap();
+          slot.mapped = false;
+        }
+        slot.busy = true;
+        pending_ = static_cast<int>(i);
+        break;
+      }
+      if (pending_ < 0) {
+        measuring_ = false;
+        return;
+      }
+      auto& slot = slots_[static_cast<size_t>(pending_)];
+      slot.way = way_;
+      if (!slot.queries) {
+        const wgpu::QuerySetDescriptor qd{.type = wgpu::QueryType::Timestamp, .count = 2};
+        slot.queries = g_device.CreateQuerySet(&qd);
+        const wgpu::BufferDescriptor rd{.usage = wgpu::BufferUsage::QueryResolve | wgpu::BufferUsage::CopySrc,
+                                        .size = 2 * sizeof(uint64_t)};
+        slot.resolve = g_device.CreateBuffer(&rd);
+        const wgpu::BufferDescriptor bd{.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                        .size = 2 * sizeof(uint64_t)};
+        slot.readback = g_device.CreateBuffer(&bd);
+      }
+      if (!marker_) {
+        const wgpu::TextureDescriptor td{.usage = wgpu::TextureUsage::RenderAttachment,
+                                         .size = {1, 1, 1},
+                                         .format = wgpu::TextureFormat::RGBA8Unorm};
+        marker_ = g_device.CreateTexture(&td).CreateView();
+      }
+    }
+    if (pending_ < 0) return;
+    auto& slot = slots_[static_cast<size_t>(pending_)];
+    const wgpu::PassTimestampWrites writes{
+        .querySet = slot.queries,
+        .beginningOfPassWriteIndex = begin ? 0u : wgpu::kQuerySetIndexUndefined,
+        .endOfPassWriteIndex = begin ? wgpu::kQuerySetIndexUndefined : 1u,
+    };
+    const wgpu::RenderPassColorAttachment ca{.view = marker_, .loadOp = wgpu::LoadOp::Clear,
+                                             .storeOp = wgpu::StoreOp::Discard};
+    const wgpu::RenderPassDescriptor rd{.label = "VR eye output timing", .colorAttachmentCount = 1,
+                                        .colorAttachments = &ca, .timestampWrites = &writes};
+    encoder.BeginRenderPass(&rd).End();
+    if (!begin) {
+      encoder.ResolveQuerySet(slot.queries, 0, 2, slot.resolve, 0);
+      encoder.CopyBufferToBuffer(slot.resolve, 0, slot.readback, 0, 2 * sizeof(uint64_t));
+    }
+  }
+  std::mutex mutex_;
+  int forced_ = -1, decided_ = -1, way_ = 0, pending_ = -1;
+  bool measuring_ = false;
+  uint32_t sets_ = 0;
+  std::array<std::vector<float>, 2> samples_;
+  std::array<Slot, 6> slots_;
+  wgpu::TextureView marker_;
+};
+DirectEyesCalibration g_directEyesCalibration;
+
 // An immersive set's eyes go straight into the acquired swapchain images when the sink takes them (the
 // backend allows it per set: it measures which way is cheaper on the runtime's images) and
 // nothing else needs Aurora's own eye targets this set: no MSAA resolve, no orientation correction, no
@@ -2200,7 +2349,10 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
     gfx::gpu_timing_end_frame(encoder);  // closes the slot; nothing was recorded on the GPU
     return;
   }
-  use_direct_eye_targets(replay, *input);
+  if (g_directEyesCalibration.choose() == 1) {
+    use_direct_eye_targets(replay, *input);
+  }
+  g_directEyesCalibration.begin(encoder);
   for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
     gfx::render_stereo_eye(sealedFrame, encoder, replay, eye, false);
     // The panel texture from the last sealed frame; its draw data is not ours to touch here.
@@ -2211,6 +2363,7 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
   const auto sink = run_stereo_sink(encoder, input->frameToken, g_retainedStereo.logicalFrame, input->mode, true,
                                     input->displayTimeNanos);
   gfx::gpu_timing_mark(encoder, std::nullopt);
+  g_directEyesCalibration.end(encoder);
   gfx::gpu_timing_end_frame(encoder);
   const auto buffer = encoder.Finish();
   {
@@ -2219,6 +2372,7 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
     if (sink && sink->submitted)
       sink->submitted(sink->frame, sink->userdata);
   }
+  g_directEyesCalibration.after_submit();
   gfx::gpu_timing_after_submit();
 }
 
@@ -2459,7 +2613,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
       ctx.stereoReplay = interpolated_stereo_frame(*ctx.stereoInput, weight);
       gfx::prepare_late_stereo_replay(sealedFrame, encoder, *ctx.stereoReplay, weight);
     }
-    if (ctx.stereoInput) {
+    if (ctx.stereoInput && g_directEyesCalibration.decided() == 1) {
       use_direct_eye_targets(*ctx.stereoReplay, *ctx.stereoInput);
     }
     for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {

@@ -39,11 +39,17 @@ done
 echo "perf: $NAME running ${SECS}s ($*)"
 KF_IOSAMPLE_EXE=$EXE python3 -I "$HERE/iosample.py" "$D/io.tsv" &
 SAMPLER=$!
+# GPU clock (devfreq) and the hottest thermal zone every 0.5 s (lane I: per-set GPU times follow the clock).
+( while :; do
+    printf '%s %s %s %s\n' "$(date +%s.%N)" "$(cat /sys/class/devfreq/*.gpu/cur_freq 2>/dev/null | head -1)" \
+      "$(cat /sys/class/devfreq/*.gpu/max_freq 2>/dev/null | head -1)" "$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1)"
+    sleep 0.5; done > "$D/gpufreq.tsv" ) &
+FREQ=$!
 set +e
 bash "$HERE/../tools/mockrun.sh" --seconds "$SECS" --exe "$EXE" > "$D/mockrun.out" 2>&1
 RC=$?
 set -e
-kill $SAMPLER 2>/dev/null || true
+kill $SAMPLER $FREQ 2>/dev/null || true
 LOG=$(ls -t "$HOMEDIR"/logs/*-mock.log 2>/dev/null | head -1)
 [ -n "$LOG" ] || { cat "$D/mockrun.out"; exit 1; }
 cp "$LOG" "$D/game.log"

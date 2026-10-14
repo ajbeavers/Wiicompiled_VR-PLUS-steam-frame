@@ -145,9 +145,6 @@ bool CopyCompatible(int64_t a, int64_t b) {
 struct Import { uint64_t image; uint32_t width, height; wgpu::TextureFormat format; wgpu::Texture texture; };
 // The eyes, then the settings panel's layer image after them.
 constexpr uint32_t kMaxImages = 3;
-// Whether the next sets' eyes may render straight into their swapchain images; the backend decides
-// (it measures both ways, see openxr_vulkan_win32.cpp).
-std::atomic<bool> g_allowDirect{false};
 class Bridge {
 public:
   std::mutex mutex;
@@ -162,8 +159,6 @@ public:
   bool encoded = false;
   // The eyes render straight into this set's images (DirectTargets): it can no longer be canceled.
   bool claimed = false;
-  // The backend lets this set's eyes render straight into its images (aurora_vulkan_win32_allow_direct).
-  bool directAllowed = false;
   AuroraD3D12StereoSubmittedCallback callback;
   void* userdata;
   Bridge(AuroraD3D12StereoSubmittedCallback cb, void* data) : callback(cb), userdata(data) {}
@@ -181,7 +176,6 @@ public:
     for (uint32_t i = 0; i < n; ++i) targets[i] = data[i];
     panel = panelTarget != nullptr;
     if (panel) targets[n] = *panelTarget;
-    directAllowed = g_allowDirect.load(std::memory_order_relaxed);
     token = next; count = n; images = n + (panel ? 1u : 0u); return true;
   }
   bool Cancel(uint64_t wanted) {
@@ -216,7 +210,7 @@ public:
   bool DirectTargets(uint64_t wanted, wgpu::TextureFormat format, uint32_t width, uint32_t height,
                      std::array<wgpu::Texture, AURORA_STEREO_EYE_COUNT>& out) {
     std::lock_guard guard(mutex);
-    if (!token || token != wanted || encoded || !directAllowed || count != AURORA_STEREO_EYE_COUNT) return false;
+    if (!token || token != wanted || encoded || count != AURORA_STEREO_EYE_COUNT) return false;
     for (uint32_t i = 0; i < count; ++i) {
       if (targets[i].width != width || targets[i].height != height ||
           !CopyCompatible(VkFormat(format), targets[i].dxgiFormat)) return false;
@@ -327,10 +321,6 @@ bool aurora_vulkan_win32_disable() {
   return true;
 }
 bool aurora_vulkan_win32_submitting_retained() { return aurora::vulkan_win32::submittingRetained; }
-// Not in the public header (lane I): the OpenXR Vulkan backend declares it where it calls it.
-extern "C" void aurora_vulkan_win32_allow_direct(bool allowed) {
-  aurora::vulkan_win32::g_allowDirect.store(allowed, std::memory_order_relaxed);
-}
 void* aurora_vulkan_win32_lock_queue() {
   return aurora::vulkan_win32::api.lock(aurora::webgpu::g_device.Get());
 }
@@ -352,7 +342,6 @@ bool aurora_vulkan_win32_set_targets_with_panel(uint64_t, const AuroraD3D12Stere
 bool aurora_vulkan_win32_cancel(uint64_t) { return false; }
 bool aurora_vulkan_win32_disable() { return true; }
 bool aurora_vulkan_win32_submitting_retained() { return false; }
-extern "C" void aurora_vulkan_win32_allow_direct(bool) {}
 void* aurora_vulkan_win32_lock_queue() { return nullptr; }
 void aurora_vulkan_win32_unlock_queue(void*) {}
 #endif
