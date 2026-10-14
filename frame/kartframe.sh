@@ -134,6 +134,15 @@ touch "$SESSION/.start"
 "$EXE" "$@" > "$SESSION/stdout.log" 2>&1 &
 GAME_PID=$!
 echo "kartframe $GAME_PID" > "$HEADSET_MARK" 2> /dev/null
+# KARTFRAME_RECORD=raw records both panels as scanned out (framecorder; about 1.6 ms of GPU a frame)
+# into the session folder, for questions the logs cannot settle (per-eye ghosting, flicker).
+REC_PID=
+if [ -n "$KARTFRAME_RECORD" ] && command -v framecorder > /dev/null; then
+    ( sleep 8; exec framecorder --view "${KARTFRAME_RECORD}" --fps "${KARTFRAME_RECORD_FPS:-120}" --qp 18 "$SESSION/panels.mkv" ) \
+        > "$SESSION/framecorder.log" 2>&1 &
+    REC_PID=$!
+    log "recording the panels (framecorder --view $KARTFRAME_RECORD) into panels.mkv"
+fi
 trap 'kill -TERM "$GAME_PID" 2> /dev/null' TERM INT HUP
 rc=0
 while kill -0 "$GAME_PID" 2> /dev/null; do
@@ -141,6 +150,7 @@ while kill -0 "$GAME_PID" 2> /dev/null; do
 done
 trap - TERM INT HUP
 rm -f "$HEADSET_MARK"
+[ -n "$REC_PID" ] && { pkill -INT -P "$REC_PID" framecorder 2> /dev/null; kill -INT "$REC_PID" 2> /dev/null; sleep 3; }
 log "game exited with status $rc"
 [ -n "$VRT_PID" ] && { kill "$VRT_PID" 2> /dev/null; wait "$VRT_PID" 2> /dev/null; }
 
