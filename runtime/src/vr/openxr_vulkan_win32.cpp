@@ -884,6 +884,9 @@ public:
         if (!set.xr_frame.views_valid) return OpenXRBeginStatus::Ready;
         render_session_serial_ = runtime_->SessionRunSerial();
         render_space_serial_ = runtime_->LastReferenceSpaceChange().serial;
+        // The per-refresh sets rotate through all eye pairs (RotateEyePairs); the render-first path
+        // (interpolation off) keeps the two it always had.
+        if (!extra_pairs_made_) MakeExtraEyePairs();
         // A failure here is fatal for the session (the caller ends it).
         const auto status = PrepareTargets(set);
         if (status == OpenXRBeginStatus::Ready && set.expects_gpu_submission) pending_packet_serial_ = set.xr_frame.serial;
@@ -1331,7 +1334,7 @@ public:
     // refreshes, beyond SteamVR's lead plus the refresh a frame stays on show); =2 restores the old
     // alternation. The pairs between the retained one and the one written cool off in cooling_pairs_.
     void RotateEyePairs() {
-        if (cooling_pairs_.empty() && eye_pairs_wanted_ <= 2) {
+        if (cooling_pairs_.empty()) {
             std::swap(eye_swapchains_, retained_swapchains_);
             return;
         }
@@ -1350,8 +1353,9 @@ public:
         size_t best = 0;
         for (size_t i = 1; i < cooling_since_.size(); ++i)
             if (cooling_since_[i] < cooling_since_[best]) best = i;
+        // 0: never shown (made after the first frames).
         const uint64_t hold = eye_pairs_wanted_ - 1;
-        if (cycle_count_ < cooling_since_[best] + hold) return false;
+        if (cooling_since_[best] != 0 && cycle_count_ < cooling_since_[best] + hold) return false;
         eye_swapchains_ = std::move(cooling_pairs_[best]);
         cooling_pairs_.erase(cooling_pairs_.begin() + static_cast<std::ptrdiff_t>(best));
         cooling_since_.erase(cooling_since_.begin() + static_cast<std::ptrdiff_t>(best));
@@ -1497,7 +1501,13 @@ private:
         cooling_pairs_.clear();
         cooling_since_.clear();
         eye_pair_ready_ = true;
-        if (!CreateSwapchainPair(eye_swapchains_, 0) || !CreateSwapchainPair(retained_swapchains_, 1)) return false;
+        extra_pairs_made_ = false;
+        return CreateSwapchainPair(eye_swapchains_, 0) && CreateSwapchainPair(retained_swapchains_, 1);
+    }
+
+    // The pairs beyond the first two, made before the first set is rendered (the session runs by then).
+    void MakeExtraEyePairs() {
+        extra_pairs_made_ = true;
         for (uint32_t pair = 2; pair < eye_pairs_wanted_; ++pair) {
             EyePair extra{};
             if (!CreateSwapchainPair(extra, pair)) {
@@ -1514,7 +1524,6 @@ private:
                                                 " refreshes after the last frame that showed it; KARTFRAME_EYE_PAIRS)"
                                           : std::string(" (alternating; KARTFRAME_EYE_PAIRS)"));
         Log(OpenXRLogLevel::Info, message.str());
-        return true;
     }
 
     bool CreateSwapchainPair(std::array<EyeSwapchain, kOpenXREyeCount>& pair, uint32_t id) {
@@ -1760,6 +1769,7 @@ private:
         cooling_pairs_.clear();
         cooling_since_.clear();
         eye_pair_ready_ = true;
+        extra_pairs_made_ = false;
         have_retained_frame_ = false;
         retained_frame_ = {};
         retained_locate_time_ = 0;
@@ -1863,6 +1873,7 @@ private:
     std::vector<uint64_t> cooling_since_;
     uint32_t eye_pairs_wanted_ = 2;
     bool eye_pair_ready_ = true;  // eye_swapchains_ holds a pair that may be written
+    bool extra_pairs_made_ = false;
     uint64_t cycle_count_ = 0;
     uint64_t retained_ref_cycle_ = 0;
     std::chrono::steady_clock::time_point wake_{};
