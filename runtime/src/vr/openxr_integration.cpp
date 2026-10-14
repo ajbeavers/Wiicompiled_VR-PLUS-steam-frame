@@ -847,6 +847,7 @@ public:
         if (pacing_mode_ == PacingMode::Pipelined) {
             RT_LOG(RT_TAG_RUNTIME) << "OpenXR pipelined pacing: "
                                    << (ahead_ ? (ahead_lead_ == 1 ? "sets rendered one refresh ahead (KARTFRAME_AHEAD_REFRESHES=1), "
+                                                                    "each started at the wake-up before the frame is ended, "
                                                                     "every frame ended at its wake-up with the newest finished set"
                                                                   : "sets rendered two refreshes ahead, every frame ended at its wake-up "
                                                                     "with the newest finished set (KARTFRAME_PIPELINED=wait: the old loop)")
@@ -1872,6 +1873,42 @@ private:
     // Up to two sets in flight, each on an eye pair of its own (three pairs at least).
     static constexpr size_t kAheadInFlight = 2;
 
+    // Starts the set for ahead_lead_ refreshes after this cycle's display time when one is due and Aurora is
+    // free. may_wait: wait for the last set to reach Aurora's queue (bounded by this cycle's end; only after
+    // the frame was ended); otherwise only start when it already has. started: a set was published.
+    CycleResult TryStartAhead(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
+                              bool allow_start, const OpenXRFrame& cycle, XrDuration period, XrTime target, bool render_tick,
+                              size_t in_flight, bool may_wait, bool& started) {
+        auto& st = set_pacing_;
+        started = false;
+        const XrDuration half = period / 2;
+        const bool covered = !ahead_sets_.empty() &&
+                             ahead_sets_.back().set.xr_frame.predicted_display_time >= target - half;
+        if (!(allow_start && !startup_origin_pending_ && render_tick && !covered && in_flight < kAheadInFlight))
+            return CycleResult::Continue;
+        // Aurora takes one set at a time: the last one must have reached its queue first. Waiting
+        // for that is bounded by this cycle's end (the next xrWaitFrame must not start late).
+        const auto deadline = may_wait ? backend_->CycleWakeTime() + std::chrono::nanoseconds(period) - pacing_margin_
+                                       : std::chrono::steady_clock::now();
+        const bool aurora_free =
+            ahead_sets_.empty() ||
+            diagnostics::Measure(diagnostics::Stage::SubmissionWait, [&] {
+                return backend_->PollAheadSet(ahead_sets_.back().set, deadline, false);
+            }) == OpenXRSubmissionStatus::Success;
+        if (!aurora_free || !backend_->AheadCanPrepare()) return CycleResult::Continue;
+        if (may_wait && ahead_start_delay_.count() > 0) {
+            std::this_thread::sleep_until(std::min(backend_->CycleWakeTime() + ahead_start_delay_, deadline));
+        }
+        const CycleResult result = StartSet(presentation, policy, immersive, target, cycle);
+        if (st.pending) {
+            ahead_sets_.push_back({st.set, st.published_at, false});
+            st.pending = false;
+            st.set = {};
+        }
+        started = true;
+        return result;
+    }
+
     CycleResult AheadCycle(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
                            uint32_t interpolation_target, bool allow_start, bool& immersive_submission_logged) {
         auto& st = set_pacing_;
@@ -1920,6 +1957,29 @@ private:
                 SetError(std::string("Aurora's ") + kGraphicsBackendName +
                          " stereo copy failed; continuing on the mirror output");
                 return CycleResult::Fatal;
+            }
+        }
+        // KARTFRAME_AHEAD_REFRESHES=1 (lane R): GalaxyFrame's order. The set for the next refresh starts
+        // at once, before this frame is ended (GalaxyFrame records the next set before releasing the
+        // current one), so its encode and GPU work get the whole refresh; it never waits for Aurora (a set
+        // still recording is late anyway: then the start below, after the end, waits as before). The
+        // set shown now and sets it overtakes leave this cycle and do not count as in flight.
+        // The set for two refreshes ahead (KARTFRAME_AHEAD_REFRESHES=1: the next refresh); one tick a cycle.
+        const XrTime target = now_display + static_cast<XrDuration>(ahead_lead_) * period;
+        st.odd_tick = !st.odd_tick;
+        const bool render_tick = (!st.half_rate || st.odd_tick) &&
+                                 interpolation_pacing_.ShouldRender(target, interpolation_target);
+        bool started_early = false;
+        if (ahead_lead_ == 1) {
+            const XrTime gone = chosen >= 0 ? ahead_sets_[static_cast<size_t>(chosen)].set.xr_frame.predicted_display_time
+                                            : ahead_shown_time_;
+            size_t in_flight = 0;
+            for (const auto& a : ahead_sets_) in_flight += a.set.xr_frame.predicted_display_time > gone;
+            const CycleResult started = TryStartAhead(presentation, policy, immersive, allow_start, cycle, period, target,
+                                                      render_tick, in_flight, false, started_early);
+            if (started != CycleResult::Continue) {
+                backend_->EndCycleRetained();
+                return started;
             }
         }
         if (chosen >= 0) {
@@ -1983,34 +2043,12 @@ private:
             }
         }
 
-        // The set for two refreshes ahead (KARTFRAME_AHEAD_REFRESHES=1: the next refresh).
-        const XrTime target = now_display + static_cast<XrDuration>(ahead_lead_) * period;
-        st.odd_tick = !st.odd_tick;
-        const bool render_tick = (!st.half_rate || st.odd_tick) &&
-                                 interpolation_pacing_.ShouldRender(target, interpolation_target);
-        const bool covered = !ahead_sets_.empty() &&
-                             ahead_sets_.back().set.xr_frame.predicted_display_time >= target - half;
-        if (allow_start && !startup_origin_pending_ && render_tick && !covered && ahead_sets_.size() < kAheadInFlight) {
-            // Aurora takes one set at a time: the last one must have reached its queue first. Waiting
-            // for that is bounded by this cycle's end (the next xrWaitFrame must not start late).
-            const auto deadline = backend_->CycleWakeTime() + std::chrono::nanoseconds(period) - pacing_margin_;
-            const bool aurora_free =
-                ahead_sets_.empty() ||
-                diagnostics::Measure(diagnostics::Stage::SubmissionWait, [&] {
-                    return backend_->PollAheadSet(ahead_sets_.back().set, deadline, false);
-                }) == OpenXRSubmissionStatus::Success;
-            if (aurora_free && backend_->AheadCanPrepare()) {
-                if (ahead_start_delay_.count() > 0) {
-                    std::this_thread::sleep_until(std::min(backend_->CycleWakeTime() + ahead_start_delay_, deadline));
-                }
-                const CycleResult started = StartSet(presentation, policy, immersive, target, cycle);
-                if (st.pending) {
-                    ahead_sets_.push_back({st.set, st.published_at, false});
-                    st.pending = false;
-                    st.set = {};
-                }
-                if (started != CycleResult::Continue) return started;
-            }
+        // The set (KARTFRAME_AHEAD_REFRESHES=1: unless it started above).
+        if (!started_early) {
+            bool started_now = false;
+            const CycleResult started = TryStartAhead(presentation, policy, immersive, allow_start, cycle, period, target,
+                                                      render_tick, ahead_sets_.size(), true, started_now);
+            if (started != CycleResult::Continue) return started;
         }
         UpdateHalfRate(period);
         pacing::Flush();

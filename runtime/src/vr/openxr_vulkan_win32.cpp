@@ -1967,10 +1967,14 @@ public:
     }
 
     // KARTFRAME_EYE_PAIRS with sets rendered ahead: 3 by default (the pair on display and two sets in
-    // flight), at least 3; more lets each pair rest longer after it left the display.
+    // flight), at least 3; more lets each pair rest longer after it left the display. Lane R: 4 by default
+    // with KARTFRAME_AHEAD_REFRESHES=1, whose next set starts before the frame is ended (the pair on
+    // display, the set shown now, one it overtook, the new one).
     static uint32_t AheadPairsSetting() {
         const char* env = std::getenv("KARTFRAME_EYE_PAIRS");
-        const long v = env != nullptr && *env != '\0' ? std::strtol(env, nullptr, 10) : 3;
+        const char* lead = std::getenv("KARTFRAME_AHEAD_REFRESHES");
+        const long fallback = lead != nullptr && std::string_view(lead) == "1" ? 4 : 3;
+        const long v = env != nullptr && *env != '\0' ? std::strtol(env, nullptr, 10) : fallback;
         return static_cast<uint32_t>(std::clamp(v, 3l, 8l));
     }
 
