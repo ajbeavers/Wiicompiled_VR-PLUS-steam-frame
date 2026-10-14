@@ -16,6 +16,18 @@ struct EyeImage {
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
 };
 
+// Lane L: the scene state one eye's draws used (see gfx::EyeSceneRecord), for the frame stamp.
+struct EyeScene {
+  bool valid = false;  // an immersive replay whose eye uniforms were filled for this set
+  bool late = false;   // filled at the set's sample time (interpolation), else at the seal
+  bool anchored = false;
+  bool continuous = false;  // a previous game frame was available
+  float weight = 1.f;
+  uint32_t previousFrame = 0, currentFrame = 0;  // game (logical) frames of the transform pair
+  uint32_t set = 0;  // sets encoded so far
+  uint16_t interpolated = 0, current = 0, recorded = 0, outside = 0;
+};
+
 struct SinkFrame {
   uint64_t frameToken = 0;
   uint32_t logicalFrame = 0;
@@ -25,6 +37,7 @@ struct SinkFrame {
   std::array<EyeImage, AURORA_STEREO_EYE_COUNT> eyes{};
   // The packet's display time (steady clock ns): the time its eye poses were located for.
   uint64_t displayTimeNanos = 0;
+  std::array<EyeScene, AURORA_STEREO_EYE_COUNT> scene{};
 };
 
 // Runs synchronously on the frame worker after both eye replays have been

@@ -465,17 +465,18 @@ static int dumpImage(void* images, int index, int width, int height, int64_t for
     return ok;
 }
 
-// MOCK_XR_STAMP: the app's stamp block (see the app's vulkan_win32_interop.cpp), 256x12 pixels in
-// the top left corner, copied at the release into one of STAMP_SLOTS host-visible slots.
+// MOCK_XR_STAMP: the app's stamp block (see the app's vulkan_win32_interop.cpp), 256x28 pixels in
+// the top left corner (rows 0-2 the display time and eye, 3-6 lane L's scene words), copied at the
+// release into one of STAMP_SLOTS host-visible slots.
 #define STAMP_W 256
-#define STAMP_H 12
+#define STAMP_H 28
 #define STAMP_SLOTS 64
 static struct {
     VkFence fence;
     VkCommandBuffer cb;
     unsigned gen;
-    int submitted, decoded, result, eye;
-    uint64_t value;
+    int submitted, decoded, result, eye, scene;
+    uint64_t value, sceneA, sceneB;
 } gStamp[STAMP_SLOTS];
 static VkBuffer gStampBuf;
 static VkDeviceMemory gStampMem;
@@ -556,6 +557,22 @@ static int stampDecode(int i) {
     }
     gStamp[i].value = value;
     gStamp[i].eye = stampBit(i, 0, 2);
+    // Scene words: each bit and its complement; all-zero pairs (an app without them) read as none.
+    uint64_t words[2] = {0, 0};
+    int scene = 1, any = 0;
+    for (int w = 0; w < 2 && scene == 1; w++)
+        for (int bit = 0; bit < 64; bit++) {
+            int one = stampBit(i, bit, 3 + 2 * w), other = stampBit(i, bit, 4 + 2 * w);
+            any |= one | other;
+            if (one == other) {
+                scene = -1;
+                break;
+            }
+            if (one) words[w] |= 1ull << bit;
+        }
+    gStamp[i].scene = any ? scene : 0;
+    gStamp[i].sceneA = words[0];
+    gStamp[i].sceneB = words[1];
     return 1;
 }
 
@@ -634,5 +651,12 @@ static int stampRead(int i, unsigned gen, int wait, uint64_t* value, int* eye) {
     return gStamp[i].result;
 }
 
+static int stampScene(int i, unsigned gen, uint64_t* a, uint64_t* b) {
+    if (i < 0 || i >= STAMP_SLOTS || gStamp[i].gen != gen || !gStamp[i].decoded || gStamp[i].result != 1) return -1;
+    *a = gStamp[i].sceneA;
+    *b = gStamp[i].sceneB;
+    return gStamp[i].scene;
+}
+
 const MockGfx kMockGfxVk = {"vk", ownsBinding, describeBinding, getProc, formats, formatOf, createImages, fillImages, releaseWaitMs,
-                            releaseSnapshot, pollSnapshots, snapshotsChecked, dumpImage, stampCapture, stampRead};
+                            releaseSnapshot, pollSnapshots, snapshotsChecked, dumpImage, stampCapture, stampRead, stampScene};

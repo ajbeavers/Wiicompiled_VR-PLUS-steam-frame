@@ -368,6 +368,11 @@ struct LateStereoData {
 // Advanced for every upload, including synchronous mid-frame EFB readbacks.
 static std::atomic_uint64_t g_replayBufferGeneration{0};
 static LateStereoData g_pendingLateStereo;
+static thread_local EyeSceneRecord t_eyeScene;
+EyeSceneRecord& eye_scene_record() noexcept { return t_eyeScene; }
+static void count_eye_scene(uint16_t& counter) noexcept {
+  if (counter != UINT16_MAX) ++counter;
+}
 static uint32_t g_stereoLocalPlayerCount = 1;
 
 void set_stereo_local_player_count(uint32_t count) noexcept {
@@ -1835,6 +1840,9 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
     return false;
   }
 
+  if (history == nullptr) {
+    t_eyeScene = {};
+  }
   if (history != nullptr) {
     history->uniforms.reserve(replayPerspectiveDrawCount + replayHudScreenDrawCount);
     history->sources.reserve(requiredBytes);
@@ -1960,6 +1968,16 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
           continue;
         }
         const auto& eye = stereoFrame.eyes[eyeIndex];
+        if (eyeIndex < 2) {
+          auto& scene = t_eyeScene;
+          const uint32_t end = range.offset + range.size;
+          if (!scene.valid) {
+            scene = {.valid = true, .late = false, .weight = 1.f, .fillOffset = range.offset, .fillSize = range.size};
+          }
+          scene.fillOffset = std::min(scene.fillOffset, range.offset);
+          scene.fillSize = std::max(scene.fillOffset + scene.fillSize, end) - scene.fillOffset;
+          if (layout.perspective) count_eye_scene(scene.current[eyeIndex]);
+        }
         std::memcpy(eyeUniform.data(), sourceUniform.data(), range.size);
         write_stereo_uniform({eyeUniform.data(), range.size}, layout, eye, gameProjection, drawViewport, uniformRegion,
                              hudScreen, false, drawScissor, clipOffset);
@@ -2534,6 +2552,9 @@ bool prepare_late_stereo_replay(SealedFrame& frame, wgpu::CommandEncoder& cmd, c
   data.uploadBytes.resize(data.uploadSize);
   auto* bytes = data.uploadBytes.data();
   weight = std::clamp(weight, 0.0f, 1.0f);
+  auto& scene = t_eyeScene;
+  scene = {.valid = true, .late = true, .anchored = stereoFrame.interpolateInAnchor, .weight = weight,
+           .fillOffset = data.uploadOffset, .fillSize = data.uploadSize};
   for (const auto& saved : data.uniforms) {
     // Interpolate once; both eyes share exactly the same scene sample.
     std::span<uint8_t> uniform{bytes + saved.eyes[0].offset - data.uploadOffset, saved.current.size};
@@ -2583,10 +2604,12 @@ bool prepare_late_stereo_replay(SealedFrame& frame, wgpu::CommandEncoder& cmd, c
     for (uint32_t eye = 1; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
       std::memcpy(bytes + saved.eyes[eye].offset - data.uploadOffset, uniform.data(), uniform.size());
     }
+    const bool interpolated = layout.perspective && hasPrevious && weight < 1.0f;
     for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
       write_stereo_uniform({bytes + saved.eyes[eye].offset - data.uploadOffset, saved.eyes[eye].size}, layout,
                            stereoFrame.eyes[eye], projection, saved.viewport, saved.displayRegion, data.hudScreen,
                            stereoFrame.interpolateInAnchor, saved.scissor, saved.clipOffset);
+      if (layout.perspective && eye < 2) count_eye_scene(interpolated ? scene.interpolated[eye] : scene.current[eye]);
     }
   }
   // Never interpolate in mapped upload memory: write-combined pages make CPU
@@ -3209,6 +3232,15 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
                    static_cast<size_t>(invocation.interpolatedFrame) < draw.gx.interpolatedUniformRanges.size() &&
                    draw.gx.interpolatedUniformRanges[invocation.interpolatedFrame].size != 0) {
           uniformOverride = &draw.gx.interpolatedUniformRanges[invocation.interpolatedFrame];
+        }
+        if (overrideTarget && invocation.stereoEye < 2 && draw.gx.uniformReplayLayout.perspective) {
+          auto& scene = t_eyeScene;
+          if (uniformOverride == nullptr) {
+            count_eye_scene(scene.recorded[invocation.stereoEye]);
+          } else if (!scene.valid || uniformOverride->offset < scene.fillOffset ||
+                     uniformOverride->offset + uniformOverride->size > scene.fillOffset + scene.fillSize) {
+            count_eye_scene(scene.outside[invocation.stereoEye]);
+          }
         }
         // A virtual-screen draw gets the whole eye (below), so the game's scissor no longer clips
         // it. An element lying wholly outside a scissor the game narrowed would not have shown on

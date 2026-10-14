@@ -53,6 +53,9 @@ typedef struct MockGfx {
     // The slot's stamp: 1 decoded (value, eye), 0 not read back yet (wait != 0: waits), -1 no valid
     // stamp in the image, -2 the slot was reused since (gen differs).
     int (*stamp_read)(int slot, unsigned gen, int wait, uint64_t* value, int* eye);
+    // Lane L: the slot's scene words (rows 3 and 5 of the block; see the app's vulkan_win32_interop.cpp)
+    // once stamp_read returned 1: 1 both words valid, 0 none written (an older app), -1 broken.
+    int (*stamp_scene)(int slot, unsigned gen, uint64_t* sceneA, uint64_t* sceneB);
 } MockGfx;
 
 extern const MockGfx kMockGfxGles;

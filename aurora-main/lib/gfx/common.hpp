@@ -375,6 +375,25 @@ bool has_late_stereo_replay(const SealedFrame& frame) noexcept;
 bool prepare_late_stereo_replay(SealedFrame& frame, wgpu::CommandEncoder& cmd, const StereoReplayFrame& stereoFrame,
                                 float weight);
 
+// Lane L: the scene state each eye of the set being encoded actually used, for the frame stamp and the
+// per-set log line (KARTFRAME_FRAME_STAMP, KARTFRAME_FRAME_LOG). Filled where the eye uniform ranges are
+// written (prepare_late_stereo_replay at the set's sample time, or the seal's own eye pair) and where the
+// eye replays bind them (render_stereo_eye). The frame worker's own record; run_stereo_sink takes it.
+struct EyeSceneRecord {
+  bool valid = false;
+  bool late = false;  // filled at the set's sample time (interpolation), else at the seal (current only)
+  bool anchored = false;
+  float weight = 1.f;  // the clamped weight the fill used
+  bool continuous = false;  // set by the caller: a previous game frame was available
+  uint32_t previousFrame = 0, currentFrame = 0;  // set by the caller: the pair's game (logical) frames
+  uint32_t fillOffset = 0, fillSize = 0;  // the uniform buffer bytes this fill wrote
+  // Per eye, perspective draws: filled from the previous/current pair (weight < 1), filled with the
+  // current transforms only; drawn with the recorded uniform (no eye range), drawn with an eye range
+  // outside this fill (one some other set or frame wrote).
+  std::array<uint16_t, 2> interpolated{}, current{}, recorded{}, outside{};
+};
+EyeSceneRecord& eye_scene_record() noexcept;
+
 // Encode a sealed frame. Never touches the producer-visible recording state,
 // so this may run concurrently with the producer's FIFO drains.
 // `nativeRenderLastPass` limits the passes that do render work (texture bakes still run for every
