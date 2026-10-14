@@ -1,121 +1,124 @@
-# Headset session 11 (lane P): the head pose each eye was rendered with
+# Headset session 11 (lane Q): the projection layer alone, and GalaxyFrame's first-write barrier
 
-Hypothesis tested: the pacing thread publishes every set's packet into one buffer (`published_frame_`), and
-a publish of the next set landing between the left and the right eye's uniform fill would give the right
-eye the next set's head pose, one refresh ahead: a right-eye image placed a refresh or two of motion off,
-alternating with timing. The bridge's stamp could not see it (it stamps the set's display time, not what
-each eye's draws used).
+Replaces lane P's plan (its eye-pose instrumentation stays in the build: with `KARTFRAME_FRAME_LOG=1` the
+XRS/XRP lines and the "VR eye poses (10 s)" / "VR eye uniform probe (10 s)" summaries are still logged and
+must still read 0).
 
-## What the app does (read, then measured)
+Inside the app everything is proven correct headless (lane P: both eyes from the same packet and pose;
+lanes before: pacing, finished releases, exact stamps and end times), and the hand-over was made
+GalaxyFrame's way (format, usage, end locate, extensions; H9.md) without effect. Two candidates are left:
 
-- The frame worker takes each set's packet **once**, by value, under `published_mutex_`
-  (`openxr_integration.cpp` ProvideStereoFrame: exchange + copy under the lock; `aurora.cpp`
-  request_stereo_frame returns an `AuroraStereoFrame` by value). Both eyes' transforms, the display time,
-  the cockpit, the panel and menu placement of that set come from that one copy
-  (`make_stereo_replay_frame`); the seal path and the refresh sets (`run_retained_stereo_frame`) each consume
-  one packet and nothing re-reads the published buffer mid-set. The pacing thread publishes the next packet
-  only after the last set reached Aurora's queue (AheadCycle polls it first). The stamp's display time is
-  that copy's (`run_stereo_sink(..., input->displayTimeNanos)`). So the snapshot the hypothesis asks for is
-  already the design; no change was needed in the publish path.
-- Per-eye uploads in the eye passes (cockpit vertices, window mask, panel overlay uniform, stamp block) each
-  have their own per-eye destination; sets are encoded and submitted one at a time on the frame worker.
-- The one shared GPU resource: every refresh set of a game frame rewrites the same `g_uniformBuffer` region
-  (the sealed frame's eye ranges) with a copy at its start. Order between set k's eye draws and set k+1's
-  copy rests on Dawn's barrier in queue order. Probed (below).
+- **A, the layer list.** KartFrame's menus (a projection layer, the menu environment, plus quad layers:
+  screen, panel) are clean; its races (a projection layer alone) double. GalaxyFrame always submits its
+  projection with quads (HUD, pointer) and is clean; PrimeFrame submits a projection alone and doubles.
+  If SteamVR on the Frame takes a frame whose only layer is a projection on another path (a per-eye
+  direct path with its own timing), the right eye could suffer there.
+  `KARTFRAME_RACE_QUAD=1` adds one more layer to every such frame: a 16x16 fully transparent quad
+  (alpha 0, `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`), in the app space 2 m ahead, 1 cm across,
+  after the projection. Its three images are cleared once (acquired, cleared, the GPU waited for, released);
+  every frame then shows the last released one. Invisible.
+- **B, the first write.** GalaxyFrame's first write to an eye image after xrWaitSwapchainImage waits on
+  ALL prior commands and memory writes (SteamVR's client's acquire work included); Dawn's tracked barrier
+  waits on colour-attachment output only. `KARTFRAME_FIRST_WRITE_BARRIER=all` submits that barrier
+  (src ALL_COMMANDS / MEMORY_WRITE, dst ALL_COMMANDS / MEMORY_READ|MEMORY_WRITE, layout
+  COLOR_ATTACHMENT_OPTIMAL kept, queue families ignored) on every image of a set (eyes; in menus the screen,
+  the environment, the panel) right after their waits, on Dawn's queue under its lock, before Aurora's set.
+  No Dawn change (a barrier's first scope is everything earlier in submission order on the queue).
 
-## Instrumentation (lane P, in the build)
+Build defaults: `KARTFRAME_RACE_QUAD=1`, `KARTFRAME_FIRST_WRITE_BARRIER=all` (both on). Other values:
+`KARTFRAME_RACE_QUAD=0` (none), `=cycle` (also acquire, wait and release one quad image every frame, no
+GPU work: GalaxyFrame's per-frame pattern); `KARTFRAME_FIRST_WRITE_BARRIER=dawn` (Dawn's barrier alone).
+Each launch below switches exactly one of the two on.
 
-- At both uniform fill sites (the seal's eye pair, `prepare_late_stereo_replay`), per eye: the packet
-  (display time, token) and the eye transform written, the eye frustum, and a count of draws of that eye
-  filled with another packet or transform (`gfx::EyeSceneRecord::pose*`).
-- `KARTFRAME_FRAME_LOG=1`: the per-set `XRS` line carries `XRP tL= tR= kL= kR= yL= yR= mL= mR= same=` (packet
-  time per eye in steady ms, token, eye yaw in degrees, mixed draws, 1 when both eyes used the set's own
-  packet). Always: `VR eye poses (10 s): N sets, eyes from different packets 0, an eye not from the set's
-  packet 0, an eye filled with more than one transform 0`.
-- GPU uniform probe (`KARTFRAME_FRAME_LOG=1` or `KARTFRAME_UNIFORM_PROBE=1`): after both eyes of a set,
-  each eye's first perspective range is copied back from `g_uniformBuffer` and compared with the bytes its
-  fill wrote: `VR eye uniform probe (10 s): N sets read back after their eyes, left eye's range not what
-  its fill wrote 0, right eye's 0`. A set k+1 copy reaching set k's eye ranges early would show here.
-- Test stamp (`KARTFRAME_FRAME_STAMP=1`, mock only): 64x15 pixels, one pixel a bit (was 4x4-pixel cells),
-  rows 7-14 the pose words; `xrmock: pose stamps` compares each eye with the layer's submitted pose and
-  field of view and the eyes of a set with each other.
+## Install
 
-## Mock results (scripted Grand Prix, 120 Hz, head sway 0.3 rad at 0.5 Hz, default loop)
+Build: lane Q's branch, installed with `install --dev`. Put both `01-race-quad.env` and `02-barrier.env`
+into `$KARTFRAME_HOME/session.queue/`; the wrapper takes them one launch each, in name order. Both record
+the panels (`KARTFRAME_RECORD=raw`) and log every frame (`KARTFRAME_FRAME_LOG=1`).
 
-`frame/perf/hudrace.sh NAME 180 MOCK_XR_STAMP=1 MOCK_XR_BUSY_MS=1 KARTFRAME_FRAME_LOG=1 KF_MOCKRUN_END_GATE=2`,
-build dac9971 (scratch `$HOME/.cache/kf-laneP/runs/p-final`):
+**Routine, each launch:** menus, then straight into a Time Trial. During the countdown (kart standing
+still) look at a track-side edge and turn the head slowly left and right for about ten seconds, hold still
+five; then drive and do the same for ten seconds, hold still five. Say: doubled or not, which eye,
+standing still and while driving, and whether the menus are still clean.
+
+## Launch 1: `01-race-quad.env` (race quad on, Dawn's barrier)
+
+What the owner should see: nothing new (the quad is transparent and 1 cm at 2 m). If hypothesis A holds,
+the race is clean like the menus.
+
+game.log:
+- `OpenXR Vulkan swapchains ready: ... first-write barrier dawn (KARTFRAME_FIRST_WRITE_BARRIER), race quad
+  on (KARTFRAME_RACE_QUAD), ...`
+- once, at the first projection-only frame (the first-run guide, a loading screen or the race start):
+  `OpenXR race quad layer ready: 16x16 VkFormat 43, 3 images cleared to transparent in <about 1.5> ms; a
+  1 cm quad 2 m ahead after every projection-only layer (KARTFRAME_RACE_QUAD=1)`. No `race quad could not
+  be made` warning (with it, the frames went out with the projection alone and the launch tests nothing).
+- XRF lines end in `n=<layers>`: `n=2` on every race frame (projection + quad); menu frames `n=2` (environment
+  + screen) or `n=3` (with the panel). No `n=1` once the race quad is ready.
+- pacing as session 10 (`mode=pipelined`, `end_ms` p50 about 0.2, late near 0); lane P's counters 0.
+
+`~/.local/share/Steam/logs/xrclient_kartframe.txt`:
+- one more swapchain: `CreateSwapchain` with format 43 and 16x16, and its `Created remote Vulkan image ...,
+  dimensions 16 x 16, format 43` lines (three images), after the eye swapchains and menu environment.
+- if SteamVR logs layers per frame, a quad beside the projection on race frames. It may turn the quad into an
+  overlay as it did the menus' screen (`VRMsg_CompositorNewSharedImage`, `openxr_quadlayer_<n>`, H9.md
+  section 1); note whether it does: GalaxyFrame's quads were not overlays.
+
+## Launch 2: `02-barrier.env` (no race quad, GalaxyFrame's barrier)
+
+What the owner should see: the race as in sessions 1 to 10 (projection alone), unless hypothesis B holds.
+
+game.log:
+- `... first-write barrier all (KARTFRAME_FIRST_WRITE_BARRIER), race quad off (KARTFRAME_RACE_QUAD), ...`;
+  no `first-write barrier could not be submitted` warning; no `race quad layer ready` line.
+- XRF lines: `n=1` on every race frame.
+- pacing as launch 1 (the barrier is one small submission per set; mock: no timing change).
+
+`xrclient_kartframe.txt`: no 16x16 swapchain; otherwise as session 10.
+
+## What it decides
+
+- Launch 1 clean, launch 2 doubled: the projection layer alone is the cause (A). Keep the race quad on
+  (default) and tell PrimeFrame (it submits a projection alone and doubles too).
+- Launch 2 clean, launch 1 doubled: the first write ordered only after colour-attachment output was the
+  cause (B). Keep the barrier on (default) and consider making it Dawn's own barrier.
+- Both clean: either one is enough; both defaults stay on; a later session can tell them apart with
+  `KARTFRAME_RACE_QUAD=0 KARTFRAME_FIRST_WRITE_BARRIER=dawn` as the control.
+- Both doubled: neither. What is left from H9.md: the order of the calls (acquire and render the next set
+  before releasing and ending, GalaxyFrame's order) and the eye size (render_scale 0.9 measured for the
+  record only). Panel analysis as before: `frame/perf/panels/analyse.sh <session>` per launch, H7 section
+  1's zigzag table (zigzag refreshes per eye, race against menus).
+
+## Mock results (lane Q, build 6596f27)
+
+`frame/perf/hudrace.sh q-race 180 MOCK_XR_STAMP=1 MOCK_XR_BUSY_MS=1 KARTFRAME_FRAME_LOG=1
+KF_MOCKRUN_END_GATE=2` (scripted Grand Prix, 120 Hz, defaults: race quad on, barrier all):
 
 | check | result |
 | --- | --- |
-| sets with both eyes stamped | 17468 |
-| eyes filled from different packets | **0** |
-| eye images whose fill pose is off the submitted pose (>= 0.01 deg) | **0** of 34960 (right only 0, left only 0) |
-| eye images whose packet is not the layer's locate | 0 |
-| eye images with draws filled from another packet or transform | 0 |
-| eye frustum not the submitted field of view (or the other eye's) | 0 (worst tangent error 0.00005, the 16-bit rounding) |
-| GPU uniform probe: sets read back, left / right range not what the fill wrote | 16679, **0 / 0** |
-| XRP lines `same=1`, `mL=0 mR=0` | 17471 of 17471 |
-| releases changed after the GPU passed them | 0 of 42854 |
-| stamps for their poses' locate; end times exact | 34960 of 34964 (4 unstamped); 21485 of 21485 |
-| mock errors; end gate (ends > 1 ms after the wake-up) | 0; 0.2 % (gate 2 %) |
-| pacing | 120 sets/s, late 20 of 21480, end_ms p50 0.14, gpu 4.25 ms p50 |
+| mock errors | 0 |
+| releases changed after the GPU passed them | 0 of 42792 |
+| stamps for their poses' locate | 33144 of 33148 (4 unstamped), 0 for another locate, 0 with the other eye's |
+| end times exact | 21481 of 21481 |
+| ends later than 1 ms after the wake-up (gate 2 %) | 0.3 % |
+| layer lists per xrEndFrame | PQ 16574 (race: projection + quad), EQ 4867 (menus: environment + screen), none 40; P alone 0; quads on a never-released swapchain 0 |
+| XRF lines | 21441, all `n=2` |
+| race quad made | 16x16 VkFormat 43, usage 0x31, 3 images cleared in 1.4 ms |
+| lane P's counters | eye poses 0, uniform probe 0 / 0 |
+| pacing | late 32 of 21363 ticks, end_ms p50 0.15, gpu 4.08 ms p50 |
 
-The first instrumented run (d2c67ba, same 3 minutes) gave the same: 17459 sets, 0 with different packets,
-0 of 34944 eye images off the submitted pose. Validation layer, 100 s with stamps and the probe: 0 messages,
-0 mock errors; ctest 32 of 32.
+Validation layer (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`, 80 s, menus and race with stamps, the
+barrier on every set and the quad's clears): 0 messages (best-practices warnings in a check run showed the
+layer's output reaches game.log), 0 mock errors. ctest 32 of 32. Eye images at 65 and 75 s as before.
 
-Timing against the baseline (f20f221, `wt/native`), interleaved A B A B, 90 s each, with stamps: the
-first version of the larger stamp made "ends later than 1 ms" 2.3 to 3.1 % against 0.7 to 1.6 %; without
-stamps the two builds were equal (0.5 / 0.4 % against 0.4 / 0.3 %), so it was the test stamp, not the
-instrumentation. The stamp is now one pixel a bit, and xrmock does its read-back bookkeeping before the
-sleep in xrWaitFrame rather than after the wake-up it measures from: 0.5 / 0.5 % (baseline) against
-0.5 / 0.4 % (lane P), end p50 0.22-0.23 against 0.20-0.22 ms.
+Race timing, interleaved, 90 s each, `MOCK_XR_BUSY_MS=1`, no stamps (old = `KARTFRAME_RACE_QUAD=0
+KARTFRAME_FIRST_WRITE_BARRIER=dawn`, the behaviour before this lane; new = the defaults):
 
-**So the hypothesis does not hold in the app, at least at the mock's timing**: both eyes of every set were
-filled from the set's one packet copy, with exactly the pose and field of view the layer submitted, and the
-uniform bytes the GPU held after the eyes were the bytes written. By construction (one copy per set taken
-under the mutex) a later publish cannot reach a set in progress at any timing; the headset launch below
-checks that with the same counters on the headset's own timing.
+| run | errors | end p50 / p99 ms | ends > 1 ms | late sets | gpu p50 / p99 ms | layer lists |
+| --- | --- | --- | --- | --- | --- | --- |
+| old 1 | 0 | 0.17 / 0.65 | 0.4 % | 21 | 4.06 / 5.03 | P 6683, EQ 3960 |
+| new 1 | 0 | 0.18 / 0.64 | 0.3 % | 23 | 4.02 / 5.03 | PQ 6685, EQ 3958 |
+| old 2 | 0 | 0.18 / 0.70 | 0.5 % | 24 | 3.97 / 5.00 | P 6697, EQ 3954 |
+| new 2 | 0 | 0.17 / 0.70 | 0.4 % | 27 | 4.04 / 5.08 | PQ 6680, EQ 3960 |
 
-Inside the app, what else could place one eye differently, and where it stands:
-- per-eye projection matrices / the asymmetric field of view on the wrong eye on alternate sets: measured,
-  0 (each eye's frustum is the submitted fov of that eye, never the other's);
-- the replay's per-eye uniform ranges swapped or reused: lane L's counters (drawn with the recorded
-  uniform 0, with a range outside the set's fill 0) and the GPU probe (0 of 16679 sets, both eyes);
-- viewport: each eye renders its own full 1728x1728 target, the same every set (static; cannot alternate
-  with head motion);
-- the scene state (interpolation): lane L, identical in both eyes;
-- the eye transforms swapped left/right: would be a fixed 64 mm stereo error on every set, not a head-turn
-  zigzag (not stamped: the mock's eyes share one orientation, so only the frustum check would see a swap).
-
-## The launch
-
-Install `01-eye-poses.env` into `$KARTFRAME_HOME/session.queue/`, build: this branch installed with
-`install --dev`. One launch, recorded, every set logged.
-
-**Routine:** menus, then straight into a Time Trial. During the countdown (kart standing still) look at a
-track-side edge and turn the head slowly left and right for about ten seconds, hold still five; then drive
-and do the same for ten seconds, hold still five. Say: doubled or not, which eye, standing and driving.
-
-What the logs must show:
-- game.log, every 10 s in the race: `VR eye poses (10 s): ~1200 sets, eyes from different packets 0, an
-  eye not from the set's packet 0, an eye filled with more than one transform 0` and `VR eye uniform probe
-  (10 s): ~1200 sets read back ..., left ... 0, right eye's 0 (0 sets not probed ...)`.
-- Every `XRS ... XRP` line: `same=1`, `tL=tR=` the line's `t=`, `kL=kR=`, `mL=0 mR=0`; `yL` and `yR` the
-  two eyes' yaw (they differ by the eyes' fixed canting, the same every set; on the Frame also by the gaze
-  offsets lane M logged), stepping smoothly from set to set through head turns.
-- Pacing as session 10 (`mode=pipelined`, `end_ms` p50 about 0.2, late near 0).
-
-What it decides:
-- Any non-zero count in either line (or a `same=0` / `mL`,`mR` above 0 line) on the headset: the
-  hypothesis holds under the headset's timing after all (the mock did not reach it); the XRP lines name
-  the sets, which line up with the recording's refreshes through the XRF lines (H7 section 1's alignment).
-- All zero, yet still doubled: each eye was rendered with the set's own head pose, the same pose both
-  eyes' layer views were submitted with (the mock's pose check), and the uniform bytes the GPU held
-  after the eyes were the ones written. Then the doubling is not in what the app renders per eye.
-- Zigzag analysis of the recording as before (`frame/perf/panels/analyse.sh <session>` and H7 section 1's
-  table: zigzag refreshes per eye, race against menus). With the XRP lines, take each set's `yR - yL` and
-  the set-to-set step of `yL`: on the right eye's zigzag refreshes these must be as smooth as on the
-  others (no ±1-refresh alternation in the app's poses), while the panel image alternates. That puts
-  the alternation after the hand-over to SteamVR, where H9's remaining candidates are (the order of
-  calls, GalaxyFrame's first-write barrier, the quad layers, the eye size).
+No timing change. Scratch: `$HOME/.cache/kf-laneQ/runs/`.
