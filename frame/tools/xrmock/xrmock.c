@@ -472,6 +472,13 @@ static RelEv* gRelEv; static int gRelN, gRelCap, gRelDone;
 static EndEv* gEndEv; static int gEndN, gEndCap;
 static int64_t gLastWakeNs = 0, gBegunWakeNs = 0;
 static int gEndAfterWake[7];  // xrEndFrame minus its xrWaitFrame's return: <0.5, <1, <2, <3, <4, <6, more ms
+// Lane K: every xrEndFrame against the runtime's own wake-up (the refresh grid, not the moment a late
+// xrWaitFrame call returned), with its display time and the time its poses were located for (0: no
+// projection layer). The seventh headset session (frame/perf/H7.md): frames ended more than about 1 ms
+// after SteamVR's wake-up were shown inconsistently (the image zigzagged on head turns).
+typedef struct { int64_t wake, end; XrTime display, pose; } LateEv;
+static LateEv* gLateEv; static int gLateN, gLateCap;
+static int64_t gWaitWakeSched = 0, gBegunWakeSched = 0;
 #define COMP_GROW(arr, n, cap) do { if ((n) >= (cap)) { (cap) = (cap) ? 2 * (cap) : 4096; (arr) = realloc((arr), sizeof(*(arr)) * (size_t)(cap)); } } while (0)
 static void compAcquire(int chain, int idx) {
     if (!gStampOn) return;
@@ -502,6 +509,11 @@ static void compEnd(const XrCompositionLayerProjection* p, XrTime display, int l
     if (gBegunWakeNs) {
         double ms = (double)(now - gBegunWakeNs) / 1e6;
         gEndAfterWake[ms < 0.5 ? 0 : ms < 1 ? 1 : ms < 2 ? 2 : ms < 3 ? 3 : ms < 4 ? 4 : ms < 6 ? 5 : 6]++;
+    }
+    if (gBegunWakeSched && gFocused) {
+        COMP_GROW(gLateEv, gLateN, gLateCap);
+        gLateEv[gLateN++] = (LateEv){gBegunWakeSched, now, display,
+                                     (p && p->viewCount == 2 && located >= 0) ? locateTime(located) : 0};
     }
     if (!gStampOn || !p || p->viewCount != 2 || p->views[0].subImage.swapchain == p->views[1].subImage.swapchain) return;
     COMP_GROW(gEndEv, gEndN, gEndCap);
@@ -540,7 +552,78 @@ static int compLatest(int model, int chain, int64_t t) {
     }
     return -1;
 }
+static int cmpFloat(const void* a, const void* b) {
+    float x = *(const float*)a, y = *(const float*)b;
+    return x < y ? -1 : x > y;
+}
+// Lane K: xrEndFrame after the runtime's wake-up for it, and a model of how SteamVR shows late ends.
+// Model (MOCK_XR_LATE_END_MS, default 1.5): a frame ended later than that after its wake-up is taken
+// for the refresh after its display time (the PrimeFrame H2 sessions: frames ended 2.5 ms or more after
+// the wake-up went to a 1-3 cadence, under 1.5 ms mostly clean). Each vsync shows the newest frame taken
+// for it; the step is the shown poses' locate time from the last vsync's, in refreshes. A steady stream
+// steps 1 every vsync (0 where the app repeated a layer, then 2); "zigzag" counts vsyncs whose step
+// differs from the one before by 2 or more (a 0 next to a 2: an image one refresh off, back and forth).
+static void lateReport(void) {
+    if (gLateN < 100) return;
+    float* ms = malloc(sizeof(float) * (size_t)gLateN);
+    int bins[8] = {0}, over1 = 0;
+    for (int i = 0; i < gLateN; i++) {
+        float v = (float)((double)(gLateEv[i].end - gLateEv[i].wake) / 1e6);
+        ms[i] = v;
+        bins[v < 0.5f ? 0 : v < 1.0f ? 1 : v < 1.5f ? 2 : v < 2.0f ? 3 : v < 4.0f ? 4 : v < 6.0f ? 5 : v < 8.3f ? 6 : 7]++;
+        if (v > 1.0f) over1++;
+    }
+    qsort(ms, (size_t)gLateN, sizeof(float), cmpFloat);
+    fprintf(stderr,
+            "xrmock: end after wake-up (ms, from the runtime's wake-up): %d frames, p50 %.2f, p99 %.2f, max %.2f; <0.5 %d, 0.5-1 %d, "
+            "1-1.5 %d, 1.5-2 %d, 2-4 %d, 4-6 %d, 6-8.3 %d, more %d; later than 1 ms %d (%.1f %%)\n",
+            gLateN, ms[gLateN / 2], ms[(int)((gLateN - 1) * 0.99)], ms[gLateN - 1], bins[0], bins[1], bins[2], bins[3], bins[4],
+            bins[5], bins[6], bins[7], over1, 100.0 * over1 / gLateN);
+    free(ms);
+    double limit = 1.5;
+    if (getenv("MOCK_XR_LATE_END_MS")) limit = atof(getenv("MOCK_XR_LATE_END_MS"));
+    int64_t limitNs = (int64_t)(limit * 1e6);
+    // Vsyncs from the first frame's display time to the last's.
+    XrTime first = gLateEv[0].display, last = gLateEv[gLateN - 1].display;
+    int j = 0, prevStep = -99, vsyncs = 0, fresh = 0, held = 0, skipped = 0, zig = 0, unknown = 0, moved = 0;
+    XrTime prevPose = 0;
+    int shown = -1;
+    // Frames are taken in end order; a later end replaces an earlier one taken for the same or an earlier vsync.
+    int* takenFor = malloc(sizeof(int) * (size_t)gLateN);
+    char* wasShown = calloc((size_t)gLateN, 1);
+    for (int i = 0; i < gLateN; i++) {
+        int64_t e = gLateEv[i].end - gLateEv[i].wake;
+        XrTime t = gLateEv[i].display + (e > limitNs ? gPeriod : 0);
+        takenFor[i] = (int)((t - first + gPeriod / 2) / gPeriod);
+    }
+    int nv = (int)((last - first + gPeriod / 2) / gPeriod);
+    for (int v = 0; v <= nv; v++) {
+        // The newest frame (in end order) taken for this vsync or an earlier one.
+        // takenFor never decreases (display times step by a refresh or more): the newest is the last.
+        while (j < gLateN && takenFor[j] <= v) shown = j++;
+        if (shown < 0) continue;
+        vsyncs++;
+        wasShown[shown] = 1;
+        XrTime pose = gLateEv[shown].pose;
+        if (!pose || !prevPose) { unknown++; prevPose = pose; prevStep = -99; continue; }
+        int step = (int)lround((double)(pose - prevPose) / (double)gPeriod);
+        if (step == 1) fresh++;
+        else if (step == 0) held++;
+        else moved++;
+        if (prevStep != -99 && abs(step - prevStep) >= 2) zig++;
+        prevStep = step;
+        prevPose = pose;
+    }
+    for (int i = 0; i < j; i++) skipped += !wasShown[i];
+    free(takenFor);
+    free(wasShown);
+    fprintf(stderr,
+            "xrmock: late-end model (ends later than %.1f ms after the wake-up shown a refresh late): %d vsyncs; poses step 1: %d, "
+            "0 (held): %d, other: %d, frames replaced before shown %d, no projection %d; zigzag %d (%.1f %%)\n",
+            limit, vsyncs, fresh, held, moved, skipped, unknown, zig, 100.0 * zig / (vsyncs > 0 ? vsyncs : 1));
+}
 static void compReport(void) {
+    lateReport();
     if (!gStampOn) return;
     fprintf(stderr, "xrmock: xrEndFrame after its xrWaitFrame returned (ms): <0.5 %d, 0.5-1 %d, 1-2 %d, 2-3 %d, 3-4 %d, 4-6 %d, >6 %d\n",
             gEndAfterWake[0], gEndAfterWake[1], gEndAfterWake[2], gEndAfterWake[3], gEndAfterWake[4], gEndAfterWake[5], gEndAfterWake[6]);
@@ -846,6 +929,7 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
         gWaits = (int)((now - gT0) / gPeriod) + 1;
     }
     int64_t wake = gT0 + (int64_t)gWaits * gPeriod;
+    gWaitWakeSched = wake;
     if (wake > now) {
         struct timespec ts = {(time_t)((wake - now) / 1000000000ll), (long)((wake - now) % 1000000000ll)};
         nanosleep(&ts, NULL);
@@ -886,6 +970,7 @@ static XrResult XRAPI_CALL mBeginFrame(XrSession s, const XrFrameBeginInfo* bi) 
     (void)bi;
     gBegunPredicted = gWaitPredicted;
     gBegunWakeNs = gLastWakeNs;
+    gBegunWakeSched = gWaitWakeSched;
     trace("beginFrame");
     return XR_SUCCESS;
 }

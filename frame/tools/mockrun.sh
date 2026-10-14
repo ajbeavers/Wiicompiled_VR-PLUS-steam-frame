@@ -129,7 +129,7 @@ HWATCH=$!
 wait $PID; RC=$?
 kill $WATCH $HWATCH 2>/dev/null
 echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
-grep -a 'xrmock: summary\|xrmock: end times\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|xrmock: stamps\|vr pacing totals' "$LOG" || true
+grep -a 'xrmock: summary\|xrmock: end times\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|xrmock: stamps\|xrmock: end after wake-up\|xrmock: late-end model\|vr pacing totals' "$LOG" || true
 echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
 FATAL=$(grep -a -c 'fatal dialog\|Signal 11' "$LOG")
 echo "mockrun: fatal lines: $FATAL"
@@ -137,5 +137,13 @@ echo "mockrun: fatal lines: $FATAL"
 if [ $FLAT = 0 ]; then
   grep -aq 'session state -> FOCUSED' "$LOG" || { echo "mockrun: FAIL, the session never reached FOCUSED" >&2; exit 1; }
   grep -aq 'xrmock: summary: 0 errors' "$LOG" || { echo "mockrun: FAIL, mock errors (see the trace)" >&2; exit 1; }
+  # KF_MOCKRUN_END_GATE=<percent>: FAIL when more frames than that ended later than 1 ms after the mock's
+  # wake-up (lane K: SteamVR showed such frames inconsistently on the headset, frame/perf/H7.md).
+  if [ -n "${KF_MOCKRUN_END_GATE:-}" ]; then
+    PCT=$(grep -a 'xrmock: end after wake-up' "$LOG" | sed -n 's/.*later than 1 ms [0-9]* (\([0-9.]*\) %).*/\1/p' | tail -1)
+    [ -n "$PCT" ] || { echo "mockrun: FAIL, no end-after-wake-up line" >&2; exit 1; }
+    awk -v p="$PCT" -v g="$KF_MOCKRUN_END_GATE" 'BEGIN{exit !(p <= g)}' ||
+      { echo "mockrun: FAIL, $PCT % of frames ended later than 1 ms after the wake-up (gate $KF_MOCKRUN_END_GATE %)" >&2; exit 1; }
+  fi
 fi
 echo "mockrun: ok"
