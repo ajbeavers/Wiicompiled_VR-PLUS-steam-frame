@@ -1412,7 +1412,16 @@ private:
         XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         create.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
                             XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-        if (IsWindowsVkSrgbFormat(swapchain_format_)) {
+        // Aurora writes the eyes through an sRGB view (decoding them in its shader; KARTFRAME_SINK, default
+        // srgb), so the images need no MUTABLE_FORMAT, which lets the driver compress them (lane I: the
+        // eyes' way into the images 0.47 ms a set instead of 2.3). KARTFRAME_SINK=copy|blit: raw copies
+        // through a UNORM view, which need the flag.
+        static const bool srgb_sink = [] {
+            const char* env = std::getenv("KARTFRAME_SINK");
+            const std::string_view v = env != nullptr ? env : "";
+            return v != "copy" && v != "blit";
+        }();
+        if (IsWindowsVkSrgbFormat(swapchain_format_) && !srgb_sink) {
             // Permit a UNORM view for raw copies into the sRGB XR image.
             create.usageFlags |= XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
         }

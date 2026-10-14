@@ -26,6 +26,7 @@ int AuroraDawnVulkanDrain(void* handle);
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <vector>
 namespace aurora::vulkan_win32 {
 namespace {
@@ -183,6 +184,92 @@ public:
     if (!guard.owns_lock() || encoded || claimed || !token || token != wanted) return false;
     token = 0; return true;
   }
+  // How the eyes reach the swapchain images (lane I). Default srgb: a full-screen draw that decodes the
+  // eye's sRGB-encoded bytes and writes them through an sRGB view of the sRGB image (the same bytes; the
+  // stamps read back exactly). The image then needs no MUTABLE_FORMAT, so the driver may compress it
+  // (Turnip: UBWC), and the eyes' way into it cost 0.47 ms a set instead of the copy's 2.3 ms (mock, GP
+  // race, compositor running; RACE120.md). KARTFRAME_SINK=copy is the old texture copy into a UNORM view
+  // of a MUTABLE_FORMAT image, =blit the same through a full-screen draw (the backend asks for
+  // MUTABLE_FORMAT for both). Not for a UNORM swapchain (no sRGB format offered): that takes the copy.
+  enum class Sink { Copy, Blit, Srgb };
+  static Sink SinkMode() {
+    static const Sink mode = [] {
+      const char* env = std::getenv("KARTFRAME_SINK");
+      const std::string_view v = env != nullptr ? env : "";
+      return v == "blit" ? Sink::Blit : v == "copy" ? Sink::Copy : Sink::Srgb;
+    }();
+    return mode;
+  }
+  static bool SinkBlit() { return SinkMode() != Sink::Copy; }
+  static wgpu::TextureFormat SrgbOf(wgpu::TextureFormat f) {
+    return f == wgpu::TextureFormat::BGRA8Unorm ? wgpu::TextureFormat::BGRA8UnormSrgb
+         : f == wgpu::TextureFormat::RGBA8Unorm ? wgpu::TextureFormat::RGBA8UnormSrgb
+                                                : f;
+  }
+  wgpu::RenderPipeline srgbPipeline;
+  wgpu::TextureFormat srgbPipelineFormat = wgpu::TextureFormat::Undefined;
+  const wgpu::RenderPipeline& SrgbPipeline(wgpu::TextureFormat format) {
+    if (srgbPipeline && srgbPipelineFormat == format) return srgbPipeline;
+    wgpu::ShaderSourceWGSL code{};
+    code.code = R"(
+      @group(0) @binding(0) var s: sampler;
+      @group(0) @binding(1) var t: texture_2d<f32>;
+      @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+        let p = array(vec2f(-1.0, 1.0), vec2f(-1.0, -3.0), vec2f(3.0, 1.0));
+        return vec4f(p[i], 0.0, 1.0);
+      }
+      fn decode(c: f32) -> f32 {
+        return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
+      }
+      @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+        let c = textureLoad(t, vec2i(p.xy), 0);
+        return vec4f(decode(c.r), decode(c.g), decode(c.b), 1.0);
+      }
+    )";
+    wgpu::ShaderModuleDescriptor md{};
+    md.nextInChain = &code;
+    const auto module = webgpu::g_device.CreateShaderModule(&md);
+    const auto layout = webgpu::g_CopyPipeline.GetBindGroupLayout(0);
+    const wgpu::PipelineLayoutDescriptor ld{.bindGroupLayoutCount = 1, .bindGroupLayouts = &layout};
+    const wgpu::ColorTargetState target{.format = format};
+    const wgpu::FragmentState fs{.module = module, .entryPoint = "fs", .targetCount = 1, .targets = &target};
+    wgpu::RenderPipelineDescriptor pd{};
+    pd.layout = webgpu::g_device.CreatePipelineLayout(&ld);
+    pd.vertex = {.module = module, .entryPoint = "vs"};
+    pd.fragment = &fs;
+    srgbPipeline = webgpu::g_device.CreateRenderPipeline(&pd);
+    srgbPipelineFormat = format;
+    return srgbPipeline;
+  }
+  std::vector<std::pair<WGPUTextureView, wgpu::BindGroup>> blitSources;
+  std::vector<std::pair<WGPUTexture, wgpu::TextureView>> blitTargets;
+  wgpu::Sampler blitSampler;
+  void Blit(wgpu::CommandEncoder& encoder, const wgpu::TextureView& source, const wgpu::Texture& target) {
+    if (!blitSampler) {
+      const wgpu::SamplerDescriptor sd{.magFilter = wgpu::FilterMode::Nearest, .minFilter = wgpu::FilterMode::Nearest};
+      blitSampler = webgpu::g_device.CreateSampler(&sd);
+    }
+    auto src = std::find_if(blitSources.begin(), blitSources.end(), [&](const auto& e) { return e.first == source.Get(); });
+    if (src == blitSources.end()) {
+      if (blitSources.size() >= 8) blitSources.erase(blitSources.begin());
+      blitSources.emplace_back(source.Get(), webgpu::create_copy_bind_group(source, blitSampler));
+      src = blitSources.end() - 1;
+    }
+    auto dst = std::find_if(blitTargets.begin(), blitTargets.end(), [&](const auto& e) { return e.first == target.Get(); });
+    if (dst == blitTargets.end()) {
+      if (blitTargets.size() >= 16) blitTargets.erase(blitTargets.begin());
+      blitTargets.emplace_back(target.Get(), target.CreateView());
+      dst = blitTargets.end() - 1;
+    }
+    const wgpu::RenderPassColorAttachment ca{.view = dst->second, .loadOp = wgpu::LoadOp::Clear,
+                                             .storeOp = wgpu::StoreOp::Store};
+    const wgpu::RenderPassDescriptor rd{.label = "VR eye to swapchain", .colorAttachmentCount = 1, .colorAttachments = &ca};
+    auto pass = encoder.BeginRenderPass(&rd);
+    pass.SetPipeline(SinkMode() == Sink::Srgb ? SrgbPipeline(target.GetFormat()) : webgpu::g_CopyPipeline);
+    pass.SetBindGroup(0, src->second, 0, nullptr);
+    pass.Draw(3);
+    pass.End();
+  }
   // The wrapped texture of target i as `format`, imported on first use (mutex held).
   wgpu::Texture* ImportTarget(uint32_t i, wgpu::TextureFormat format) {
     const auto& target = targets[i];
@@ -210,7 +297,7 @@ public:
   bool DirectTargets(uint64_t wanted, wgpu::TextureFormat format, uint32_t width, uint32_t height,
                      std::array<wgpu::Texture, AURORA_STEREO_EYE_COUNT>& out) {
     std::lock_guard guard(mutex);
-    if (!token || token != wanted || encoded || count != AURORA_STEREO_EYE_COUNT) return false;
+    if (!token || token != wanted || encoded || count != AURORA_STEREO_EYE_COUNT || SinkMode() == Sink::Srgb) return false;
     for (uint32_t i = 0; i < count; ++i) {
       if (targets[i].width != width || targets[i].height != height ||
           !CopyCompatible(VkFormat(format), targets[i].dxgiFormat)) return false;
@@ -236,7 +323,9 @@ public:
       const auto& target = targets[i];
       if (!eye.texture || eye.size.width != target.width || eye.size.height != target.height ||
           !CopyCompatible(VkFormat(eye.format), target.dxgiFormat)) return false;
-      auto* texture = ImportTarget(i, eye.format);
+      const bool srgbEye = SinkMode() == Sink::Srgb && i < count && frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY &&
+                           (target.dxgiFormat == 43 || target.dxgiFormat == 50) && SrgbOf(eye.format) != eye.format;
+      auto* texture = ImportTarget(i, srgbEye ? SrgbOf(eye.format) : eye.format);
       if (!texture) return false;
       active[i] = *texture;
     }
@@ -246,11 +335,17 @@ public:
       destination.texture = active[i];
       wgpu::Extent3D size{targets[i].width, targets[i].height, 1};
       // An eye rendered straight into its swapchain image (DirectTargets) needs no copy.
-      if (source.texture.Get() != destination.texture.Get()) encoder.CopyTextureToTexture(&source, &destination, &size);
+      if (source.texture.Get() == destination.texture.Get()) {
+      } else if (SinkBlit() && sources[i].view != nullptr && *sources[i].view &&
+                 (SinkMode() == Sink::Blit || active[i].GetFormat() != sources[i].format)) {
+        Blit(encoder, *sources[i].view, active[i]);
+      } else {
+        encoder.CopyTextureToTexture(&source, &destination, &size);
+      }
       if (StampEnabled() && frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && i < count && count == 2 &&
           targets[i].width >= 64 * kStampCell &&
           targets[i].height >= 3 * kStampCell)
-        WriteStamp(encoder, active[i], sources[i].format, frame.displayTimeNanos, i);
+        WriteStamp(encoder, active[i], active[i].GetFormat(), frame.displayTimeNanos, i);
     }
     encoded = true;
     return true;

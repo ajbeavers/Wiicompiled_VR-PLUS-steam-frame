@@ -933,6 +933,7 @@ public:
     way_ = static_cast<int>(((n - kSkip) / kBlock) & 1u) ^ 1;
     return way_;
   }
+  void not_applied() noexcept { measuring_ = false; }
   void begin(wgpu::CommandEncoder& encoder) noexcept { mark(encoder, true); }
   void end(wgpu::CommandEncoder& encoder) noexcept { mark(encoder, false); }
   void after_submit() noexcept {
@@ -1060,15 +1061,15 @@ DirectEyesCalibration g_directEyesCalibration;
 // backend allows it per set: it measures which way is cheaper on the runtime's images) and
 // nothing else needs Aurora's own eye targets this set: no MSAA resolve, no orientation correction, no
 // foveation view, no desktop mirror of the eyes, both eyes the size of their swapchain image.
-void use_direct_eye_targets(gfx::StereoReplayFrame& replay, const AuroraStereoFrame& input) noexcept {
+bool use_direct_eye_targets(gfx::StereoReplayFrame& replay, const AuroraStereoFrame& input) noexcept {
   g_directEyes = {};
   if (input.mode != AURORA_STEREO_FRAME_IMMERSIVE_REPLAY ||
       webgpu::g_graphicsConfig.msaaSamples > 1 || webgpu::g_RaceOutputNeedsCopy) {
-    return;
+    return false;
   }
   const auto mirror = gfx::get_stereo_mirror_view();
   if (mirror != AURORA_STEREO_MIRROR_NORMAL && mirror != AURORA_STEREO_MIRROR_NONE) {
-    return;
+    return false;
   }
   stereo::DirectTargetsCallback callback;
   void* userdata;
@@ -1081,12 +1082,12 @@ void use_direct_eye_targets(gfx::StereoReplayFrame& replay, const AuroraStereoFr
   if (callback == nullptr || replay.eyes[0].target.foveatedColorView || replay.eyes[1].target.foveatedColorView ||
       g_stereoEyeTargets[1].color.size.width != left.color.size.width ||
       g_stereoEyeTargets[1].color.size.height != left.color.size.height) {
-    return;
+    return false;
   }
   std::array<wgpu::Texture, AURORA_STEREO_EYE_COUNT> textures;
   if (!callback(input.frameToken, left.color.format, left.color.size.width, left.color.size.height, textures,
                 userdata)) {
-    return;
+    return false;
   }
   // A view per swapchain image, kept while the image is (the runtime cycles through a few).
   static std::vector<std::pair<WGPUTexture, wgpu::TextureView>> views;
@@ -1104,6 +1105,7 @@ void use_direct_eye_targets(gfx::StereoReplayFrame& replay, const AuroraStereoFr
     target.copySourceTexture = textures[eye];
     target.copySourceView = it->second;
   }
+  return true;
 }
 
 #include "vr_ui.hpp"
@@ -2349,8 +2351,8 @@ void run_retained_stereo_frame(gfx::SealedFrame& sealedFrame) noexcept {
     gfx::gpu_timing_end_frame(encoder);  // closes the slot; nothing was recorded on the GPU
     return;
   }
-  if (g_directEyesCalibration.choose() == 1) {
-    use_direct_eye_targets(replay, *input);
+  if (g_directEyesCalibration.choose() == 1 && !use_direct_eye_targets(replay, *input)) {
+    g_directEyesCalibration.not_applied();  // a trial set that could not go straight in: not a sample
   }
   g_directEyesCalibration.begin(encoder);
   for (uint32_t eye = 0; eye < AURORA_STEREO_EYE_COUNT; ++eye) {
