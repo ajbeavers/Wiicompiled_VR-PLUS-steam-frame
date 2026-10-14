@@ -131,6 +131,7 @@ typedef struct {
     int dumpMark, dumped;  // MOCK_XR_DUMP: the dump time this chain is on, images written for it
     int stampSlot;         // MOCK_XR_STAMP: the last released image's stamp read-back slot, -1 none
     unsigned stampGen;
+    int lastRel;           // index of the last image released, -1 none
 } Chain;
 static Chain gChains[MAXSC];
 static int gErrors = 0;  // ERROR lines in the trace
@@ -344,6 +345,7 @@ static XrResult XRAPI_CALL mCreateSwapchain(XrSession s, const XrSwapchainCreate
     c->format = ci->format;
     c->count = 3;
     c->stampSlot = -1;
+    c->lastRel = -1;
     c->images = gGfx->create_images(c->format, ci->usageFlags, c->w, c->h, c->mips, c->count);
     trace("createSwapchain sc%d %dx%d mips=%d format=0x%llx usage=0x%llx", gChainCount, c->w, c->h, c->mips, (long long)c->format,
           (unsigned long long)ci->usageFlags);
@@ -369,6 +371,8 @@ static XrResult XRAPI_CALL mEnumSwapImages(XrSwapchain sc, uint32_t cap, uint32_
     if (cap == 0) return XR_SUCCESS;
     return gGfx->fill_images(c->images, c->count < (int)cap ? c->count : (int)cap, im);
 }
+static void compAcquire(int chain, int idx);
+static void compRelease(int chain, int idx, int slot, unsigned gen);
 static XrResult XRAPI_CALL mAcquire(XrSwapchain sc, const XrSwapchainImageAcquireInfo* ai, uint32_t* idx) {
     (void)ai;
     Chain* c = chainOf(sc);
@@ -379,6 +383,7 @@ static XrResult XRAPI_CALL mAcquire(XrSwapchain sc, const XrSwapchainImageAcquir
     *idx = (uint32_t)c->next;
     c->next = (c->next + 1) % c->count;
     c->acquired++;
+    compAcquire(chainId(sc), (int)*idx);
     trace("acquire sc%d idx=%u", chainId(sc), *idx);
     return XR_SUCCESS;
 }
@@ -436,6 +441,182 @@ static void stampPoll(int wait) {
             }
         }
         gStampPending[i] = gStampPending[--gStampPendingCount];
+    }
+}
+
+// ---- Compositor model (lane J): what the panels would show ----
+// The panel recording of the eighth headset session (frame/perf/PANELS.md) showed, in races only, one
+// eye at a time displaying a whole image it had shown 3 to 5 refreshes before (10 % of the left eye's
+// refreshes, 7 % of the right eye's, both eyes at once 0.3 %), and the race timer on the virtual screen
+// going back and forth between game frames. SteamVR's compositor evidently does not show the image a
+// layer was ended with but resolves each eye's image when it composites. With MOCK_XR_STAMP the mock
+// logs every acquire, release (with the released image's stamp) and xrEndFrame, and at the end of the
+// session replays a 120 Hz vsync grid against three models of that resolution:
+//   spec    the image latched at xrEndFrame (what OpenXR specifies),
+//   lazyrel each eye's swapchain's most recently released image when the eye is composited,
+//   lazyacq its most recently acquired image (the one the app may be rendering into: until its
+//           release it still holds what it held at its previous release).
+// Frames are picked by display time (the newest frame ended before the eye is composited whose
+// predicted display time is not after the vsync; MOCK_XR_COMPOSITE_SELECT=latest: the newest frame
+// ended), each eye read MOCK_XR_COMPOSITE_MS=<left>,<right> ms before its vsync (default 3,1: with the
+// game's two alternating swapchain pairs this reproduced the recording's per-eye pattern). For every
+// eye and vsync: the refreshes between the display time the shown image was rendered for and the one
+// the frame's poses were located for (0: image and poses belong together; anything else is a world
+// placed by the wrong head pose, a doubled image on head turns), and how often an eye shows an image
+// again that it showed 2 to 8 refreshes before (the recording's measure).
+typedef struct { int chain, idx; int64_t t; } AcqEv;
+typedef struct { int chain, idx; int64_t t; int slot; unsigned gen; int state; uint64_t value; } RelEv;
+typedef struct { int64_t t, wake; XrTime display, pose; int chain[2], latched[2]; } EndEv;
+static AcqEv* gAcqEv; static int gAcqN, gAcqCap;
+static RelEv* gRelEv; static int gRelN, gRelCap, gRelDone;
+static EndEv* gEndEv; static int gEndN, gEndCap;
+static int64_t gLastWakeNs = 0, gBegunWakeNs = 0;
+static int gEndAfterWake[7];  // xrEndFrame minus its xrWaitFrame's return: <0.5, <1, <2, <3, <4, <6, more ms
+#define COMP_GROW(arr, n, cap) do { if ((n) >= (cap)) { (cap) = (cap) ? 2 * (cap) : 4096; (arr) = realloc((arr), sizeof(*(arr)) * (size_t)(cap)); } } while (0)
+static void compAcquire(int chain, int idx) {
+    if (!gStampOn) return;
+    COMP_GROW(gAcqEv, gAcqN, gAcqCap);
+    gAcqEv[gAcqN++] = (AcqEv){chain, idx, nowNs()};
+}
+static void compRelease(int chain, int idx, int slot, unsigned gen) {
+    if (!gStampOn) return;
+    COMP_GROW(gRelEv, gRelN, gRelCap);
+    gRelEv[gRelN++] = (RelEv){chain, idx, nowNs(), slot, gen, slot < 0 ? -1 : 0, 0};
+}
+// Reads back the stamps of the released images (wait: block for the outstanding ones).
+static void compResolve(int wait) {
+    if (!gStampOn || !gGfx || !gGfx->stamp_read) return;
+    for (int i = gRelDone; i < gRelN; i++) {
+        RelEv* r = &gRelEv[i];
+        if (r->state != 0) continue;
+        uint64_t v = 0;
+        int eye = 0;
+        int got = gGfx->stamp_read(r->slot, r->gen, wait, &v, &eye);
+        if (got == 1) r->state = 1, r->value = v;
+        else if (got != 0) r->state = -1;
+    }
+    while (gRelDone < gRelN && gRelEv[gRelDone].state != 0) gRelDone++;
+}
+static void compEnd(const XrCompositionLayerProjection* p, XrTime display, int located) {
+    int64_t now = nowNs();
+    if (gBegunWakeNs) {
+        double ms = (double)(now - gBegunWakeNs) / 1e6;
+        gEndAfterWake[ms < 0.5 ? 0 : ms < 1 ? 1 : ms < 2 ? 2 : ms < 3 ? 3 : ms < 4 ? 4 : ms < 6 ? 5 : 6]++;
+    }
+    if (!gStampOn || !p || p->viewCount != 2 || p->views[0].subImage.swapchain == p->views[1].subImage.swapchain) return;
+    COMP_GROW(gEndEv, gEndN, gEndCap);
+    EndEv* e = &gEndEv[gEndN++];
+    e->t = now;
+    e->wake = gBegunWakeNs;
+    e->display = display;
+    e->pose = located >= 0 ? locateTime(located) : 0;
+    for (int v = 0; v < 2; v++) {
+        e->chain[v] = chainId(p->views[v].subImage.swapchain);
+        e->latched[v] = chainOf(p->views[v].subImage.swapchain)->lastRel;
+    }
+}
+// The content (stamp) image idx of chain held at time t: the stamp of its last release before t.
+static int compContent(int chain, int idx, int64_t t, uint64_t* value) {
+    int lo = 0, hi = gRelN;  // first release after t
+    while (lo < hi) { int m = (lo + hi) / 2; if (gRelEv[m].t <= t) lo = m + 1; else hi = m; }
+    for (int i = lo - 1; i >= 0 && i >= lo - 400; i--) {
+        if (gRelEv[i].chain == chain && gRelEv[i].idx == idx) {
+            if (gRelEv[i].state != 1) return 0;
+            *value = gRelEv[i].value;
+            return 1;
+        }
+    }
+    return 0;
+}
+static int compLatest(int model, int chain, int64_t t) {
+    if (model == 1) {
+        int lo = 0, hi = gRelN;
+        while (lo < hi) { int m = (lo + hi) / 2; if (gRelEv[m].t <= t) lo = m + 1; else hi = m; }
+        for (int i = lo - 1; i >= 0 && i >= lo - 400; i--) if (gRelEv[i].chain == chain) return gRelEv[i].idx;
+    } else {
+        int lo = 0, hi = gAcqN;
+        while (lo < hi) { int m = (lo + hi) / 2; if (gAcqEv[m].t <= t) lo = m + 1; else hi = m; }
+        for (int i = lo - 1; i >= 0 && i >= lo - 400; i--) if (gAcqEv[i].chain == chain) return gAcqEv[i].idx;
+    }
+    return -1;
+}
+static void compReport(void) {
+    if (!gStampOn) return;
+    fprintf(stderr, "xrmock: xrEndFrame after its xrWaitFrame returned (ms): <0.5 %d, 0.5-1 %d, 1-2 %d, 2-3 %d, 3-4 %d, 4-6 %d, >6 %d\n",
+            gEndAfterWake[0], gEndAfterWake[1], gEndAfterWake[2], gEndAfterWake[3], gEndAfterWake[4], gEndAfterWake[5], gEndAfterWake[6]);
+    if (gEndN < 100) return;
+    compResolve(1);
+    double cofs[2] = {3.0, 1.0};
+    const char* co = getenv("MOCK_XR_COMPOSITE_MS");
+    if (co) sscanf(co, "%lf,%lf", &cofs[0], &cofs[1]);
+    const char* sel = getenv("MOCK_XR_COMPOSITE_SELECT");
+    int byDisplay = !(sel && !strcmp(sel, "latest"));
+    static const char* names[3] = {"spec", "lazyrel", "lazyacq"};
+    int64_t k0 = (gEndEv[0].display - gTimeOffset - gT0) / gPeriod + 1;
+    int64_t k1 = (gEndEv[gEndN - 1].t - gT0) / gPeriod - 1;
+    for (int model = 0; model < 3; model++) {
+        int n[2] = {0, 0}, unknown[2] = {0, 0}, own[2] = {0, 0}, again[2] = {0, 0}, hist[2][13];
+        int differ = 0, both = 0;
+        memset(hist, 0, sizeof(hist));
+        uint64_t prev[2][9];
+        int have[2][9];
+        memset(have, 0, sizeof(have));
+        for (int64_t k = k0; k <= k1; k++) {
+            int64_t vsync = gT0 + k * gPeriod;
+            uint64_t shown[2] = {0, 0};
+            int ok[2] = {0, 0};
+            for (int e = 0; e < 2; e++) {
+                int64_t tr = vsync - (int64_t)(cofs[e] * 1e6);
+                int lo = 0, hi = gEndN;
+                while (lo < hi) { int m = (lo + hi) / 2; if (gEndEv[m].t <= tr) lo = m + 1; else hi = m; }
+                int f = lo - 1;
+                if (byDisplay)
+                    while (f >= 0 && gEndEv[f].display - gTimeOffset > vsync + gPeriod / 2) f--;
+                if (f < 0) continue;
+                const EndEv* ev = &gEndEv[f];
+                int idx = model == 0 ? ev->latched[e] : compLatest(model, ev->chain[e], tr);
+                uint64_t value = 0;
+                n[e]++;
+                if (idx < 0 || !ev->pose || !compContent(ev->chain[e], idx, tr, &value)) { unknown[e]++; continue; }
+                ok[e] = 1;
+                shown[e] = value;
+                long d = lround((double)((int64_t)value - (ev->pose - gTimeOffset)) / (double)gPeriod);
+                if (d == 0) own[e]++;
+                hist[e][d < -6 ? 0 : d > 6 ? 12 : d + 6]++;
+                if (have[e][0] && value != prev[e][0])
+                    for (int j = 1; j < 8; j++)
+                        if (have[e][j] && prev[e][j] == value) { again[e]++; break; }
+            }
+            if (ok[0] && ok[1]) {
+                both++;
+                if (shown[0] != shown[1]) differ++;
+            }
+            for (int e = 0; e < 2; e++) {
+                memmove(&prev[e][1], &prev[e][0], 8 * sizeof(uint64_t));
+                memmove(&have[e][1], &have[e][0], 8 * sizeof(int));
+                prev[e][0] = shown[e];
+                have[e][0] = ok[e];
+            }
+        }
+        char other[2][256];
+        for (int e = 0; e < 2; e++) {
+            other[e][0] = 0;
+            for (int b = 0; b < 13; b++) {
+                if (b == 6 || !hist[e][b]) continue;
+                char t[32];
+                snprintf(t, sizeof(t), " %s%d:%d", b == 0 ? "<=" : b == 12 ? ">=" : "", b - 6, hist[e][b]);
+                strcat(other[e], t);
+            }
+        }
+        fprintf(stderr,
+                "xrmock: compositor %s (eyes read %.1f/%.1f ms before the vsync, frames by %s): %lld vsyncs; "
+                "left: %d of %d with the poses it was rendered for (%.1f %%), off by refreshes:%s; shown again from 2-8 refreshes before %d (%.1f %%), unknown %d; "
+                "right: %d of %d (%.1f %%), off:%s; again %d (%.1f %%), unknown %d; eyes from different sets %d of %d (%.1f %%)\n",
+                names[model], cofs[0], cofs[1], byDisplay ? "display time" : "end", (long long)(k1 - k0 + 1),
+                own[0], n[0] - unknown[0], 100.0 * own[0] / (n[0] - unknown[0] > 0 ? n[0] - unknown[0] : 1), other[0][0] ? other[0] : " none",
+                again[0], 100.0 * again[0] / (n[0] > 0 ? n[0] : 1), unknown[0],
+                own[1], n[1] - unknown[1], 100.0 * own[1] / (n[1] - unknown[1] > 0 ? n[1] - unknown[1] : 1), other[1][0] ? other[1] : " none",
+                again[1], 100.0 * again[1] / (n[1] > 0 ? n[1] : 1), unknown[1], differ, both, 100.0 * differ / (both > 0 ? both : 1));
     }
 }
 static XrResult XRAPI_CALL mWaitImage(XrSwapchain sc, const XrSwapchainImageWaitInfo* wi) {
@@ -534,9 +715,13 @@ static XrResult XRAPI_CALL mRelease(XrSwapchain sc, const XrSwapchainImageReleas
         }
     }
     maybeDump(c, sc);
-    if (gStampOn && gGfx && gGfx->stamp_capture) {
+    {
         int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
-        c->stampSlot = gGfx->stamp_capture(c->images, idx, c->w, c->h, &c->stampGen);
+        if (gStampOn && gGfx && gGfx->stamp_capture) {
+            c->stampSlot = gGfx->stamp_capture(c->images, idx, c->w, c->h, &c->stampGen);
+            compRelease(chainId(sc), idx, c->stampSlot, c->stampGen);
+        }
+        c->lastRel = idx;
     }
     c->acquired--;
     c->waited--;
@@ -594,6 +779,7 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
         fprintf(stderr, "xrmock: queue drain time at the releases: <0.5 ms %d, 0.5-1 %d, 1-2 %d, 2-4 %d, >4 %d\n", gWaitHist[0], gWaitHist[1], gWaitHist[2],
                 gWaitHist[3], gWaitHist[4]);
     }
+    compReport();
     pushState(XR_SESSION_STATE_EXITING);
     trace("endSession");
     return XR_SUCCESS;
@@ -681,8 +867,10 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
         pushState(XR_SESSION_STATE_STOPPING);
     }
     gFrame++;
+    gLastWakeNs = nowNs();
     trace("waitFrame");
     if (gStampOn && gGfx && gGfx->stamp_read) stampPoll(0);
+    compResolve(0);
     if (gGfx && gGfx->poll_snapshots) {
         int changed = gGfx->poll_snapshots(0);
         for (int k = 0; k < changed; k++) {
@@ -697,12 +885,15 @@ static XrResult XRAPI_CALL mBeginFrame(XrSession s, const XrFrameBeginInfo* bi) 
     (void)s;
     (void)bi;
     gBegunPredicted = gWaitPredicted;
+    gBegunWakeNs = gLastWakeNs;
     trace("beginFrame");
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
     (void)s;
     char buf[1024] = "";
+    const XrCompositionLayerProjection* eyesLayer = NULL;
+    int eyesLocated = -1;
     for (uint32_t i = 0; i < ei->layerCount; i++) {
         const XrCompositionLayerBaseHeader* l = ei->layers[i];
         char t[256];
@@ -715,6 +906,10 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
                 else gRepeatSets++;
             }
             int located = checkPoses(p, ei->displayTime, fresh);
+            if (!eyesLayer && p->viewCount == 2 && p->views[0].subImage.swapchain != p->views[1].subImage.swapchain) {
+                eyesLayer = p;
+                eyesLocated = located;
+            }
             // A layer whose eyes share one image (packed side by side) carries no stamp.
             if (gStampOn && gGfx && gGfx->stamp_read && p->viewCount == 2 &&
                 p->views[0].subImage.swapchain != p->views[1].subImage.swapchain) {
@@ -755,6 +950,7 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
         }
     }
     trace("endFrame layers=%u%s", ei->layerCount, buf);
+    compEnd(eyesLayer, ei->displayTime, eyesLocated);
     // Display times increase from one xrEndFrame to the next (the app keeps them so; a runtime may
     // take an older one for a frame it already showed).
     static XrTime lastDisplay = 0;
