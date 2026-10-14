@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -500,6 +501,24 @@ bool EndLocateSetting() {
     static const bool on = [] {
         const char* env = std::getenv("KARTFRAME_END_LOCATE");
         return !(env != nullptr && env[0] == '0');
+    }();
+    return on;
+}
+
+// Lane R: KARTFRAME_SUBMIT_POSE=fresh submits race frames that show a new set with the poses of the
+// pose check's locate for the frame's own display time (the images stay as rendered); default rendered.
+bool SubmitFreshPoseSetting() {
+    static const bool fresh = [] {
+        const char* env = std::getenv("KARTFRAME_SUBMIT_POSE");
+        return env != nullptr && std::string_view(env) == "fresh";
+    }();
+    return fresh;
+}
+// KARTFRAME_END_TIME=locate (lane G's rule): end a layer with its poses' locate time.
+bool EndAtLocateSetting() {
+    static const bool on = [] {
+        const char* env = std::getenv("KARTFRAME_END_TIME");
+        return env != nullptr && std::string_view(env) == "locate";
     }();
     return on;
 }
@@ -1613,6 +1632,9 @@ public:
         retained_ref_cycle_ = cycle_count_;
         log_fresh_ = fresh;  // logged by EndFrameWithPanel with the layer count
         const auto& frame = retained_frame_;
+        CheckPoses(frame, fresh);
+        // KARTFRAME_SUBMIT_POSE=fresh: a race frame showing a new set goes out with the check's poses.
+        const bool submit_fresh = fresh && fresh_views_valid_ && SubmitFreshPoseSetting();
         if (frame.presentation.mode == OpenXRWindowsVulkanFrameMode::VirtualScreen) {
             XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
             quad.layerFlags = 0;
@@ -1680,8 +1702,9 @@ public:
             std::array<XrCompositionLayerProjectionView, kOpenXREyeCount> views{};
             for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
                 views[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-                views[eye].pose.orientation = frame.xr_frame.views[eye].pose.orientation;
-                views[eye].pose.position = frame.xr_frame.views[eye].pose.position;
+                const XrPosef& pose = submit_fresh ? fresh_views_[eye].pose : frame.xr_frame.views[eye].pose;
+                views[eye].pose.orientation = pose.orientation;
+                views[eye].pose.position = pose.position;
                 views[eye].fov = frame.xr_frame.views[eye].fov;
                 views[eye].subImage.swapchain = retained_swapchains_[eye].handle;
                 views[eye].subImage.imageRect = {
@@ -1739,10 +1762,7 @@ public:
         // a time one refresh older than its cycle's; SteamVR's mispresented frames went from 116
         // to 1284 and reused app frames from 0.2 to 4.4 %. KARTFRAME_END_TIME=locate restores it
         // (the mock's end-time check counts each such frame as an error).
-        static const bool end_at_locate = [] {
-            const char* env = std::getenv("KARTFRAME_END_TIME");
-            return env != nullptr && std::string_view(env) == "locate";
-        }();
+        const bool end_at_locate = EndAtLocateSetting();
         // Display times stay increasing from one xrEndFrame to the next: a layer shown again (or a
         // late set whose time an earlier frame already used) goes out at this cycle's time.
         if (end_at_locate && retained_locate_time_ != 0 && retained_locate_time_ > last_end_display_time_ &&
@@ -1755,31 +1775,114 @@ public:
             return ok;
         }
         last_end_display_time_ = std::max(last_end_display_time_, active_frame_.predicted_display_time);
-        if (frame.presentation.mode != OpenXRWindowsVulkanFrameMode::VirtualScreen) LocateAtEnd(active_frame_.predicted_display_time);
         const bool ok = runtime_->EndFrame(active_frame_, layers, count);
         NoteEndAfterWake();
         return ok;
     }
 
-    // Lane O: GalaxyFrame's last OpenXR call before xrEndFrame (after the set's release) is an
-    // xrLocateViews for the frame's own display time (its pose check; eye sets only, not the menus).
-    // KartFrame's last locate before an xrEndFrame was the one for the set two refreshes ahead. The
-    // result is not used.
-    void LocateAtEnd(XrTime display_time) {
-        if (!EndLocateSetting() || runtime_ == nullptr || runtime_->Session() == XR_NULL_HANDLE ||
-            runtime_->AppSpace() == XR_NULL_HANDLE)
+    // The display time EndFrameWithPanel will end the open cycle with (KARTFRAME_END_TIME=locate: the
+    // retained layer's locate time when that is still new).
+    XrTime EndDisplayTime() const {
+        if (EndAtLocateSetting() && retained_locate_time_ != 0 && retained_locate_time_ > last_end_display_time_ &&
+            retained_locate_time_ != active_frame_.predicted_display_time)
+            return retained_locate_time_;
+        return active_frame_.predicted_display_time;
+    }
+
+    // Lane R: GalaxyFrame's pose check (notePoses in its xr_app.cpp). Lane O made GalaxyFrame's last
+    // OpenXR call before xrEndFrame (after the release) part of KartFrame too: one xrLocateViews for the
+    // frame's own display time, in the layer's space. Its result is now used: per eye, how far the poses
+    // the shown images were rendered from (the set's own locate, made up to two refreshes plus SteamVR's
+    // lead earlier) are from that fresh locate, and with KARTFRAME_SUBMIT_POSE=fresh the race's
+    // projection layer is submitted with it. Every frame with located views (race and menus) is checked;
+    // the 5 s summary counts frames that show a new set (as GalaxyFrame: each set once, when it goes out),
+    // the XRF line carries every frame's angles. KARTFRAME_END_LOCATE=0 leaves the locate out (except for
+    // KARTFRAME_SUBMIT_POSE=fresh frames, which need it).
+    void CheckPoses(const OpenXRBackendFrame& frame, bool fresh) {
+        fresh_views_valid_ = false;
+        log_angle_[0] = log_angle_[1] = -1.0;
+        const bool race = frame.presentation.mode != OpenXRWindowsVulkanFrameMode::VirtualScreen;
+        const bool need_fresh = race && fresh && SubmitFreshPoseSetting();
+        if ((!EndLocateSetting() && !need_fresh) || runtime_ == nullptr || runtime_->Session() == XR_NULL_HANDLE ||
+            runtime_->AppSpace() == XR_NULL_HANDLE || !frame.xr_frame.views_valid)
             return;
         // Through the runtime's dispatch (the backend's replay test links no OpenXR loader).
         if (locate_views_ == nullptr && !runtime_->LoadFunction("xrLocateViews", &locate_views_)) return;
+        const XrTime end_time = EndDisplayTime();
         XrViewLocateInfo info{XR_TYPE_VIEW_LOCATE_INFO};
         info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        info.displayTime = display_time;
+        info.displayTime = end_time;
         info.space = runtime_->AppSpace();
         XrViewState state{XR_TYPE_VIEW_STATE};
-        std::array<XrView, kOpenXREyeCount> views{};
-        for (auto& view : views) view = {XR_TYPE_VIEW};
+        for (auto& view : fresh_views_) view = {XR_TYPE_VIEW};
         uint32_t count = 0;
-        ObserveResult(locate_views_(runtime_->Session(), &info, &state, kOpenXREyeCount, &count, views.data()));
+        const auto t0 = std::chrono::steady_clock::now();
+        const XrResult result = locate_views_(runtime_->Session(), &info, &state, kOpenXREyeCount, &count, fresh_views_.data());
+        const double locate_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ObserveResult(result);
+        constexpr XrViewStateFlags kValid = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+        if (XR_FAILED(result) || count < kOpenXREyeCount || (state.viewStateFlags & kValid) != kValid) return;
+        fresh_views_valid_ = true;
+        auto& pc = pose_check_;
+        const auto now = std::chrono::steady_clock::now();
+        if (pc.sets > 0 && (pc.race != race || now - pc.since >= std::chrono::seconds(5))) LogPoseCheck(now);
+        if (pc.sets == 0) {
+            pc = {};
+            pc.race = race;
+            pc.since = now;
+        }
+        const XrTime set_time = retained_locate_time_ != 0 ? retained_locate_time_ : frame.xr_frame.predicted_display_time;
+        const double dt = std::fabs(static_cast<double>(set_time - end_time)) / 1e6;
+        for (uint32_t e = 0; e < kOpenXREyeCount; ++e) {
+            const XrPosef& sub = frame.xr_frame.views[e].pose;
+            const XrPosef& now_pose = fresh_views_[e].pose;
+            const double dx = sub.position.x - now_pose.position.x, dy = sub.position.y - now_pose.position.y,
+                         dz = sub.position.z - now_pose.position.z;
+            const double d = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.0;
+            const XrQuaternionf& r = sub.orientation;
+            const XrQuaternionf& q = now_pose.orientation;
+            // The angle between them from the chord (|r - s| = 2 sin(angle / 4)), exact for small angles
+            // where acos of the dot product is not.
+            const double sg = r.x * q.x + r.y * q.y + r.z * q.z + r.w * q.w < 0.0 ? -1.0 : 1.0;
+            const double cx = r.x - sg * q.x, cy = r.y - sg * q.y, cz = r.z - sg * q.z, cw = r.w - sg * q.w;
+            const double ang = 4.0 * std::asin(std::fmin(1.0, 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz + cw * cw))) * 57.29578;
+            log_angle_[e] = ang;
+            if (!fresh) continue;
+            pc.pos_sum[e] += d;
+            pc.pos_max[e] = std::fmax(pc.pos_max[e], d);
+            pc.ang_sum[e] += ang;
+            pc.ang_max[e] = std::fmax(pc.ang_max[e], ang);
+        }
+        if (!fresh) return;
+        ++pc.sets;
+        pc.on_time += dt < 0.5;
+        pc.dt_sum += dt;
+        pc.dt_max = std::fmax(pc.dt_max, dt);
+        const XrVector3f& l = frame.xr_frame.views[0].pose.position;
+        const XrVector3f& rp = frame.xr_frame.views[1].pose.position;
+        const double ipd = std::sqrt((l.x - rp.x) * (l.x - rp.x) + (l.y - rp.y) * (l.y - rp.y) + (l.z - rp.z) * (l.z - rp.z)) * 1000.0;
+        pc.ipd_min = std::fmin(pc.ipd_min, ipd);
+        pc.ipd_max = std::fmax(pc.ipd_max, ipd);
+        pc.locate_sum += locate_ms;
+        pc.locate_max = std::fmax(pc.locate_max, locate_ms);
+    }
+
+    // GalaxyFrame's words, then the scene (race: eye sets; menus: the environment's poses) and the
+    // check's own locate call.
+    void LogPoseCheck(std::chrono::steady_clock::time_point now) {
+        auto& pc = pose_check_;
+        const int k = pc.sets;
+        char line[640];
+        std::snprintf(line, sizeof(line),
+                      "vr: views of %d sets: %d for the display time they went out at (off %.2f ms avg, %.2f max); against a locate then: "
+                      "left eye %.2f mm %.3f deg avg, %.2f mm %.3f deg max; right eye %.2f mm %.3f deg avg, %.2f mm %.3f deg max; "
+                      "eye distance %.2f-%.2f mm; %s, %.1f s; that locate %.3f ms avg %.3f max",
+                      k, pc.on_time, pc.dt_sum / k, pc.dt_max, pc.pos_sum[0] / k, pc.ang_sum[0] / k, pc.pos_max[0], pc.ang_max[0],
+                      pc.pos_sum[1] / k, pc.ang_sum[1] / k, pc.pos_max[1], pc.ang_max[1], pc.ipd_min, pc.ipd_max,
+                      pc.race ? "race" : "menus", std::chrono::duration<double>(now - pc.since).count(), pc.locate_sum / k,
+                      pc.locate_max);
+        Log(OpenXRLogLevel::Info, line);
+        pc.sets = 0;
     }
 
     void NoteEndAfterWake() {
@@ -1928,7 +2031,8 @@ public:
     // at 120 Hz). XRF c=<cycle> w=<wake-up, ms since the first> e=<xrEndFrame after the wake-up, ms, at the
     // call> f=<1 a newly rendered set, 0 the retained layer again> p=<eye pair> i=<released image index
     // left/right> d=<display time step from the last frame, refreshes> l=<display time minus the poses'
-    // locate time, refreshes> n=<layers submitted> (lane Q). The panel recording (KARTFRAME_RECORD=raw) lines up with it frame by frame.
+    // locate time, refreshes> n=<layers submitted> (lane Q) aL=/aR=<degrees between each eye's rendered pose and
+    // a locate for the frame's display time, -1 when not checked> (lane R). The panel recording (KARTFRAME_RECORD=raw) lines up with it frame by frame.
     void LogFrame(bool fresh, uint32_t layer_count) {
         static const bool enabled = [] {
             const char* env = std::getenv("KARTFRAME_FRAME_LOG");
@@ -1942,13 +2046,13 @@ public:
         const double step = log_last_display_ ? static_cast<double>(active_frame_.predicted_display_time - log_last_display_) / period : 0.0;
         log_last_display_ = active_frame_.predicted_display_time;
         const double located = retained_locate_time_ ? static_cast<double>(active_frame_.predicted_display_time - retained_locate_time_) / period : 0.0;
-        char line[200];
-        std::snprintf(line, sizeof(line), "XRF c=%llu w=%.3f e=%.2f f=%d p=%u i=%d/%d d=%.2f l=%.2f n=%u",
+        char line[256];
+        std::snprintf(line, sizeof(line), "XRF c=%llu w=%.3f e=%.2f f=%d p=%u i=%d/%d d=%.2f l=%.2f n=%u aL=%.3f aR=%.3f",
                       static_cast<unsigned long long>(cycle_count_),
                       std::chrono::duration<double, std::milli>(wake_ - log_epoch_).count(),
                       std::chrono::duration<double, std::milli>(now - wake_).count(), fresh ? 1 : 0,
                       retained_swapchains_[0].pair_id, retained_swapchains_[0].released_index,
-                      retained_swapchains_[1].released_index, step, located, layer_count);
+                      retained_swapchains_[1].released_index, step, located, layer_count, log_angle_[0], log_angle_[1]);
         Log(OpenXRLogLevel::Info, line);
     }
 
@@ -2596,7 +2700,20 @@ private:
     VkFormat aurora_format_ = VK_FORMAT_UNDEFINED;
     VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
     VkFormat eye_format_ = VK_FORMAT_UNDEFINED;  // lane O: the eye pairs' format (SelectSwapchainFormat)
-    PFN_xrLocateViews locate_views_ = nullptr;   // lane O: LocateAtEnd
+    PFN_xrLocateViews locate_views_ = nullptr;   // lane O / R: CheckPoses
+    // Lane R: the pose check's fresh locate for the frame being ended, its per-eye angles for the XRF line
+    // (-1: none), and the 5 s summary.
+    std::array<XrView, kOpenXREyeCount> fresh_views_{};
+    bool fresh_views_valid_ = false;
+    double log_angle_[kOpenXREyeCount] = {-1.0, -1.0};
+    struct PoseCheckWindow {
+        int sets = 0, on_time = 0;
+        bool race = false;
+        std::chrono::steady_clock::time_point since{};
+        double dt_sum = 0, dt_max = 0, ipd_min = 1e9, ipd_max = 0, locate_sum = 0, locate_max = 0;
+        double pos_sum[kOpenXREyeCount] = {}, pos_max[kOpenXREyeCount] = {}, ang_sum[kOpenXREyeCount] = {},
+               ang_max[kOpenXREyeCount] = {};
+    } pose_check_;
     std::string last_error_;
 
     mutable std::mutex submission_mutex_;

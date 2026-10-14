@@ -1627,6 +1627,7 @@ private:
                          XrTime display_time, const OpenXRFrame& cycle) {
         auto& st = set_pacing_;
         OpenXRBackendFrame set{};
+        const auto locate_at = std::chrono::steady_clock::now();
         const OpenXRBeginStatus prepared = backend_->PrepareSet(presentation, display_time, cycle, set);
         if (prepared == OpenXRBeginStatus::SessionNotRunning) {
             return CycleResult::Continue;
@@ -1669,6 +1670,7 @@ private:
         if (!set.expects_gpu_submission) {
             return CycleResult::Continue;  // nothing to render: no tracking, or should_render off
         }
+        NotePrediction(set.xr_frame.predicted_display_time, locate_at, presentation.mode != OpenXRFrameMode::VirtualScreen);
         st.set = set;
         st.pending = true;
         st.timeouts = 0;
@@ -1682,6 +1684,34 @@ private:
         }
         aurora_notify_stereo_frame();
         return CycleResult::Continue;
+    }
+
+    // Lane R: how far ahead each set's poses are predicted: its display time minus the moment its
+    // xrLocateViews was made (steady clock, through the display-time conversion), logged every 5 s
+    // (and when the scene changes between menus and race). Sets rendered ahead: about two refreshes
+    // plus SteamVR's display lead; GalaxyFrame: about one refresh plus the lead.
+    void NotePrediction(XrTime display_time, std::chrono::steady_clock::time_point locate_at, bool race) {
+        const uint64_t display_ns = DisplayTimeNanos(display_time);
+        if (display_ns == 0) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (!prediction_ms_.empty() && (prediction_race_ != race || now - prediction_since_ >= std::chrono::seconds(5))) {
+            std::sort(prediction_ms_.begin(), prediction_ms_.end());
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                          "vr: poses predicted ahead (%zu sets, %.1f s, %s): display time minus the set's locate p50 %.1f ms, max %.1f",
+                          prediction_ms_.size(), std::chrono::duration<double>(now - prediction_since_).count(),
+                          prediction_race_ ? "race" : "menus", prediction_ms_[prediction_ms_.size() / 2], prediction_ms_.back());
+            RT_LOG(RT_TAG_RUNTIME) << line << std::endl;
+            prediction_ms_.clear();
+        }
+        if (prediction_ms_.empty()) {
+            prediction_since_ = now;
+            prediction_race_ = race;
+        }
+        const int64_t locate_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(locate_at.time_since_epoch()).count();
+        if (prediction_ms_.size() < 4096)
+            prediction_ms_.push_back(static_cast<double>(static_cast<int64_t>(display_ns) - locate_ns) / 1e6);
     }
 
     // Every compositor cycle: frame timing, the pacing line's tick, missed refreshes. Returns the period.
@@ -3016,6 +3046,9 @@ private:
     bool ahead_wanted_ = false;
     std::chrono::microseconds ahead_start_delay_{0};
     size_t ahead_lead_ = 2; // refreshes between a set's start and its display time (KARTFRAME_AHEAD_REFRESHES)
+    std::vector<double> prediction_ms_;  // lane R: NotePrediction
+    std::chrono::steady_clock::time_point prediction_since_{};
+    bool prediction_race_ = false;
     bool SetsInFlight() const { return set_pacing_.pending || !ahead_sets_.empty(); }
     std::chrono::steady_clock::time_point last_focused_{};
     PacingMode pacing_mode_ = PacingMode::Pipelined;

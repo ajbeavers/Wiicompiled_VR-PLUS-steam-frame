@@ -26,6 +26,11 @@ dpos_mm L=<p50>/<p99> R=<p50>/<p99> drot_deg L=<p50>/<p99> R=<p50>/<p99> dfov_de
 head_dps=<p50>/<p99>" (runtime/src/vr/openxr_integration.cpp, EyeOffsets): per second, the change of
 each eye's LOCATED eye-to-head offset from one locate to the next; turning seconds are those whose head
 speed p99 is above 30 deg/s.
+
+Lane R: "vr: views of <n> sets: ... against a locate then: left eye <mm> mm <deg> deg avg, ..." (GalaxyFrame's
+pose check, every 5 s and per scene, ending "; race|menus, <s> s; that locate <ms> ms avg <ms> max") and
+"vr: poses predicted ahead (<n> sets, <s> s, race|menus): display time minus the set's locate p50 <ms> ms, max <ms>".
+Averages are weighted by sets; maxima are the session's.
 """
 import os
 import re
@@ -37,6 +42,14 @@ EYES = re.compile(r"vr eyes: mono=[\d.]+ mode=(?P<mode>\S+) locates=\d+ fixed=(?
                   r"drot_deg L=(?P<rl50>[\d.]+)/(?P<rl99>[\d.]+) R=(?P<rr50>[\d.]+)/(?P<rr99>[\d.]+) "
                   r"dfov_deg L=(?P<fl>[\d.]+) R=(?P<fr>[\d.]+) head_dps=(?P<h50>[\d.]+)/(?P<h99>[\d.]+)")
 TURNING_DPS = 30.0
+# Lane R: GalaxyFrame's pose check (runtime/src/vr/openxr_vulkan_win32.cpp, CheckPoses), every 5 s per scene.
+VIEWS = re.compile(r"vr: views of (?P<n>\d+) sets: (?P<on>\d+) for the display time they went out at \(off (?P<off>[\d.]+) ms avg, "
+                   r"(?P<offmax>[\d.]+) max\); against a locate then: left eye (?P<lp>[\d.]+) mm (?P<la>[\d.]+) deg avg, "
+                   r"(?P<lpm>[\d.]+) mm (?P<lam>[\d.]+) deg max; right eye (?P<rp>[\d.]+) mm (?P<ra>[\d.]+) deg avg, "
+                   r"(?P<rpm>[\d.]+) mm (?P<ram>[\d.]+) deg max; eye distance (?P<ipd0>[\d.]+)-(?P<ipd1>[\d.]+) mm; "
+                   r"(?P<scene>race|menus), [\d.]+ s; that locate (?P<loc>[\d.]+) ms avg (?P<locm>[\d.]+) max")
+PREDICT = re.compile(r"vr: poses predicted ahead \((?P<n>\d+) sets, [\d.]+ s, (?P<scene>race|menus)\): display time minus the set's "
+                     r"locate p50 (?P<p50>-?[\d.]+) ms, max (?P<max>-?[\d.]+)")
 PACING = re.compile(r"vr pacing(?P<tot> totals)?: t=(?P<t>[\d.]+) hz=(?P<hz>[\d.]+) mode=(?P<mode>\S+) ticks=(?P<ticks>\d+) "
                     r"rendered=(?P<rendered>\d+) interpolated=(?P<interp>\d+) late=(?P<late>\d+) missed=(?P<missed>\d+) "
                     r"repeats=(?P<repeats>\d+) gpu_ms=(?P<g50>[\d.]+)/(?P<g99>[\d.]+) encode_ms=(?P<e50>[\d.]+)/(?P<e99>[\d.]+)")
@@ -48,7 +61,7 @@ def parse_game_log(path):
          "totals": None, "half": 0, "full": 0, "hitch": 0, "hitch_notes": [], "refresh_note": None,
          "worst_late": (0, 0), "race": None, "in_race": False, "end50": [], "end99": [], "pairwait": 0, "pairs": None,
          "dropped": 0, "end_late": 0, "end_n": 0, "eyes": {k: [] for k in ("menus", "race")}, "eye_modes": set(),
-         "eye_fixed": None,
+         "eye_fixed": None, "views": {k: [] for k in ("menus", "race")}, "predict": {k: [] for k in ("menus", "race")},
          "parts": {k: {"seconds": 0, "rendered": 0, "late": 0, "ticks": 0, "g50": [], "g99": [], "e50": []} for k in ("menus", "race")}}
     with open(path, errors="replace") as f:
         for line in f:
@@ -60,6 +73,16 @@ def parse_game_log(path):
                     r["race"] = r["t_last"]
             elif "exited RaceScene" in line or "presentation=virtual-screen" in line or "presentation=desktop" in line:
                 r["in_race"] = False
+            m = VIEWS.search(line)
+            if m:
+                d = {k: (v if k == "scene" else float(v)) for k, v in m.groupdict().items()}
+                r["views"][d["scene"]].append(d)
+                continue
+            m = PREDICT.search(line)
+            if m:
+                d = {k: (v if k == "scene" else float(v)) for k, v in m.groupdict().items()}
+                r["predict"][d["scene"]].append(d)
+                continue
             m = EYES.search(line)
             if m:
                 d = {k: (v if k == "mode" else float(v)) for k, v in m.groupdict().items()}
@@ -239,6 +262,26 @@ def build(sessions):
                 lambda g, v, t=turning, n=name: eyerow(g, t, "rl", "rr", n) if g else "-")
         add("%s: eye fov change max deg L / R" % name, lambda g, v, n=name: "%s / %s" % (
             fmt(max(d["fl"] for d in g["eyes"][n]), "%.4f"), fmt(max(d["fr"] for d in g["eyes"][n]), "%.4f")) if g and g["eyes"][n] else "-")
+    for name in ("menus", "race"):
+        def views(g, name=name):
+            return g["views"][name]
+
+        def wavg(xs, k):
+            n = sum(d["n"] for d in xs)
+            return sum(d[k] * d["n"] for d in xs) / n if n else None
+        add("%s: pose check sets, for their display time" % name, lambda g, v, f=views: "%d, %d (off %s ms avg, %s max)" % (
+            sum(d["n"] for d in f(g)), sum(d["on"] for d in f(g)), fmt(wavg(f(g), "off"), "%.2f"), fmt(max(d["offmax"] for d in f(g)), "%.2f"))
+            if g and f(g) else "-")
+        for eye, e in (("left", "l"), ("right", "r")):
+            add("%s: %s eye vs a locate then: avg mm deg / max mm deg" % (name, eye), lambda g, v, f=views, e=e: "%s %s / %s %s" % (
+                fmt(wavg(f(g), e + "p"), "%.2f"), fmt(wavg(f(g), e + "a"), "%.3f"), fmt(max(d[e + "pm"] for d in f(g)), "%.2f"),
+                fmt(max(d[e + "am"] for d in f(g)), "%.3f")) if g and f(g) else "-")
+        add("%s: eye distance mm, check locate ms avg / max" % name, lambda g, v, f=views: "%s-%s, %s / %s" % (
+            fmt(min(d["ipd0"] for d in f(g)), "%.2f"), fmt(max(d["ipd1"] for d in f(g)), "%.2f"), fmt(wavg(f(g), "loc"), "%.3f"),
+            fmt(max(d["locm"] for d in f(g)), "%.3f")) if g and f(g) else "-")
+        add("%s: poses predicted ahead ms p50 (median 5 s) / max" % name, lambda g, v, n=name: "%s / %s" % (
+            fmt(median([d["p50"] for d in g["predict"][n]]), "%.1f"), fmt(max(d["max"] for d in g["predict"][n]), "%.1f"))
+            if g and g["predict"][n] else "-")
     add("compositor seconds logged", lambda g, v: str(v["seconds"]) if v else "no vrtiming.log")
     add("compositor frames", lambda g, v: str(v["frames"]) if v else "-")
     add("  app frames reused", lambda g, v: "%d (%s)" % (v["reused"], pct(v["reused"], v["frames"])) if v else "-")
