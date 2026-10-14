@@ -2120,6 +2120,8 @@ struct RenderInvocation {
   bool* sceneDrawn = nullptr;
   // An eye replay laid out by eye_pass_plan, replacing the one-render-pass-per-recorded-pass loop.
   const eye_pass_plan::Plan* eyePlan = nullptr;
+  // Per recorded pass, a scissor every draw of it is clipped to (x, y, width, height; width 0: none).
+  const std::vector<std::array<uint32_t, 4>>* passClips = nullptr;
   // The immersive window's mask, drawn by a planned eye at the end of its last render pass
   // (render_stereo_eye draws it otherwise).
   const StereoReplayFrame* windowFrame = nullptr;
@@ -2197,6 +2199,10 @@ static void render_eye_planned(std::vector<RenderPass>& renderPasses, wgpu::Comm
   }
   // The cockpit that no virtual-screen draw brought in goes over the finished world here rather than
   // in a render pass of its own (render_stereo_eye's fallback), which would load the eye back.
+  if (gpu_timing_marks_enabled() && ((invocation.cockpitFrame != nullptr && !*invocation.cockpitDrawn) ||
+                                     (invocation.windowFrame != nullptr && !*invocation.windowDrawn))) {
+    gpu_timing_mark(pass, GpuTimingCategory::Cockpit);
+  }
   if (invocation.cockpitFrame != nullptr && !*invocation.cockpitDrawn) {
     cockpit::render(*invocation.cockpitEncoder, *invocation.cockpitFrame, invocation.stereoEye,
                     invocation.cockpitDepth, &pass);
@@ -2412,14 +2418,60 @@ void seal_frame(SealedFrame& out) noexcept {
   out.data().windowScreen = stereo_window_screen();
 }
 
+// A native render cut after `last` (an immersive frame: only the copies the eyes sample matter) needs
+// its pixels only where those copies read. In a Mario Kart race that is a 6x4 depth copy at the sun
+// for the lens flare, after the whole scene: without the clip the native render drew the full 3D
+// scene at 939x528 for it, about 1 ms of GPU a game frame (lane I). Each pass gets the bounds of the
+// copies it and the passes after it make (its pixels stay in the EFB for them), plus a margin for the
+// copy filter; the vertex work stays. KARTFRAME_NATIVE_CLIP=0 draws the whole passes again.
+static const std::vector<std::array<uint32_t, 4>>* native_cut_clips(const std::vector<RenderPass>& passes,
+                                                                    int32_t last) {
+  static const bool enabled = [] {
+    const char* env = std::getenv("KARTFRAME_NATIVE_CLIP");
+    return env == nullptr || env[0] != '0';
+  }();
+  if (!enabled || last < 0 || static_cast<size_t>(last) >= passes.size()) {
+    return nullptr;
+  }
+  thread_local std::vector<std::array<uint32_t, 4>> clips;
+  clips.assign(passes.size(), {0, 0, 0, 0});
+  constexpr int32_t kMargin = 2;
+  int32_t left = INT32_MAX, top = INT32_MAX, right = INT32_MIN, bottom = INT32_MIN;
+  for (int32_t i = last; i >= 0; --i) {
+    const auto& pass = passes[static_cast<size_t>(i)];
+    if (pass.resolveTarget && !pass.displayCopyResolve) {
+      const auto& r = pass.snapshotColorResolveSource ? pass.resolveSnapshotRect : pass.resolveRect;
+      const auto& q = pass.resolveRect;
+      left = std::min({left, r.x, q.x});
+      top = std::min({top, r.y, q.y});
+      right = std::max({right, r.x + r.width, q.x + q.width});
+      bottom = std::max({bottom, r.y + r.height, q.y + q.height});
+    }
+    if (right <= left || bottom <= top || !pass.efbTarget) {
+      continue;  // nothing read yet; an offscreen pass draws whole (it is a texture of its own)
+    }
+    const int32_t width = static_cast<int32_t>(pass.targetSize.width);
+    const int32_t height = static_cast<int32_t>(pass.targetSize.height);
+    const int32_t x0 = std::clamp(left - kMargin, 0, width), y0 = std::clamp(top - kMargin, 0, height);
+    const int32_t x1 = std::clamp(right + kMargin, x0, width), y1 = std::clamp(bottom + kMargin, y0, height);
+    if (x1 > x0 && y1 > y0) {
+      clips[static_cast<size_t>(i)] = {static_cast<uint32_t>(x0), static_cast<uint32_t>(y0),
+                                       static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)};
+    }
+  }
+  return &clips;
+}
+
 void render(SealedFrame& frame, wgpu::CommandEncoder& cmd, int32_t interpolatedFrame, bool finalize,
             int32_t nativeRenderLastPass) {
+  const bool cut = interpolatedFrame < 0 && nativeRenderLastPass != INT32_MAX;
   render_impl(frame.data().passes, cmd,
               RenderInvocation{
                   .interpolatedFrame = interpolatedFrame,
                   .renderLastPass = nativeRenderLastPass,
                   .finalize = finalize,
                   .encodeTextureBakes = interpolatedFrame < 0,
+                  .passClips = cut ? native_cut_clips(frame.data().passes, nativeRenderLastPass) : nullptr,
               });
 }
 
@@ -2430,6 +2482,35 @@ int32_t last_pass_feeding_replay(const SealedFrame& frame) noexcept {
     if (passes[i].resolveTarget && !passes[i].displayCopyResolve) {
       last = static_cast<int32_t>(i);
     }
+  }
+  // Each distinct pass layout once: what the native render of an immersive frame still has to draw.
+  static std::mutex loggedMutex;
+  static std::vector<std::string> logged;
+  std::string shape;
+  for (size_t i = 0; i < passes.size(); ++i) {
+    const auto& pass = passes[i];
+    size_t draws = 0, perspective = 0;
+    for (const auto& command : pass.commands) {
+      if (command.type == CommandType::Draw && command.data.draw.type == ShaderType::GX) {
+        ++draws;
+        perspective += command.data.draw.gx.uniformReplayLayout.perspective ? 1 : 0;
+      }
+    }
+    shape += fmt::format(" [{}{} {}x{} draws {} (3D {})", i, pass.efbTarget ? " efb" : "", pass.targetSize.width,
+                         pass.targetSize.height, draws, perspective);
+    if (pass.resolveTarget) {
+      shape += fmt::format(" -> copy fmt {} {}x{}{}{}", static_cast<int>(pass.resolveFormat), pass.resolveRect.width,
+                           pass.resolveRect.height, pass.resolveHalfScale ? " half" : "",
+                           pass.displayCopyResolve ? " display" : "");
+    }
+    shape += "]";
+  }
+  std::lock_guard lock(loggedMutex);
+  std::string key;
+  for (char c : shape) key += std::isdigit(static_cast<unsigned char>(c)) ? '#' : c;
+  if (logged.size() < 24 && std::ranges::find(logged, key) == logged.end()) {
+    logged.push_back(key);
+    Log.info("Native render of an immersive frame stops after pass {} of {}:{}", last, passes.size(), shape);
   }
   return last;
 }
@@ -2521,7 +2602,9 @@ bool prepare_late_stereo_replay(SealedFrame& frame, wgpu::CommandEncoder& cmd, c
   upload.Unmap();
   // Command-buffer ordering keeps these writes after the preceding eye pair,
   // without mutating any producer staging memory or desktop uniforms.
+  gpu_timing_mark(cmd, GpuTimingCategory::Upload);
   cmd.CopyBufferToBuffer(upload, 0, g_uniformBuffer, data.uploadOffset, data.uploadSize);
+  gpu_timing_mark(cmd, std::nullopt);
   return true;
 }
 
@@ -2638,20 +2721,37 @@ void render(wgpu::CommandEncoder& cmd, int32_t interpolatedFrame, bool finalize)
 
 // --- Per-pass GPU timing (see common.hpp) -------------------------------------------------------
 namespace {
-constexpr uint32_t kGpuTimingSlots = 4;
-constexpr uint32_t kGpuTimingPairs = 62;
-constexpr uint32_t kGpuTimingQueries = 2 * kGpuTimingPairs;
+constexpr uint32_t kGpuTimingSlots = 6;
+constexpr uint32_t kGpuTimingQueries = 512;
+constexpr uint32_t kGpuTimingPasses = 128;
+constexpr uint8_t kGpuTimingEnd = 0xff;
+constexpr size_t kGpuTimingCategories = static_cast<size_t>(GpuTimingCategory::Count);
+constexpr size_t kGpuTimingKinds = 2;
+
+struct GpuTimingEvent {
+  uint32_t query;
+  uint8_t category;  // the segment this timestamp begins; kGpuTimingEnd ends one
+};
 
 struct GpuTimingSlot {
   wgpu::QuerySet querySet;
   wgpu::Buffer resolve;
   wgpu::Buffer readback;
-  std::array<wgpu::PassTimestampWrites, kGpuTimingPairs> writes{};
-  std::array<GpuTimingCategory, kGpuTimingPairs> categories{};
-  uint32_t pairs = 0;
+  std::array<wgpu::PassTimestampWrites, kGpuTimingPasses> writes{};
+  std::vector<GpuTimingEvent> events;
+  uint32_t passes = 0;
+  uint32_t queries = 0;
+  uint8_t kind = 0;
   bool open = false;    // between the frame's begin and end
   bool reading = false; // readback in flight or mapped
   bool mapped = false;  // the callback ran; the encoding thread unmaps on reuse
+};
+
+struct GpuTimingTotals {
+  std::array<uint64_t, kGpuTimingCategories> ns{};
+  uint64_t betweenNs = 0;
+  std::vector<float> spanMs;
+  uint32_t frames = 0;
 };
 
 std::atomic<bool> g_gpuTimingEnabled{false};
@@ -2662,9 +2762,7 @@ bool g_gpuTimingReady = false;
 // Guards the totals below and every slot's reading/mapped flags: the map callback may run on
 // whichever thread processes Dawn's events.
 std::mutex g_gpuTimingMutex;
-std::array<uint64_t, static_cast<size_t>(GpuTimingCategory::Count)> g_gpuTimingTotalsNs{};
-uint64_t g_gpuTimingSpanNs = 0;
-uint32_t g_gpuTimingFrames = 0;
+std::array<GpuTimingTotals, kGpuTimingKinds> g_gpuTimingTotals;
 uint32_t g_gpuTimingSkipped = 0;
 
 bool gpu_timing_create_slots() {
@@ -2693,16 +2791,25 @@ bool gpu_timing_create_slots() {
         .size = kGpuTimingQueries * sizeof(uint64_t),
     };
     slot.readback = webgpu::g_device.CreateBuffer(&readbackDescriptor);
+    slot.events.reserve(kGpuTimingQueries);
   }
   g_gpuTimingReady = true;
   return true;
+}
+
+GpuTimingSlot* gpu_timing_open_slot() noexcept {
+  if (g_gpuTimingCurrent < 0) {
+    return nullptr;
+  }
+  auto& slot = g_gpuTimingSlots[static_cast<size_t>(g_gpuTimingCurrent)];
+  return slot.open ? &slot : nullptr;
 }
 } // namespace
 
 void gpu_timing_set_enabled(bool enabled) noexcept { g_gpuTimingEnabled.store(enabled, std::memory_order_relaxed); }
 bool gpu_timing_enabled() noexcept { return g_gpuTimingEnabled.load(std::memory_order_relaxed); }
 
-void gpu_timing_begin_frame() noexcept {
+void gpu_timing_begin_frame(uint8_t kind) noexcept {
   g_gpuTimingCurrent = -1;
   if (!gpu_timing_enabled() || !gpu_timing_create_slots()) {
     return;
@@ -2722,42 +2829,69 @@ void gpu_timing_begin_frame() noexcept {
     }
     slot.reading = false;
   }
-  slot.pairs = 0;
+  slot.passes = 0;
+  slot.queries = 0;
+  slot.events.clear();
+  slot.kind = static_cast<uint8_t>(std::min<size_t>(kind, kGpuTimingKinds - 1));
   slot.open = true;
   g_gpuTimingCurrent = static_cast<int32_t>(index);
 }
 
 const wgpu::PassTimestampWrites* gpu_timing_pass(GpuTimingCategory category) noexcept {
-  if (g_gpuTimingCurrent < 0) {
+  auto* slot = gpu_timing_open_slot();
+  if (slot == nullptr || slot->passes >= kGpuTimingPasses || slot->queries + 2 > kGpuTimingQueries) {
     return nullptr;
   }
-  auto& slot = g_gpuTimingSlots[static_cast<size_t>(g_gpuTimingCurrent)];
-  if (!slot.open || slot.pairs >= kGpuTimingPairs) {
-    return nullptr;
-  }
-  const uint32_t i = slot.pairs++;
-  slot.writes[i] = wgpu::PassTimestampWrites{
-      .querySet = slot.querySet,
-      .beginningOfPassWriteIndex = 2 * i,
-      .endOfPassWriteIndex = 2 * i + 1,
+  const uint32_t q = slot->queries;
+  slot->queries += 2;
+  auto& writes = slot->writes[slot->passes++];
+  writes = wgpu::PassTimestampWrites{
+      .querySet = slot->querySet,
+      .beginningOfPassWriteIndex = q,
+      .endOfPassWriteIndex = q + 1,
   };
-  slot.categories[i] = category;
-  return &slot.writes[i];
+  slot->events.push_back({q, static_cast<uint8_t>(category)});
+  slot->events.push_back({q + 1, kGpuTimingEnd});
+  return &writes;
+}
+
+bool gpu_timing_marks_enabled() noexcept {
+  return webgpu::g_timestampInsidePassesSupported && gpu_timing_open_slot() != nullptr;
+}
+
+void gpu_timing_mark(const wgpu::RenderPassEncoder& pass, GpuTimingCategory category) noexcept {
+  auto* slot = gpu_timing_open_slot();
+  if (slot == nullptr || !webgpu::g_timestampInsidePassesSupported || slot->queries + 1 > kGpuTimingQueries) {
+    return;
+  }
+  const uint32_t q = slot->queries++;
+  pass.WriteTimestamp(slot->querySet, q);
+  slot->events.push_back({q, static_cast<uint8_t>(category)});
+}
+
+void gpu_timing_mark(const wgpu::CommandEncoder& encoder, std::optional<GpuTimingCategory> category) noexcept {
+  auto* slot = gpu_timing_open_slot();
+  if (slot == nullptr || !webgpu::g_timestampInsidePassesSupported || slot->queries + 1 > kGpuTimingQueries) {
+    return;
+  }
+  const uint32_t q = slot->queries++;
+  encoder.WriteTimestamp(slot->querySet, q);
+  slot->events.push_back({q, category ? static_cast<uint8_t>(*category) : kGpuTimingEnd});
 }
 
 void gpu_timing_end_frame(wgpu::CommandEncoder& encoder) noexcept {
-  if (g_gpuTimingCurrent < 0) {
-    return;
-  }
-  auto& slot = g_gpuTimingSlots[static_cast<size_t>(g_gpuTimingCurrent)];
-  slot.open = false;
-  if (slot.pairs == 0) {
+  auto* slot = gpu_timing_open_slot();
+  if (slot == nullptr) {
     g_gpuTimingCurrent = -1;
     return;
   }
-  const uint32_t queries = 2 * slot.pairs;
-  encoder.ResolveQuerySet(slot.querySet, 0, queries, slot.resolve, 0);
-  encoder.CopyBufferToBuffer(slot.resolve, 0, slot.readback, 0, queries * sizeof(uint64_t));
+  slot->open = false;
+  if (slot->queries == 0) {
+    g_gpuTimingCurrent = -1;
+    return;
+  }
+  encoder.ResolveQuerySet(slot->querySet, 0, slot->queries, slot->resolve, 0);
+  encoder.CopyBufferToBuffer(slot->resolve, 0, slot->readback, 0, slot->queries * sizeof(uint64_t));
 }
 
 void gpu_timing_after_submit() noexcept {
@@ -2767,40 +2901,48 @@ void gpu_timing_after_submit() noexcept {
   const uint32_t index = static_cast<uint32_t>(g_gpuTimingCurrent);
   g_gpuTimingCurrent = -1;
   auto& slot = g_gpuTimingSlots[index];
-  const uint32_t pairs = slot.pairs;
+  const uint32_t queries = slot.queries;
   {
     std::lock_guard lock(g_gpuTimingMutex);
     slot.reading = true;
     slot.mapped = false;
   }
   slot.readback.MapAsync(
-      wgpu::MapMode::Read, 0, 2 * pairs * sizeof(uint64_t), wgpu::CallbackMode::AllowSpontaneous,
-      [index, pairs](wgpu::MapAsyncStatus status, wgpu::StringView) {
+      wgpu::MapMode::Read, 0, queries * sizeof(uint64_t), wgpu::CallbackMode::AllowSpontaneous,
+      [index, queries](wgpu::MapAsyncStatus status, wgpu::StringView) {
         auto& slot = g_gpuTimingSlots[index];
         std::lock_guard lock(g_gpuTimingMutex);
         if (status != wgpu::MapAsyncStatus::Success) {
           slot.reading = false;
           return;
         }
-        const auto* stamps =
-            static_cast<const uint64_t*>(slot.readback.GetConstMappedRange(0, 2 * pairs * sizeof(uint64_t)));
+        const auto* stamps = static_cast<const uint64_t*>(slot.readback.GetConstMappedRange(0, queries * sizeof(uint64_t)));
         if (stamps != nullptr) {
-          uint64_t first = UINT64_MAX;
-          uint64_t last = 0;
-          for (uint32_t i = 0; i < pairs; ++i) {
-            const uint64_t begin = stamps[2 * i];
-            const uint64_t end = stamps[2 * i + 1];
-            if (end < begin) {
-              continue;
+          // Timestamps on one queue follow execution order, so sorting by value recovers the order of
+          // pass begins, marks and pass ends however their query indices were handed out. A query
+          // nothing wrote (a pass that was never encoded) resolves to 0 and is left out.
+          thread_local std::vector<std::pair<uint64_t, uint8_t>> ordered;
+          ordered.clear();
+          for (const auto& event : slot.events) {
+            if (event.query < queries && stamps[event.query] != 0) {
+              ordered.emplace_back(stamps[event.query], event.category);
             }
-            g_gpuTimingTotalsNs[static_cast<size_t>(slot.categories[i])] += end - begin;
-            first = std::min(first, begin);
-            last = std::max(last, end);
           }
-          if (last > first) {
-            g_gpuTimingSpanNs += last - first;
+          std::stable_sort(ordered.begin(), ordered.end(),
+                           [](const auto& a, const auto& b) { return a.first < b.first; });
+          auto& totals = g_gpuTimingTotals[slot.kind];
+          for (size_t i = 0; i + 1 < ordered.size(); ++i) {
+            const uint64_t span = ordered[i + 1].first - ordered[i].first;
+            if (ordered[i].second == kGpuTimingEnd) {
+              totals.betweenNs += span;
+            } else if (ordered[i].second < kGpuTimingCategories) {
+              totals.ns[ordered[i].second] += span;
+            }
           }
-          ++g_gpuTimingFrames;
+          if (ordered.size() >= 2) {
+            totals.spanMs.push_back(static_cast<float>(ordered.back().first - ordered.front().first) / 1e6f);
+          }
+          ++totals.frames;
         }
         slot.mapped = true;
       });
@@ -2808,33 +2950,36 @@ void gpu_timing_after_submit() noexcept {
 
 std::string gpu_timing_report() {
   std::lock_guard lock(g_gpuTimingMutex);
-  if (g_gpuTimingFrames == 0 && g_gpuTimingSkipped == 0) {
-    return {};
-  }
-  static constexpr std::array<const char*, static_cast<size_t>(GpuTimingCategory::Count)> kNames{
-      "mono", "eyeL", "eyeR", "interp", "screen", "panel", "efbcopy", "palette", "peek", "snapshot", "present"};
+  static constexpr std::array<const char*, kGpuTimingCategories> kNames{
+      "mono",  "eyeL-load", "eyeR-load", "interp",  "screen",   "panel",  "efbcopy", "palette",   "peek",
+      "snapshot", "present", "scene",  "hud2d",  "fade",  "efbfx",  "clear",  "other2d", "cockpit", "upload",
+      "sink", "hudlayer", "menuenv"};
+  static constexpr std::array<const char*, kGpuTimingKinds> kKinds{"game-frame sets", "refresh sets"};
   std::string text;
-  if (g_gpuTimingFrames != 0) {
-    const double frames = g_gpuTimingFrames;
-    uint64_t sum = 0;
-    text += fmt::format("GPU ms/frame over {} frames: passes-span={:.2f}", g_gpuTimingFrames,
-                        static_cast<double>(g_gpuTimingSpanNs) / 1e6 / frames);
-    for (size_t i = 0; i < kNames.size(); ++i) {
-      if (g_gpuTimingTotalsNs[i] == 0) {
-        continue;
-      }
-      sum += g_gpuTimingTotalsNs[i];
-      text += fmt::format(" {}={:.2f}", kNames[i], static_cast<double>(g_gpuTimingTotalsNs[i]) / 1e6 / frames);
+  for (size_t kind = 0; kind < kGpuTimingKinds; ++kind) {
+    auto& totals = g_gpuTimingTotals[kind];
+    if (totals.frames == 0) {
+      continue;
     }
-    const uint64_t between = g_gpuTimingSpanNs > sum ? g_gpuTimingSpanNs - sum : 0;
-    text += fmt::format(" between-passes={:.2f}", static_cast<double>(between) / 1e6 / frames);
+    const double frames = totals.frames;
+    auto& spans = totals.spanMs;
+    std::sort(spans.begin(), spans.end());
+    const auto pct = [&](double p) {
+      return spans.empty() ? 0.0 : static_cast<double>(spans[std::min(spans.size() - 1, size_t(p * double(spans.size() - 1) + 0.5))]);
+    };
+    text += fmt::format("{}GPU ms per {} ({}): span p50/p99 {:.2f}/{:.2f}", text.empty() ? "" : "; ", kKinds[kind],
+                        totals.frames, pct(0.5), pct(0.99));
+    for (size_t i = 0; i < kNames.size(); ++i) {
+      if (totals.ns[i] != 0) {
+        text += fmt::format(" {}={:.3f}", kNames[i], static_cast<double>(totals.ns[i]) / 1e6 / frames);
+      }
+    }
+    text += fmt::format(" between={:.3f}", static_cast<double>(totals.betweenNs) / 1e6 / frames);
+    totals = {};
   }
   if (g_gpuTimingSkipped != 0) {
     text += fmt::format(" (untimed frames: {})", g_gpuTimingSkipped);
   }
-  g_gpuTimingTotalsNs.fill(0);
-  g_gpuTimingSpanNs = 0;
-  g_gpuTimingFrames = 0;
   g_gpuTimingSkipped = 0;
   return text;
 }
@@ -2905,9 +3050,27 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
   std::array<uint32_t, 4> recordedScissor = fullTargetScissor;
   bool hudScreenScissor = false;
   bool scissorStateKnown = true;
-  const auto apply_scissor = [&pass](const std::array<uint32_t, 4>& rect) noexcept {
-    pass.SetScissorRect(rect[0], rect[1], rect[2], rect[3]);
+  // A cut native render (render(): only the copies the eyes sample are wanted) draws only where those
+  // copies read: every scissor is intersected with this pass's clip.
+  const std::array<uint32_t, 4>* passClip =
+      invocation.passClips != nullptr && idx < invocation.passClips->size() && (*invocation.passClips)[idx][2] != 0
+          ? &(*invocation.passClips)[idx]
+          : nullptr;
+  const auto apply_scissor = [&pass, passClip](const std::array<uint32_t, 4>& rect) noexcept {
+    if (passClip == nullptr) {
+      pass.SetScissorRect(rect[0], rect[1], rect[2], rect[3]);
+      return;
+    }
+    const auto& c = *passClip;
+    const uint32_t left = std::max(rect[0], c[0]);
+    const uint32_t top = std::max(rect[1], c[1]);
+    const uint32_t right = std::max(left, std::min(rect[0] + rect[2], c[0] + c[2]));
+    const uint32_t bottom = std::max(top, std::min(rect[1] + rect[3], c[1] + c[3]));
+    pass.SetScissorRect(left, top, right - left, bottom - top);
   };
+  if (passClip != nullptr) {
+    apply_scissor(fullTargetScissor);
+  }
   Viewport recordedViewport{
       .left = 0.0f,
       .top = 0.0f,
@@ -2923,6 +3086,16 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
                      hudScreen ? static_cast<float>(targetSize.width) : recordedViewport.width,
                      hudScreen ? static_cast<float>(targetSize.height) : recordedViewport.height,
                      recordedViewport.znear, recordedViewport.zfar);
+  };
+  // KARTFRAME_FPSLOG=2: an eye's pass is cut into timed segments by the kind of draw (gpu_timing_mark).
+  const bool profileMarks =
+      overrideTarget && invocation.stereoEye < AURORA_STEREO_EYE_COUNT && gpu_timing_marks_enabled();
+  int32_t lastMark = -1;
+  const auto mark = [&](GpuTimingCategory category) noexcept {
+    if (profileMarks && static_cast<int32_t>(category) != lastMark) {
+      gpu_timing_mark(pass, category);
+      lastMark = static_cast<int32_t>(category);
+    }
   };
 
   for (const auto& cmd : renderPasses[idx].commands) {
@@ -3053,6 +3226,7 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
             *invocation.sceneDrawn = true;
           }
           if (virtualScreenDraw && *invocation.sceneDrawn && !*invocation.cockpitDrawn) {
+            mark(GpuTimingCategory::Cockpit);
             cockpit::render(*invocation.cockpitEncoder, *invocation.cockpitFrame, invocation.stereoEye,
                             invocation.cockpitDepth, &pass);
             *invocation.cockpitDrawn = true;
@@ -3080,12 +3254,18 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
           viewportStateKnown = true;
           apply_viewport(fullEyeDraw);
         }
+        mark(draw.gx.uniformReplayLayout.perspective ? GpuTimingCategory::EyeScene
+             : virtualScreenDraw                       ? GpuTimingCategory::EyeHud
+             : draw.gx.uniformReplayLayout.nativeEfbEffect ? GpuTimingCategory::EyeEfbEffect
+             : draw.gx.screenRect                      ? GpuTimingCategory::EyeFade
+                                                       : GpuTimingCategory::EyeOther2D);
         gx::render(draw.gx, pass, encodeState, renderPasses[idx].requireReadyPipelines, uniformOverride,
                    overrideTarget && invocation.target->depthFormat == wgpu::TextureFormat::Depth24PlusStencil8
                        ? (virtualScreenDraw ? draw.gx.stereoScreenPipeline : draw.gx.stereoPipeline)
                        : (virtualScreenDraw ? draw.gx.exactScreenDepthPipeline : 0));
       } break;
       case ShaderType::Clear: {
+        mark(GpuTimingCategory::EyeClear);
         auto clearDraw = draw.clear;
         if (overrideTarget && invocation.target->depthFormat == wgpu::TextureFormat::Depth24PlusStencil8) {
           clearDraw.pipeline = clearDraw.stereoPipeline;
