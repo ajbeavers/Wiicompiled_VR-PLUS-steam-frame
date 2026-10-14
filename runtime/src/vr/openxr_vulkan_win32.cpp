@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -286,6 +287,15 @@ public:
         bool release_forbidden = false;
     };
     using EyePair = std::array<EyeSwapchain, kOpenXREyeCount>;
+    // Lane K: a set rendered ahead carries the slot it was written into (see LoadAheadSlot).
+    struct AheadSlot {
+        uint64_t serial = 0;
+        EyePair eyes{};
+        EyeSwapchain env{};
+        EyeSwapchain panel{};
+        uint64_t session_serial = 0;
+        uint64_t space_serial = 0;
+    };
 
     static uint32_t VkVersion(XrVersion v) {
         return VK_MAKE_API_VERSION(0, XR_VERSION_MAJOR(v), XR_VERSION_MINOR(v), XR_VERSION_PATCH(v));
@@ -612,9 +622,9 @@ public:
 
     // Both pacing paths retain ownership until completion or cancellation.
     OpenXRWindowsVulkanBeginStatus PrepareTargets(OpenXRWindowsVulkanFrame& frame) {
-        // Lane J: no eye pair has cooled off long enough (see RotateEyePairs): nothing is rendered this
-        // refresh, the cycle repeats the retained layer.
-        if (!TakeCooledPair()) {
+        // Lane J: no eye pair has cooled off long enough (see RotateEyePairs); lane K (sets rendered
+        // ahead): no pair free. Nothing is rendered this refresh, the cycle repeats the retained layer.
+        if (ahead_ ? !LoadAheadSlot() : !TakeCooledPair()) {
             pacing::OnPairWait();
             frame.expects_gpu_submission = false;
             return OpenXRWindowsVulkanBeginStatus::Ready;
@@ -887,10 +897,154 @@ public:
         // The per-refresh sets rotate through all eye pairs (RotateEyePairs); the render-first path
         // (interpolation off) keeps the two it always had.
         if (!extra_pairs_made_) MakeExtraEyePairs();
+        if (ahead_) {
+            if (!AheadCanPrepare()) {
+                Fail("PrepareSet called while Aurora still holds an unsubmitted eye set");
+                return OpenXRBeginStatus::Error;
+            }
+            std::lock_guard lock(submission_mutex_);
+            ahead_expected_.push_back(set.xr_frame.serial);
+        }
         // A failure here is fatal for the session (the caller ends it).
         const auto status = PrepareTargets(set);
+        if (ahead_) {
+            if (status == OpenXRBeginStatus::Ready && set.expects_gpu_submission) {
+                // The set's images travel with it until it is shown or dropped (LoadAheadSlot, RestoreAheadSlot).
+                AheadSlot slot;
+                slot.serial = set.xr_frame.serial;
+                slot.eyes = std::exchange(eye_swapchains_, EyePair{});
+                slot.env = std::exchange(env_swapchain_, EyeSwapchain{});
+                slot.panel = std::exchange(panel_swapchain_, EyeSwapchain{});
+                slot.session_serial = render_session_serial_;
+                slot.space_serial = render_space_serial_;
+                ahead_slots_.push_back(std::move(slot));
+            } else {
+                std::lock_guard lock(submission_mutex_);
+                ForgetExpected(set.xr_frame.serial);
+            }
+            return status;
+        }
         if (status == OpenXRBeginStatus::Ready && set.expects_gpu_submission) pending_packet_serial_ = set.xr_frame.serial;
         return status;
+    }
+
+    // ---- Sets rendered ahead (lane K) ----
+    //
+    // The seventh headset session (frame/perf/H7.md): in races the old pipelined loop ended each set
+    // whenever its GPU work finished, up to 7 ms after SteamVR's wake-up, later by about 1.7 ms each
+    // refresh (a set started only after the last one was ended), and SteamVR showed those frames
+    // inconsistently: the image zigzagged between two positions on head turns. Menus (ended within
+    // 0.2 ms of the wake-up) and GalaxyFrame (0.3 to 1 ms) were clean. Sets rendered ahead end every
+    // frame at the wake-up with the newest set already finished: a set is started two refreshes
+    // before its display time, so one set is on the GPU while the next is encoded, and each has a
+    // whole extra refresh of margin. Two in flight plus the pair on display: three pairs at least.
+    // A set's pair is never the displayed one, so an overtaken set can be released unshown without
+    // touching what the retained layer shows (a release makes an image its swapchain's newest).
+
+    bool EnableAhead(bool want) {
+        ahead_ = want && !extra_pairs_made_ && bound_ &&
+                 (gpu_.CurrentMode() == GpuCompletion::Mode::Timeline || gpu_.SkipsWait());
+        eye_pairs_wanted_ = ahead_ ? AheadPairsSetting() : EyePairsSetting();
+        return ahead_;
+    }
+
+    bool AheadCanPrepare() const {
+        std::lock_guard lock(submission_mutex_);
+        return ahead_expected_.empty();
+    }
+
+    OpenXRSubmissionStatus PollAheadSet(const OpenXRBackendFrame& set, std::chrono::steady_clock::time_point deadline,
+                                        bool gpu) {
+        if (!set.expects_gpu_submission) return OpenXRSubmissionStatus::Success;
+        uint64_t value = 0;
+        {
+            std::unique_lock lock(submission_mutex_);
+            const auto find = [&] {
+                return std::find_if(ahead_submitted_.begin(), ahead_submitted_.end(),
+                                    [&](const AheadSubmission& r) { return r.token == set.xr_frame.serial; });
+            };
+            const auto ready = [&] { return shutting_down_ || find() != ahead_submitted_.end(); };
+            if (!ready() && !submission_cv_.wait_until(lock, deadline, ready)) return OpenXRSubmissionStatus::Timeout;
+            if (shutting_down_) return OpenXRSubmissionStatus::ShuttingDown;
+            const auto record = find();
+            if (!record->success) return OpenXRSubmissionStatus::Failed;
+            value = record->gpu_value;
+        }
+        if (!gpu) return OpenXRSubmissionStatus::Success;
+        if (gpu_.WaitUntil(value, deadline)) return OpenXRSubmissionStatus::Success;
+        return gpu_.Failed() ? OpenXRSubmissionStatus::Failed : OpenXRSubmissionStatus::Timeout;
+    }
+
+    bool AheadSetCurrent(const OpenXRBackendFrame& set) const {
+        const AheadSlot* slot = FindAheadSlot(set.xr_frame.serial);
+        return slot != nullptr && runtime_ != nullptr && slot->session_serial == runtime_->SessionRunSerial() &&
+               slot->space_serial == runtime_->LastReferenceSpaceChange().serial;
+    }
+
+    // Shows the finished set at once: its images released, the cycle ended with its own poses at
+    // this cycle's display time. Call only after PollAheadSet(set) returned Success.
+    bool EndCycleWithAheadSet(OpenXRBackendFrame& set) {
+        if (!frame_active_) return Fail("EndCycleWithAheadSet needs an open compositor cycle");
+        if (!RestoreAheadSlot(set.xr_frame.serial)) return Fail("EndCycleWithAheadSet: not a set in flight");
+        {
+            std::lock_guard lock(submission_mutex_);
+            const auto record = std::find_if(ahead_submitted_.begin(), ahead_submitted_.end(),
+                                             [&](const AheadSubmission& r) { return r.token == set.xr_frame.serial; });
+            if (record == ahead_submitted_.end()) {
+                AbandonAcquiredSwapchains();
+                return Fail("EndCycleWithAheadSet: the set was never submitted");
+            }
+            // FinishFrame's checks (unsafe submission, the last GPU wait) read the single-set state.
+            awaiting_token_ = submitted_token_ = set.xr_frame.serial;
+            submission_arrived_ = true;
+            submission_success_ = record->success;
+            submission_unsafe_ = !record->success;
+            submitted_gpu_value_ = record->gpu_value;
+            ahead_submitted_.erase(record);
+        }
+        pending_packet_serial_ = set.xr_frame.serial;
+        const bool ok = EndCycleWithSet(set);
+        // The pair that was on display until now (FinishFrame swapped it out) goes back to the pool.
+        ParkAheadSlot();
+        return ok;
+    }
+
+    bool CancelAheadSet(OpenXRBackendFrame& set) {
+        if (!set.expects_gpu_submission || FindAheadSlot(set.xr_frame.serial) == nullptr ||
+            !aurora_vulkan_win32_cancel(set.xr_frame.serial)) return false;
+        {
+            std::lock_guard lock(submission_mutex_);
+            ForgetExpected(set.xr_frame.serial);
+        }
+        // Nothing wrote the images: they stay acquired and waited, and the next set reuses them.
+        RestoreAheadSlot(set.xr_frame.serial);
+        ParkAheadSlot();
+        set.expects_gpu_submission = false;
+        return true;
+    }
+
+    bool DropAheadSet(OpenXRBackendFrame& set, std::chrono::milliseconds wait) {
+        if (FindAheadSlot(set.xr_frame.serial) == nullptr) return true;
+        if (CancelAheadSet(set)) return true;
+        const auto status = PollAheadSet(set, std::chrono::steady_clock::now() + wait, true);
+        RestoreAheadSlot(set.xr_frame.serial);
+        {
+            std::lock_guard lock(submission_mutex_);
+            ForgetExpected(set.xr_frame.serial);
+            ahead_submitted_.erase(std::remove_if(ahead_submitted_.begin(), ahead_submitted_.end(),
+                                                  [&](const AheadSubmission& r) { return r.token == set.xr_frame.serial; }),
+                                   ahead_submitted_.end());
+        }
+        set.expects_gpu_submission = false;
+        if (status != OpenXRSubmissionStatus::Success) {
+            // Never released: the images stay acquired until the session ends.
+            AbandonAcquiredSwapchains();
+            AbandonCurrentSlot();
+            return Fail("an OpenXR Vulkan eye set could not be confirmed finished; its images stay acquired");
+        }
+        const bool released = ReleaseAcquiredSwapchains();
+        ParkAheadSlot();
+        return released;
     }
 
     bool CancelSet(OpenXRBackendFrame& set) {
@@ -1320,6 +1474,90 @@ public:
         pacing::OnEndAfterWake(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wake_).count());
     }
 
+    // ---- Sets rendered ahead: the slots (lane K) ----
+    //
+    // eye_swapchains_, env_swapchain_ and panel_swapchain_ are the slot PrepareTargets writes. With
+    // sets rendered ahead they are loaded from the free pools before a set (LoadAheadSlot), travel
+    // with the set while it is in flight (AheadSlot), come back for its release (RestoreAheadSlot),
+    // and what is left in them afterwards (the pair FinishFrame swapped off the display, or the
+    // dropped set's) returns to the pools (ParkAheadSlot). The pools are first in, first out: a pair
+    // is written again as long after it left the display as the pair count allows.
+    const AheadSlot* FindAheadSlot(uint64_t serial) const {
+        for (const auto& slot : ahead_slots_)
+            if (slot.serial == serial) return &slot;
+        return nullptr;
+    }
+
+    // Call with submission_mutex_ held.
+    void ForgetExpected(uint64_t serial) {
+        ahead_expected_.erase(std::remove(ahead_expected_.begin(), ahead_expected_.end(), serial),
+                              ahead_expected_.end());
+    }
+
+    bool LoadAheadSlot() {
+        if (eye_swapchains_[0].handle == XR_NULL_HANDLE) {
+            if (free_pairs_.empty()) return false;
+            eye_swapchains_ = std::move(free_pairs_.front());
+            free_pairs_.pop_front();
+        }
+        if (env_swapchains_ready_ && env_swapchain_.handle == XR_NULL_HANDLE) {
+            if (!free_envs_.empty()) {
+                env_swapchain_ = std::move(free_envs_.front());
+                free_envs_.pop_front();
+            } else if (!CreateEnvSwapchain(env_swapchain_)) {
+                env_swapchain_ = {};
+                return false;
+            }
+        }
+        if (panel_swapchains_ready_ && panel_swapchain_.handle == XR_NULL_HANDLE) {
+            if (!free_panels_.empty()) {
+                panel_swapchain_ = std::move(free_panels_.front());
+                free_panels_.pop_front();
+            } else if (!CreateSwapchain(panel_swapchain_, kOpenXRPanelLayerWidth, kOpenXRPanelLayerHeight,
+                                        "settings panel")) {
+                panel_swapchain_ = {};
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void ParkAheadSlot() {
+        if (eye_swapchains_[0].handle != XR_NULL_HANDLE) free_pairs_.push_back(std::exchange(eye_swapchains_, EyePair{}));
+        if (env_swapchain_.handle != XR_NULL_HANDLE) free_envs_.push_back(std::exchange(env_swapchain_, EyeSwapchain{}));
+        if (panel_swapchain_.handle != XR_NULL_HANDLE) free_panels_.push_back(std::exchange(panel_swapchain_, EyeSwapchain{}));
+    }
+
+    bool RestoreAheadSlot(uint64_t serial) {
+        const auto it = std::find_if(ahead_slots_.begin(), ahead_slots_.end(),
+                                     [&](const AheadSlot& slot) { return slot.serial == serial; });
+        if (it == ahead_slots_.end()) return false;
+        ParkAheadSlot();  // a pair loaded for a set that never started
+        eye_swapchains_ = std::move(it->eyes);
+        env_swapchain_ = std::move(it->env);
+        panel_swapchain_ = std::move(it->panel);
+        render_session_serial_ = it->session_serial;
+        render_space_serial_ = it->space_serial;
+        ahead_slots_.erase(it);
+        return true;
+    }
+
+    // Images that may never be released (an unconfirmed GPU submission): kept out of the pools until
+    // the session's swapchains are destroyed.
+    void AbandonCurrentSlot() {
+        if (eye_swapchains_[0].handle != XR_NULL_HANDLE) abandoned_pairs_.push_back(std::exchange(eye_swapchains_, EyePair{}));
+        if (env_swapchain_.handle != XR_NULL_HANDLE) abandoned_pairs_.push_back({std::exchange(env_swapchain_, EyeSwapchain{}), EyeSwapchain{}});
+        if (panel_swapchain_.handle != XR_NULL_HANDLE) abandoned_pairs_.push_back({std::exchange(panel_swapchain_, EyeSwapchain{}), EyeSwapchain{}});
+    }
+
+    // KARTFRAME_EYE_PAIRS with sets rendered ahead: 3 by default (the pair on display and two sets in
+    // flight), at least 3; more lets each pair rest longer after it left the display.
+    static uint32_t AheadPairsSetting() {
+        const char* env = std::getenv("KARTFRAME_EYE_PAIRS");
+        const long v = env != nullptr && *env != '\0' ? std::strtol(env, nullptr, 10) : 3;
+        return static_cast<uint32_t>(std::clamp(v, 3l, 8l));
+    }
+
     // ---- Eye swapchain pairs (lane J) ----
     //
     // The panel recording of the eighth headset session showed, in races, one eye at a time displaying
@@ -1366,7 +1604,8 @@ public:
     static uint32_t EyePairsSetting() {
         static const uint32_t pairs = [] {
             const char* env = std::getenv("KARTFRAME_EYE_PAIRS");
-            const long v = env != nullptr && *env != '\0' ? std::strtol(env, nullptr, 10) : 6;
+            // Default 2 again (lane K): six pairs were worse on the headset (seventh session, H7.md).
+            const long v = env != nullptr && *env != '\0' ? std::strtol(env, nullptr, 10) : 2;
             return static_cast<uint32_t>(std::clamp(v, 2l, 8l));
         }();
         return pairs;
@@ -1497,7 +1736,7 @@ private:
     }
 
     bool CreateSwapchains() {
-        eye_pairs_wanted_ = EyePairsSetting();
+        eye_pairs_wanted_ = ahead_ ? AheadPairsSetting() : EyePairsSetting();
         cooling_pairs_.clear();
         cooling_since_.clear();
         eye_pair_ready_ = true;
@@ -1514,13 +1753,20 @@ private:
                 Log(OpenXRLogLevel::Warning, "OpenXR could not make another eye swapchain pair; using fewer");
                 break;
             }
+            if (ahead_) {
+                free_pairs_.push_back(std::move(extra));
+                continue;
+            }
             cooling_pairs_.push_back(std::move(extra));
             cooling_since_.push_back(0);
         }
-        eye_pairs_wanted_ = static_cast<uint32_t>(cooling_pairs_.size()) + 2;
+        eye_pairs_wanted_ = static_cast<uint32_t>(ahead_ ? free_pairs_.size() : cooling_pairs_.size()) + 2;
         std::ostringstream message;
         message << "OpenXR eye swapchain pairs: " << eye_pairs_wanted_
-                << (eye_pairs_wanted_ > 2 ? " (a pair is written again " + std::to_string(eye_pairs_wanted_ - 1) +
+                << (ahead_ ? std::string(" (sets rendered ahead: one pair on display, up to ") +
+                                 std::to_string(std::min(eye_pairs_wanted_ - 1, 2u)) +
+                                 " sets in flight; KARTFRAME_EYE_PAIRS)"
+                    : eye_pairs_wanted_ > 2 ? " (a pair is written again " + std::to_string(eye_pairs_wanted_ - 1) +
                                                 " refreshes after the last frame that showed it; KARTFRAME_EYE_PAIRS)"
                                           : std::string(" (alternating; KARTFRAME_EYE_PAIRS)"));
         Log(OpenXRLogLevel::Info, message.str());
@@ -1712,8 +1958,8 @@ private:
         if (env_layer_failed_ || !MenuEnvironmentAvailable()) return false;
         const auto& view = runtime_->ViewConfiguration()[0];
         const uint32_t width = view.render_width * kOpenXREyeCount, height = view.render_height;
-        if (CreateSwapchain(env_swapchain_, width, height, "menu environment") &&
-            CreateSwapchain(retained_env_swapchain_, width, height, "menu environment")) {
+        if ((env_swapchain_.handle != XR_NULL_HANDLE || CreateEnvSwapchain(env_swapchain_)) &&
+            CreateEnvSwapchain(retained_env_swapchain_)) {
             env_swapchains_ready_ = true;
             std::ostringstream message;
             message << "OpenXR menu environment layer ready (" << width << 'x' << height << ", "
@@ -1727,7 +1973,14 @@ private:
         return false;
     }
 
+    bool CreateEnvSwapchain(EyeSwapchain& swapchain) {
+        const auto& view = runtime_->ViewConfiguration()[0];
+        return CreateSwapchain(swapchain, view.render_width * kOpenXREyeCount, view.render_height, "menu environment");
+    }
+
     void DestroyEnvSwapchains() {
+        for (auto& swapchain : free_envs_) DestroyOneSwapchain(swapchain);
+        free_envs_.clear();
         for (auto* swapchain : {&env_swapchain_, &retained_env_swapchain_}) {
             if (swapchain->handle != XR_NULL_HANDLE && !swapchain->acquired) {
                 xrDestroySwapchain(swapchain->handle);
@@ -1747,6 +2000,8 @@ private:
     }
 
     void DestroyPanelSwapchains() {
+        for (auto& swapchain : free_panels_) DestroyOneSwapchain(swapchain);
+        free_panels_.clear();
         for (auto* swapchain : {&panel_swapchain_, &retained_panel_swapchain_}) {
             if (swapchain->handle != XR_NULL_HANDLE && !swapchain->acquired) {
                 xrDestroySwapchain(swapchain->handle);
@@ -1768,6 +2023,21 @@ private:
         for (auto& pair : cooling_pairs_) DestroySwapchainPair(pair);
         cooling_pairs_.clear();
         cooling_since_.clear();
+        for (auto& slot : ahead_slots_) {
+            DestroySwapchainPair(slot.eyes);
+            DestroyOneSwapchain(slot.env);
+            DestroyOneSwapchain(slot.panel);
+        }
+        ahead_slots_.clear();
+        for (auto& pair : free_pairs_) DestroySwapchainPair(pair);
+        free_pairs_.clear();
+        for (auto& pair : abandoned_pairs_) DestroySwapchainPair(pair);
+        abandoned_pairs_.clear();
+        {
+            std::lock_guard lock(submission_mutex_);
+            ahead_expected_.clear();
+            ahead_submitted_.clear();
+        }
         eye_pair_ready_ = true;
         extra_pairs_made_ = false;
         have_retained_frame_ = false;
@@ -1777,15 +2047,17 @@ private:
     }
 
     void DestroySwapchainPair(std::array<EyeSwapchain, kOpenXREyeCount>& pair) {
-        for (auto& swapchain : pair) {
-            if (swapchain.handle != XR_NULL_HANDLE && !swapchain.acquired) {
-                xrDestroySwapchain(swapchain.handle);
-            } else if (swapchain.acquired) {
-                Log(OpenXRLogLevel::Warning,
-                    "Vulkan swapchain still owns an acquired image; deferring its destruction to xrDestroySession");
-            }
-            swapchain = {};
+        for (auto& swapchain : pair) DestroyOneSwapchain(swapchain);
+    }
+
+    void DestroyOneSwapchain(EyeSwapchain& swapchain) {
+        if (swapchain.handle != XR_NULL_HANDLE && !swapchain.acquired) {
+            xrDestroySwapchain(swapchain.handle);
+        } else if (swapchain.acquired) {
+            Log(OpenXRLogLevel::Warning,
+                "Vulkan swapchain still owns an acquired image; deferring its destruction to xrDestroySession");
         }
+        swapchain = {};
     }
 
     void EndActiveFrameWithoutLayers(const OpenXRFrame& frame) {
@@ -1811,9 +2083,14 @@ private:
             return;
         }
         const int64_t now = diagnostics::detail::NowNs();
+        const auto expected = [&] {
+            return token == self->awaiting_token_ ||
+                   std::find(self->ahead_expected_.begin(), self->ahead_expected_.end(), token) !=
+                       self->ahead_expected_.end();
+        };
         {
             std::lock_guard lock(self->submission_mutex_);
-            if (token != self->awaiting_token_) {
+            if (!expected()) {
                 return;
             }
         }
@@ -1826,7 +2103,14 @@ private:
         pacing::OnSetSubmitted(now, aurora_vulkan_win32_submitting_retained());
         {
             std::lock_guard lock(self->submission_mutex_);
+            // Sets rendered ahead: every set's submission is kept until it is shown or dropped.
+            if (const auto it = std::find(self->ahead_expected_.begin(), self->ahead_expected_.end(), token);
+                it != self->ahead_expected_.end()) {
+                self->ahead_expected_.erase(it);
+                self->ahead_submitted_.push_back({token, success, gpu_value});
+            }
             if (token != self->awaiting_token_) {
+                self->submission_cv_.notify_all();
                 return;
             }
             self->submitted_token_ = token;
@@ -1872,6 +2156,13 @@ private:
     std::vector<EyePair> cooling_pairs_;
     std::vector<uint64_t> cooling_since_;
     uint32_t eye_pairs_wanted_ = 2;
+    // Lane K: sets rendered ahead, their slots in flight, and the free pools (pacing thread).
+    bool ahead_ = false;
+    std::vector<AheadSlot> ahead_slots_;
+    std::deque<EyePair> free_pairs_;
+    std::deque<EyeSwapchain> free_envs_;
+    std::deque<EyeSwapchain> free_panels_;
+    std::vector<EyePair> abandoned_pairs_;
     bool eye_pair_ready_ = true;  // eye_swapchains_ holds a pair that may be written
     bool extra_pairs_made_ = false;
     uint64_t cycle_count_ = 0;
@@ -1907,8 +2198,17 @@ private:
     VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
     std::string last_error_;
 
-    std::mutex submission_mutex_;
+    mutable std::mutex submission_mutex_;
     std::condition_variable submission_cv_;
+    // Sets rendered ahead (lane K): serials handed to Aurora and not yet submitted, and the
+    // submissions of sets still in flight (submission_mutex_).
+    struct AheadSubmission {
+        uint64_t token = 0;
+        bool success = false;
+        uint64_t gpu_value = 0;
+    };
+    std::vector<uint64_t> ahead_expected_;
+    std::vector<AheadSubmission> ahead_submitted_;
     uint64_t awaiting_token_ = 0;
     uint64_t submitted_token_ = 0;
     uint64_t submitted_gpu_value_ = 0;
@@ -2003,6 +2303,23 @@ bool OpenXRWindowsVulkanBackend::MenuEnvironmentAvailable() const { return m_imp
 bool OpenXRWindowsVulkanBackend::EndCycleRetained() { return m_impl->EndCycleRetained(); }
 bool OpenXRWindowsVulkanBackend::CancelSet(OpenXRBackendFrame& set) { return m_impl->CancelSet(set); }
 bool OpenXRWindowsVulkanBackend::DropSet(OpenXRBackendFrame& set) { return m_impl->DropSet(set); }
+bool OpenXRWindowsVulkanBackend::EnableAhead(bool want) { return m_impl->EnableAhead(want); }
+bool OpenXRWindowsVulkanBackend::AheadCanPrepare() const { return m_impl->AheadCanPrepare(); }
+OpenXRSubmissionStatus OpenXRWindowsVulkanBackend::PollAheadSet(const OpenXRBackendFrame& set,
+                                                                std::chrono::steady_clock::time_point deadline,
+                                                                bool gpu) {
+    return m_impl->PollAheadSet(set, deadline, gpu);
+}
+bool OpenXRWindowsVulkanBackend::AheadSetCurrent(const OpenXRBackendFrame& set) const {
+    return m_impl->AheadSetCurrent(set);
+}
+bool OpenXRWindowsVulkanBackend::EndCycleWithAheadSet(OpenXRBackendFrame& set) {
+    return m_impl->EndCycleWithAheadSet(set);
+}
+bool OpenXRWindowsVulkanBackend::CancelAheadSet(OpenXRBackendFrame& set) { return m_impl->CancelAheadSet(set); }
+bool OpenXRWindowsVulkanBackend::DropAheadSet(OpenXRBackendFrame& set, std::chrono::milliseconds wait) {
+    return m_impl->DropAheadSet(set, wait);
+}
 
 bool OpenXRWindowsVulkanBackend::Shutdown() { return m_impl->Shutdown(); }
 

@@ -110,6 +110,25 @@ public:
     bool CancelSet(OpenXRBackendFrame& set);
     bool DropSet(OpenXRBackendFrame& set);
 
+    // Sets rendered ahead (lane K, the default pipelined pacing): up to two sets in flight, each
+    // on an eye swapchain pair (and menu environment image) of its own, none of them the pair on
+    // display, so a set that is overtaken can be released unshown. EnableAhead before the first
+    // set (false: GPU completion cannot be polled, the old single-set calls stay in use).
+    // AheadCanPrepare: no set waits for Aurora's submission (Aurora takes one set at a time).
+    // PollAheadSet: Success once the set was submitted and the GPU finished it; with gpu false,
+    // once it was submitted; Timeout at the deadline (now: never blocks). AheadSetCurrent: located
+    // in the session and reference space still in use. EndCycleWithAheadSet: released and shown
+    // at once with its own poses. CancelAheadSet: before Aurora encoded it (its images stay
+    // acquired for the next set). DropAheadSet: released unshown, waiting up to `wait` for the GPU.
+    bool EnableAhead(bool want);
+    bool AheadCanPrepare() const;
+    OpenXRSubmissionStatus PollAheadSet(const OpenXRBackendFrame& set, std::chrono::steady_clock::time_point deadline,
+                                        bool gpu = true);
+    bool AheadSetCurrent(const OpenXRBackendFrame& set) const;
+    bool EndCycleWithAheadSet(OpenXRBackendFrame& set);
+    bool CancelAheadSet(OpenXRBackendFrame& set);
+    bool DropAheadSet(OpenXRBackendFrame& set, std::chrono::milliseconds wait);
+
     // Call on the XR owner thread after Aurora's worker is idle and before
     // aurora_shutdown(). Safe to repeat. False means a submitted Vulkan command
     // could not be fenced; the caller must retain this backend and its runtime

@@ -351,7 +351,7 @@ inline void Info(std::string_view text) {
 //
 //   vr pacing: t=<s> hz=<display Hz> mode=<pacing> ticks=<n> rendered=<n> interpolated=<n>
 //              late=<n> missed=<n> repeats=<n> gpu_ms=<p50>/<p99> encode_ms=<p50>/<p99>
-//              end_ms=<p50>/<p99> pairwait=<n>
+//              end_ms=<p50>/<p99> pairwait=<n> dropped=<n> end_late=<n>
 //
 // (one line). t: seconds since the session started running. hz: the display refresh rate.
 // mode: inline or pipelined, "/2" appended while the loop renders every second refresh only.
@@ -364,7 +364,9 @@ inline void Info(std::string_view text) {
 // 99th percentile. encode_ms: Aurora's frame worker from taking the packet to that submit.
 // end_ms: each xrEndFrame's time after its xrWaitFrame returned (SteamVR's wake-up), median and
 // 99th percentile. pairwait: refreshes that rendered nothing because no eye swapchain pair had
-// cooled off long enough since it was last shown (KARTFRAME_EYE_PAIRS, lane J).
+// cooled off long enough since it was last shown (KARTFRAME_EYE_PAIRS, lane J). dropped: sets finished
+// but never shown because a newer one was ready first (sets rendered ahead, lane K). end_late:
+// xrEndFrame calls more than 1 ms after the wake-up (SteamVR showed those inconsistently, H7.md).
 // A "vr pacing totals:" line in the same key=value form follows each session.
 namespace mkw::vr::pacing {
 void SetSink(std::function<void(std::string_view line)> sink);
@@ -379,6 +381,8 @@ void OnRepeat();
 // Pacing thread: an xrEndFrame this long after its xrWaitFrame returned; a refresh with no eye pair free.
 void OnEndAfterWake(double ms);
 void OnPairWait();
+// Pacing thread: a finished set released unshown, overtaken by a newer one.
+void OnSetDropped();
 // Aurora's frame worker took a packet (any thread).
 void NoteSetConsumed();
 // A set reached Dawn's queue; retained: rendered from a retained game frame.

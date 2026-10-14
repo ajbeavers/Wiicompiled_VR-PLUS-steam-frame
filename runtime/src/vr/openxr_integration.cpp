@@ -100,9 +100,14 @@ using GraphicsBackend = OpenXRWindowsBackend;
 #elif defined(MKW_OPENXR_LINUX_DESKTOP)
 using GraphicsBackend = OpenXRWindowsVulkanBackend;
 inline constexpr const char* kGraphicsBackendName = "Vulkan";
+// Sets rendered ahead (lane K): the default pipelined pacing on the Linux Vulkan backend.
+#define KARTFRAME_AHEAD_PACING 1
 #else
 using GraphicsBackend = OpenXRVulkanBackend;
 inline constexpr const char* kGraphicsBackendName = "Vulkan";
+#endif
+#ifndef KARTFRAME_AHEAD_PACING
+#define KARTFRAME_AHEAD_PACING 0
 #endif
 
 // Whether the immersive window's eyes can be aimed through the window, so that only the window is
@@ -544,6 +549,23 @@ public:
         }
         ReadPacingMode();
         set_pacing_ = {};
+        ahead_sets_.clear();
+        ahead_shown_time_ = 0;
+#if KARTFRAME_AHEAD_PACING
+        ahead_ = backend_->EnableAhead(ahead_wanted_);
+#else
+        ahead_ = false;
+#endif
+        if (pacing_mode_ == PacingMode::Pipelined) {
+            RT_LOG(RT_TAG_RUNTIME) << "OpenXR pipelined pacing: "
+                                   << (ahead_ ? "sets rendered two refreshes ahead, every frame ended at its wake-up "
+                                                "with the newest finished set (KARTFRAME_PIPELINED=wait: the old loop)"
+                                              : ahead_wanted_ ? "one set at a time, frames ended when it finishes "
+                                                                "(sets ahead need GPU completion polling)"
+                                                              : "one set at a time, frames ended when it finishes "
+                                                                "(KARTFRAME_PIPELINED=wait)")
+                                   << std::endl;
+        }
         running_.store(true, std::memory_order_release);
         try {
             pacing_thread_ = std::thread([this] { PacingThread(); });
@@ -979,7 +1001,7 @@ private:
             // Reference spaces can only be replaced between XR frames. The
             // startup pose check schedules this after the previous submission,
             // so eyes, menu and controller rays all use the new space together.
-            if (startup_origin_pending_ && !set_pacing_.pending) {
+            if (startup_origin_pending_ && !SetsInFlight()) {
                 startup_origin_pending_=false;
                 if(runtime_->ResetAppSpace(startup_origin_pose_)) {
                     const auto& q=startup_origin_pose_.orientation;
@@ -1081,21 +1103,23 @@ private:
                 const std::string banner = std::string("OpenXR ") + kGraphicsBackendName + " pacing: " +
                     (render_first ? std::string("render-first")
                                   : std::string("per-refresh eye sets (VR interpolation), ") +
-                                        PacingModeName(pacing_mode_) + " (frame_pacing " + pacing_mode_source_ + ")") +
+                                        CurrentModeName() + " (frame_pacing " + pacing_mode_source_ + ")") +
                     "\n";
                 RT_LOG(RT_TAG_RUNTIME) << banner << std::flush;
-                pacing::SetMode(PacingModeName(pacing_mode_));
+                pacing::SetMode(CurrentModeName());
             }
             // A set still in flight is shown (or dropped) by the set loop before switching.
-            if (render_first && !set_pacing_.pending) {
+            if (render_first && !SetsInFlight()) {
                 if (!RenderFirstCycle(presentation, policy, immersive, consecutive_skips,
                                       immersive_submission_logged)) {
                     fatal = true;
                 }
                 continue;
             }
-            const CycleResult result = SetCycle(presentation, policy, immersive, interpolation_target,
-                                                immersive_submission_logged);
+            const CycleResult result =
+                ahead_ ? AheadCycle(presentation, policy, immersive, interpolation_target, !render_first,
+                                    immersive_submission_logged)
+                       : SetCycle(presentation, policy, immersive, interpolation_target, immersive_submission_logged);
             if (result == CycleResult::Fatal) {
                 fatal = true;
             } else if (result == CycleResult::Break) {
@@ -1153,6 +1177,10 @@ private:
     static const char* PacingModeName(PacingMode mode) noexcept {
         return mode == PacingMode::Pipelined ? "pipelined" : "inline";
     }
+    // As the pacing line names it: "pipelined" renders sets ahead, "pipelined-wait" is the old loop.
+    const char* CurrentModeName() const noexcept {
+        return pacing_mode_ == PacingMode::Pipelined && !ahead_ ? "pipelined-wait" : PacingModeName(pacing_mode_);
+    }
 
     // A [vr] key of Config.toml that runtime_config.h does not know (read here so that header,
     // which every translated file includes, stays untouched). Strings, or numbers as text.
@@ -1196,6 +1224,18 @@ private:
             margin_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
         }
         pacing_margin_ = std::chrono::microseconds(margin_us);
+        // Pipelined pacing renders sets ahead and ends every frame at its wake-up (lane K, H7.md);
+        // KARTFRAME_PIPELINED=wait restores the loop of lanes A to J (one set at a time, each frame
+        // ended when its set finished, up to the deadline). KARTFRAME_AHEAD_START_US delays each set's
+        // start after the wake-up (default 0; less pose prediction, less margin).
+        const char* pipelined_env = std::getenv("KARTFRAME_PIPELINED");
+        ahead_wanted_ = pacing_mode_ == PacingMode::Pipelined &&
+                        !(pipelined_env != nullptr && std::string_view(pipelined_env) == "wait");
+        long start_us = 0;
+        if (const char* env = std::getenv("KARTFRAME_AHEAD_START_US"); env != nullptr && *env != '\0') {
+            start_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
+        }
+        ahead_start_delay_ = std::chrono::microseconds(start_us);
         // Every refresh by default: a late set repeats the retained layer with its own poses
         // (the compositor reprojects it). Half rate shows 60 Hz content twice on a 120 Hz panel,
         // the judder and head-turn ghosting the owner rejected; in H1 the old auto rule flapped
@@ -1215,6 +1255,21 @@ private:
     // released once the GPU finished it, never shown.
     bool DropPendingSet() {
         auto& st = set_pacing_;
+#if KARTFRAME_AHEAD_PACING
+        if (!ahead_sets_.empty()) {
+            WithdrawPublishedFrame();
+            bool ok = true;
+            for (auto& a : ahead_sets_) {
+                if (!backend_->DropAheadSet(a.set, std::chrono::seconds(1))) {
+                    SetError(backend_->LastError());
+                    ok = false;
+                }
+            }
+            ahead_sets_.clear();
+            ahead_shown_time_ = 0;
+            if (!ok) return false;
+        }
+#endif
         if (!st.pending) return true;
         WithdrawPublishedFrame();
         st.pending = false;
@@ -1247,7 +1302,7 @@ private:
             const bool half = half_rate_policy_ == HalfRatePolicy::Always;
             if (st.half_rate != half) {
                 st.half_rate = half;
-                pacing::SetMode(std::string(PacingModeName(pacing_mode_)) + (half ? "/2" : ""));
+                pacing::SetMode(std::string(CurrentModeName()) + (half ? "/2" : ""));
             }
             return;
         }
@@ -1261,7 +1316,7 @@ private:
                 RT_LOG(RT_TAG_RUNTIME) << "vr pacing: " << late << " of the last " << kHalfRateWindow
                                        << " eye sets late; rendering every second refresh for the rest of the session"
                                        << std::endl;
-                pacing::SetMode(std::string(PacingModeName(pacing_mode_)) + "/2");
+                pacing::SetMode(std::string(CurrentModeName()) + "/2");
             }
         }
         (void)period;
@@ -1330,23 +1385,9 @@ private:
         return CycleResult::Continue;
     }
 
-    CycleResult SetCycle(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
-                         uint32_t interpolation_target, bool& immersive_submission_logged) {
+    // Every compositor cycle: frame timing, the pacing line's tick, missed refreshes. Returns the period.
+    XrDuration NoteCycle(const OpenXRFrame& cycle) {
         auto& st = set_pacing_;
-        OpenXRFrame cycle{};
-        const OpenXRBeginStatus begin = backend_->BeginCycle(cycle);
-        if (begin == OpenXRBeginStatus::SessionNotRunning) {
-            MkwVRPolicySetSessionActive(false);
-            return DropPendingSet() ? CycleResult::Continue : CycleResult::Fatal;
-        }
-        if (begin == OpenXRBeginStatus::ExitRequested) {
-            SetError("OpenXR runtime requested session exit; continuing on the mirror output");
-            return CycleResult::Break;
-        }
-        if (begin == OpenXRBeginStatus::Error) {
-            SetError(backend_->LastError());
-            return CycleResult::Fatal;
-        }
         UpdateFrameTiming(cycle);
         const XrDuration period = cycle.predicted_display_period > 0 ? cycle.predicted_display_period : 8'333'333;
         uint32_t missed = 0;
@@ -1365,6 +1406,27 @@ private:
         }
         st.last_display_time = cycle.predicted_display_time;
         pacing::OnTick(headset_hz_.load(std::memory_order_relaxed), missed);
+        return period;
+    }
+
+    CycleResult SetCycle(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
+                         uint32_t interpolation_target, bool& immersive_submission_logged) {
+        auto& st = set_pacing_;
+        OpenXRFrame cycle{};
+        const OpenXRBeginStatus begin = backend_->BeginCycle(cycle);
+        if (begin == OpenXRBeginStatus::SessionNotRunning) {
+            MkwVRPolicySetSessionActive(false);
+            return DropPendingSet() ? CycleResult::Continue : CycleResult::Fatal;
+        }
+        if (begin == OpenXRBeginStatus::ExitRequested) {
+            SetError("OpenXR runtime requested session exit; continuing on the mirror output");
+            return CycleResult::Break;
+        }
+        if (begin == OpenXRBeginStatus::Error) {
+            SetError(backend_->LastError());
+            return CycleResult::Fatal;
+        }
+        const XrDuration period = NoteCycle(cycle);
         const auto deadline = backend_->CycleWakeTime() + std::chrono::nanoseconds(period) - pacing_margin_;
         const bool pipelined = pacing_mode_ == PacingMode::Pipelined;
         st.odd_tick = !st.odd_tick;
@@ -1463,6 +1525,174 @@ private:
         pacing::Flush();
         return CycleResult::Continue;
     }
+
+#if KARTFRAME_AHEAD_PACING
+    // ---- Sets rendered ahead (lane K; the default pipelined pacing) ----
+    //
+    // The seventh headset session (frame/perf/H7.md): the old pipelined loop started a set only after
+    // the last one was shown and ended each frame when its set finished, so in races (encode about
+    // 2.5 ms plus GPU about 5 ms, more than a refresh) every frame ended about 1.7 ms later after
+    // SteamVR's wake-up than the one before, up to the deadline, then a repeat, then again: a
+    // sawtooth from 0 to 10 ms. On head turns the image zigzagged between two positions from refresh
+    // to refresh. Frames ended right at the wake-up (menus, GalaxyFrame, PrimeFrame's pipelined loop)
+    // looked clean. So now every cycle ends its frame at once: with the newest set due by now whose
+    // GPU work is finished (its own poses, this cycle's display time), else with the retained layer;
+    // it never waits inside the cycle. Then it starts the set for the display time two refreshes
+    // ahead, so each set has the rest of this refresh and all of the next (about 16 ms) for its encode
+    // and GPU work while the set before it is shown; one set is on the GPU while the next is encoded.
+    // Up to two sets in flight, each on an eye pair of its own (three pairs at least).
+    static constexpr size_t kAheadLead = 2;
+
+    CycleResult AheadCycle(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
+                           uint32_t interpolation_target, bool allow_start, bool& immersive_submission_logged) {
+        auto& st = set_pacing_;
+        OpenXRFrame cycle{};
+        const OpenXRBeginStatus begin = backend_->BeginCycle(cycle);
+        if (begin == OpenXRBeginStatus::SessionNotRunning) {
+            MkwVRPolicySetSessionActive(false);
+            return DropPendingSet() ? CycleResult::Continue : CycleResult::Fatal;
+        }
+        if (begin == OpenXRBeginStatus::ExitRequested) {
+            SetError("OpenXR runtime requested session exit; continuing on the mirror output");
+            return CycleResult::Break;
+        }
+        if (begin == OpenXRBeginStatus::Error) {
+            SetError(backend_->LastError());
+            return CycleResult::Fatal;
+        }
+        const XrDuration period = NoteCycle(cycle);
+        const XrTime now_display = cycle.predicted_display_time;
+        const XrDuration half = period / 2;
+        const auto now = std::chrono::steady_clock::now();
+
+        // The newest set due by this refresh that is finished; never wait for one.
+        std::ptrdiff_t chosen = -1;
+        for (size_t i = 0; i < ahead_sets_.size(); ++i) {
+            auto& a = ahead_sets_[i];
+            const XrTime t = a.set.xr_frame.predicted_display_time;
+            if (t > now_display + half) break;
+            const OpenXRSubmissionStatus status = backend_->PollAheadSet(a.set, now);
+            if (status == OpenXRSubmissionStatus::Success) {
+                if (t > ahead_shown_time_ && backend_->AheadSetCurrent(a.set)) chosen = static_cast<std::ptrdiff_t>(i);
+            } else if (status == OpenXRSubmissionStatus::Timeout) {
+                if (!a.late_counted) {
+                    // Not finished by its own refresh: late (shown later if nothing newer is ready first).
+                    a.late_counted = true;
+                    pacing::OnLate();
+                    NoteSetResult(true);
+                }
+            } else if (status == OpenXRSubmissionStatus::ShuttingDown) {
+                backend_->EndCycleRetained();
+                return CycleResult::Break;
+            } else {
+                // Aurora failed after GPU work may have been queued: those images stay acquired.
+                diagnostics::OnSubmission(false);
+                backend_->EndCycleRetained();
+                SetError(std::string("Aurora's ") + kGraphicsBackendName +
+                         " stereo copy failed; continuing on the mirror output");
+                return CycleResult::Fatal;
+            }
+        }
+        if (chosen >= 0) {
+            auto& a = ahead_sets_[static_cast<size_t>(chosen)];
+            const XrTime shown_time = a.set.xr_frame.predicted_display_time;
+            pacing::OnSetShown(shown_time - now_display);
+            if (!a.late_counted) NoteSetResult(false);
+            if (!backend_->EndCycleWithAheadSet(a.set)) {
+                SetError(backend_->LastError());
+                return CycleResult::Fatal;
+            }
+            ahead_shown_time_ = shown_time;
+            ahead_sets_.erase(ahead_sets_.begin() + chosen);
+            pacing::OnRendered();
+            diagnostics::OnSubmission(true);
+            ++timing_submissions_;
+            if (immersive && !immersive_submission_logged) {
+                immersive_submission_logged = true;
+                RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] first immersive packet consumed and submitted as "
+                                          "an OpenXR projection layer"
+                                       << std::endl;
+            }
+        } else {
+            if (!backend_->EndCycleRetained()) {
+                SetError(backend_->LastError());
+                return CycleResult::Fatal;
+            }
+            pacing::OnRepeat();
+            diagnostics::OnKeepaliveRepeat();
+        }
+
+        // Sets that can no longer be shown (overtaken by the one shown, or located in a reference
+        // space no longer in use) are released unshown once the GPU is done with them.
+        for (size_t i = 0; i < ahead_sets_.size();) {
+            auto& a = ahead_sets_[i];
+            const bool overtaken = a.set.xr_frame.predicted_display_time <= ahead_shown_time_;
+            if ((overtaken || !backend_->AheadSetCurrent(a.set)) &&
+                backend_->PollAheadSet(a.set, now) == OpenXRSubmissionStatus::Success) {
+                if (!backend_->DropAheadSet(a.set, std::chrono::milliseconds(0))) {
+                    SetError(backend_->LastError());
+                    return CycleResult::Fatal;
+                }
+                pacing::OnSetDropped();
+                ahead_sets_.erase(ahead_sets_.begin() + static_cast<std::ptrdiff_t>(i));
+                continue;
+            }
+            ++i;
+        }
+
+        // A stalled game (nothing to replay) leaves the newest packet unconsumed: withdraw it after
+        // 50 ms and cancel the set if Aurora has not started encoding it.
+        if (!ahead_sets_.empty()) {
+            auto& last = ahead_sets_.back();
+            if (now - last.published_at >= std::chrono::milliseconds(50) &&
+                backend_->PollAheadSet(last.set, now, false) == OpenXRSubmissionStatus::Timeout) {
+                diagnostics::Measure(diagnostics::Stage::Withdraw, [&] { WithdrawPublishedFrame(); });
+                if (diagnostics::Measure(diagnostics::Stage::Cancel, [&] { return backend_->CancelAheadSet(last.set); })) {
+                    ahead_sets_.pop_back();
+                    diagnostics::OnPacketCanceled();
+                }
+            }
+        }
+
+        // The set for two refreshes ahead.
+        const XrTime target = now_display + static_cast<XrDuration>(kAheadLead) * period;
+        st.odd_tick = !st.odd_tick;
+        const bool render_tick = (!st.half_rate || st.odd_tick) &&
+                                 interpolation_pacing_.ShouldRender(target, interpolation_target);
+        const bool covered = !ahead_sets_.empty() &&
+                             ahead_sets_.back().set.xr_frame.predicted_display_time >= target - half;
+        if (allow_start && !startup_origin_pending_ && render_tick && !covered && ahead_sets_.size() < kAheadLead) {
+            // Aurora takes one set at a time: the last one must have reached its queue first. Waiting
+            // for that is bounded by this cycle's end (the next xrWaitFrame must not start late).
+            const auto deadline = backend_->CycleWakeTime() + std::chrono::nanoseconds(period) - pacing_margin_;
+            const bool aurora_free =
+                ahead_sets_.empty() ||
+                diagnostics::Measure(diagnostics::Stage::SubmissionWait, [&] {
+                    return backend_->PollAheadSet(ahead_sets_.back().set, deadline, false);
+                }) == OpenXRSubmissionStatus::Success;
+            if (aurora_free && backend_->AheadCanPrepare()) {
+                if (ahead_start_delay_.count() > 0) {
+                    std::this_thread::sleep_until(std::min(backend_->CycleWakeTime() + ahead_start_delay_, deadline));
+                }
+                const CycleResult started = StartSet(presentation, policy, immersive, target, cycle);
+                if (st.pending) {
+                    ahead_sets_.push_back({st.set, st.published_at, false});
+                    st.pending = false;
+                    st.set = {};
+                }
+                if (started != CycleResult::Continue) return started;
+            }
+        }
+        UpdateHalfRate(period);
+        pacing::Flush();
+        return CycleResult::Continue;
+    }
+#else
+    CycleResult AheadCycle(const OpenXRPresentation& presentation, const MkwVRPolicySnapshot& policy, bool immersive,
+                           uint32_t interpolation_target, bool, bool& immersive_submission_logged) {
+        return SetCycle(presentation, policy, immersive, interpolation_target, immersive_submission_logged);
+    }
+#endif
 
     // One compositor cycle on the retained layer, with no frame left active. False on a fatal
     // backend or runtime failure (the error is recorded).
@@ -2470,6 +2700,18 @@ private:
     bool interpolation_stopping_ = true;
     FrameInterpolationPacing interpolation_pacing_;
     SetPacingState set_pacing_;
+    // Sets rendered ahead (lane K), oldest display time first.
+    struct AheadSet {
+        OpenXRBackendFrame set{};
+        std::chrono::steady_clock::time_point published_at{};
+        bool late_counted = false;
+    };
+    std::deque<AheadSet> ahead_sets_;
+    XrTime ahead_shown_time_ = 0;  // display time of the last set shown
+    bool ahead_ = false;
+    bool ahead_wanted_ = false;
+    std::chrono::microseconds ahead_start_delay_{0};
+    bool SetsInFlight() const { return set_pacing_.pending || !ahead_sets_.empty(); }
     std::chrono::steady_clock::time_point last_focused_{};
     PacingMode pacing_mode_ = PacingMode::Pipelined;
     bool fov_logged_ = false;

@@ -36,6 +36,7 @@ def parse_game_log(path):
          "interp": 0, "late": 0, "missed": 0, "repeats": 0, "g50": [], "g99": [], "e50": [], "e99": [],
          "totals": None, "half": 0, "full": 0, "hitch": 0, "hitch_notes": [], "refresh_note": None,
          "worst_late": (0, 0), "race": None, "in_race": False, "end50": [], "end99": [], "pairwait": 0, "pairs": None,
+         "dropped": 0, "end_late": 0, "end_n": 0,
          "parts": {k: {"seconds": 0, "rendered": 0, "late": 0, "ticks": 0, "g50": [], "g99": [], "e50": []} for k in ("menus", "race")}}
     with open(path, errors="replace") as f:
         for line in f:
@@ -70,6 +71,12 @@ def parse_game_log(path):
                     r["end50"].append(float(ex.group(1)))
                     r["end99"].append(float(ex.group(2)))
                     r["pairwait"] += int(ex.group(3))
+                # Lane K: finished sets released unshown (overtaken) and ends later than 1 ms after the wake-up.
+                ek = re.search(r"dropped=(\d+) end_late=(\d+)", line)
+                if ek:
+                    r["dropped"] += int(ek.group(1))
+                    r["end_late"] += int(ek.group(2))
+                    r["end_n"] += int(d["ticks"])
                 part = r["parts"]["race" if r["in_race"] else "menus"]
                 part["seconds"] += 1
                 for k in ("rendered", "late", "ticks"):
@@ -178,6 +185,8 @@ def build(sessions):
         "%s / %s" % (fmt(median(g["e50"]), "%.2f"), fmt(max(g["e99"]) if g["e99"] else None, "%.2f")) if g else "-")
     add("eye swapchain pairs, refreshes without one free", lambda g, v: "%s, %d" % (g["pairs"] or "2 (old build)", g["pairwait"]) if g else "-")
     add("xrEndFrame after wake-up ms: median of p50 / worst p99", lambda g, v: "%s / %s" % (fmt(median(g["end50"]), "%.2f"), fmt(max(g["end99"]), "%.2f")) if g and g["end50"] else "-")
+    add("xrEndFrame later than 1 ms after wake-up", lambda g, v: "%d (%s of ticks)" % (g["end_late"], pct(g["end_late"], g["end_n"])) if g and g["end_n"] else "-")
+    add("finished sets dropped (overtaken)", lambda g, v: str(g["dropped"]) if g and g["end_n"] else "-")
     add("first race at (s)", lambda g, v: fmt(g["race"], "%.0f") if g else "-")
     for name in ("menus", "race"):
         def part(g, name=name):
