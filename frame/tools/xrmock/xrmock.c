@@ -249,10 +249,12 @@ static XrResult XRAPI_CALL mCreateSession(XrInstance i, const XrSessionCreateInf
 }
 static XrResult XRAPI_CALL mDestroySession(XrSession s) { (void)s; return XR_SUCCESS; }
 static int gSpaces = 0;
+static int gSpaceView[256];  // the VIEW reference space (the head) follows the views (mLocateViews)
 static XrResult XRAPI_CALL mCreateRefSpace(XrSession s, const XrReferenceSpaceCreateInfo* ci, XrSpace* out) {
     (void)s;
-    (void)ci;
-    *out = (XrSpace)(uintptr_t)(100 + gSpaces++);
+    int id = gSpaces++;
+    if (id < 256) gSpaceView[id] = ci->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_VIEW;
+    *out = (XrSpace)(uintptr_t)(100 + id);
     return XR_SUCCESS;
 }
 // MOCK_XR_HANDS: which hand each action space belongs to (-1: none).
@@ -290,14 +292,20 @@ static XrResult XRAPI_CALL mEnumRefSpaces(XrSession s, uint32_t cap, uint32_t* c
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mDestroyActionSet(XrActionSet a) { (void)a; return XR_SUCCESS; }
+static void headPose(XrTime displayTime, float* yaw, XrPosef* pose);
 static XrResult XRAPI_CALL mLocateSpace(XrSpace sp, XrSpace base, XrTime t, XrSpaceLocation* loc) {
     (void)base;
-    (void)t;
     loc->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
                          XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
     loc->pose.orientation = (XrQuaternionf){0, 0, 0, 1};
     loc->pose.position = (XrVector3f){0, 1.6f, 0};
     int id = (int)((uintptr_t)sp - 100);
+    if (id >= 0 && id < 256 && id < gSpaces && gSpaceView[id]) {
+        // The head: the eyes' midpoint and orientation at that time (KARTFRAME_EYE_OFFSETS=fixed composes the eyes from it).
+        float yaw;
+        headPose(t, &yaw, &loc->pose);
+        return XR_SUCCESS;
+    }
     if (gHands && id >= 0 && id < 256 && id < gSpaces && gSpaceHand[id] >= 0) {
         // Held at chest height, pointing ahead and a little up (the right one at the menu screen).
         const float pitch = 0.08f;
@@ -391,7 +399,7 @@ static int gReleases = 0, gBusyReleases = 0;
 static double gBusyMaxMs = 0.0;
 static int gWaitHist[5];
 static int gPoseAge[6];  // display time minus locate time in refreshes: <0, 0, 1, 2, 3, more
-static int gPoseSets = 0, gPoseSameTime = 0, gPoseEarlier = 0, gPoseLater = 0, gPoseSplit = 0, gPoseUnknown = 0;
+static int gPoseSets = 0, gPoseSameTime = 0, gPoseEarlier = 0, gPoseLater = 0, gPoseSplit = 0, gPoseUnknown = 0, gPoseNear = 0;
 static int checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh);
 static XrTime locateTime(int i);
 // Frames by what they showed: a projection layer whose eye images were both released since
@@ -1009,8 +1017,9 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
     fprintf(stderr,
             "xrmock: summary: %d errors; %d releases checked for finished GPU work, %d before it finished (worst %.1f ms); "
             "%d projection layers: eyes from one locate for the display time submitted %d, for an earlier one %d, a later one %d; eyes from "
-            "different locates %d, poses not from a locate %d\n",
-            gErrors, gReleases, gBusyReleases, gBusyMaxMs, gPoseSets, gPoseSameTime, gPoseEarlier, gPoseLater, gPoseSplit, gPoseUnknown);
+            "different locates %d, poses not from a locate %d (matched to a locate within 1e-6 rather than exactly: %d)\n",
+            gErrors, gReleases, gBusyReleases, gBusyMaxMs, gPoseSets, gPoseSameTime, gPoseEarlier, gPoseLater, gPoseSplit, gPoseUnknown,
+            gPoseNear);
     fprintf(stderr,
             "xrmock: end times: %d frames ended with their predicted display time, %d with another (within a refresh %d, a refresh or more "
             "earlier %d, later %d; worst %.3f ms)\n",
@@ -1244,21 +1253,28 @@ static struct {
     XrPosef pose[2];
 } gLocates[LOCATES];
 static int gLocateNext = 0;
+static void headPose(XrTime displayTime, float* yaw, XrPosef* pose) {
+    double t = (double)(displayTime - gTimeOffset - gT0) / 1e9;
+    *yaw = (float)(0.3 * sin(t * 2.0 * 3.14159265 * 0.5));
+    pose->orientation = (XrQuaternionf){0, sinf(*yaw * 0.5f), 0, cosf(*yaw * 0.5f)};
+    // The head also rises 0.1 mm a second, so no two locates share a pose: the sway alone repeats
+    // (yaw at t and at a time mirrored about a sine peak), and the pose check matched such a twin
+    // locate now and then ("image rendered for a display time 183 ms after...").
+    pose->position = (XrVector3f){0, 1.6f + 0.0001f * (float)t, 0};
+}
 static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li, XrViewState* vs, uint32_t cap, uint32_t* count, XrView* v) {
     (void)s;
     vs->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT |
                          XR_VIEW_STATE_POSITION_TRACKED_BIT;
     *count = 2;
-    double t = (double)(li->displayTime - gTimeOffset - gT0) / 1e9;
-    float yaw = (float)(0.3 * sin(t * 2.0 * 3.14159265 * 0.5));
+    float yaw;
+    XrPosef head;
+    headPose(li->displayTime, &yaw, &head);
     float c = cosf(yaw), sn = sinf(yaw);
     for (uint32_t e = 0; e < 2 && e < cap; e++) {
         float x = e ? 0.032f : -0.032f;
-        v[e].pose.orientation = (XrQuaternionf){0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)};
-        // The head also rises 0.1 mm a second, so no two locates share a pose: the sway alone repeats
-        // (yaw at t and at a time mirrored about a sine peak), and the pose check matched such a twin
-        // locate now and then ("image rendered for a display time 183 ms after...").
-        v[e].pose.position = (XrVector3f){x * c, 1.6f + 0.0001f * (float)t, -x * sn};
+        v[e].pose.orientation = head.orientation;
+        v[e].pose.position = (XrVector3f){x * c, head.position.y, -x * sn};
         const float rad = 3.14159265f / 180.0f;
         v[e].fov = (XrFovf){gFovDeg[e][0] * rad, gFovDeg[e][1] * rad, gFovDeg[e][2] * rad, gFovDeg[e][3] * rad};
         gLocates[gLocateNext].pose[e] = v[e].pose;
@@ -1270,6 +1286,30 @@ static XrResult XRAPI_CALL mLocateViews(XrSession s, const XrViewLocateInfo* li,
 
 static XrTime locateTime(int i) { return gLocates[i].time; }
 static int samePose(const XrPosef* a, const XrPosef* b) { return !memcmp(a, b, sizeof(XrPosef)); }
+// Largest component difference of two poses (metres, quaternion units).
+static double poseDiff(const XrPosef* a, const XrPosef* b) {
+    const float d[7] = {a->position.x - b->position.x, a->position.y - b->position.y, a->position.z - b->position.z,
+                        a->orientation.x - b->orientation.x, a->orientation.y - b->orientation.y, a->orientation.z - b->orientation.z,
+                        a->orientation.w - b->orientation.w};
+    double m = 0;
+    for (int k = 0; k < 7; k++) m = fmax(m, fabs((double)d[k]));
+    return m;
+}
+// The nearest locate's eye pose within 1e-6 (KARTFRAME_EYE_OFFSETS=fixed submits the head pose composed with
+// fixed offsets: a locate's eye pose up to rounding; the head rises 0.8e-6 m a refresh, so the nearest is the one).
+static int nearestLocate(const XrPosef* pose, int eye) {
+    int best = -1;
+    double bd = 1e-6;
+    for (int i = 0; i < LOCATES; i++) {
+        if (!gLocates[i].time) continue;
+        double d = poseDiff(&gLocates[i].pose[eye], pose);
+        if (d <= bd) {
+            bd = d;
+            best = i;
+        }
+    }
+    return best;
+}
 
 // Both eyes of a projection layer: from one locate, and for which time.
 static int checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime, int fresh) {
@@ -1281,6 +1321,16 @@ static int checkPoses(const XrCompositionLayerProjection* p, XrTime displayTime,
         if (samePose(&gLocates[i].pose[0], &p->views[0].pose)) {
             left = i;
             if (samePose(&gLocates[i].pose[1], &p->views[1].pose)) both = i;
+        }
+    }
+    if (both < 0) {
+        // Recomposed poses (fixed eye offsets) can match one eye exactly and the other only to rounding.
+        int nl = nearestLocate(&p->views[0].pose, 0), nr = nearestLocate(&p->views[1].pose, 1);
+        if (nl >= 0 && nl == nr) {
+            both = nl;
+            gPoseNear++;
+        } else if (nl >= 0 && nr >= 0) {
+            left = nl;
         }
     }
     if (both < 0) {
