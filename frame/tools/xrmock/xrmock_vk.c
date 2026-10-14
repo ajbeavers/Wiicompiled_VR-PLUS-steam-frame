@@ -465,18 +465,18 @@ static int dumpImage(void* images, int index, int width, int height, int64_t for
     return ok;
 }
 
-// MOCK_XR_STAMP: the app's stamp block (see the app's vulkan_win32_interop.cpp), 256x52 pixels in
-// the top left corner (rows 0-2 the display time and eye, 3-6 lane L's scene words, 7-12 lane P's pose
-// words), copied at the release into one of STAMP_SLOTS host-visible slots.
-#define STAMP_W 256
-#define STAMP_H 52
+// MOCK_XR_STAMP: the app's stamp block (see the app's vulkan_win32_interop.cpp), 64x15 pixels in the
+// top left corner, one pixel a bit (rows 0-2 the display time and eye, 3-6 lane L's scene words, 7-14
+// lane P's pose words), copied at the release into one of STAMP_SLOTS host-visible slots.
+#define STAMP_W 64
+#define STAMP_H 15
 #define STAMP_SLOTS 64
 static struct {
     VkFence fence;
     VkCommandBuffer cb;
     unsigned gen;
     int submitted, decoded, result, eye, scene, pose;
-    uint64_t value, sceneA, sceneB, poseW[3];
+    uint64_t value, sceneA, sceneB, poseW[4];
 } gStamp[STAMP_SLOTS];
 static VkBuffer gStampBuf;
 static VkDeviceMemory gStampMem;
@@ -538,10 +538,10 @@ static int stampSetup(void) {
     return 1;
 }
 
-// Decodes slot i once its copy finished: 1 valid, -1 no stamp. A cell is 1 when its centre pixel
-// is white (any colour channel above half).
+// Decodes slot i once its copy finished: 1 valid, -1 no stamp. A cell (one pixel) is 1 when it is white
+// (any colour channel above half).
 static int stampBit(int i, int column, int row) {
-    const unsigned char* q = gStampMap + (size_t)i * STAMP_W * STAMP_H * 4 + ((size_t)(row * 4 + 2) * STAMP_W + (size_t)(column * 4 + 2)) * 4;
+    const unsigned char* q = gStampMap + (size_t)i * STAMP_W * STAMP_H * 4 + ((size_t)row * STAMP_W + (size_t)column) * 4;
     return q[0] > 127 || q[1] > 127 || q[2] > 127;
 }
 static int stampDecode(int i) {
@@ -573,10 +573,10 @@ static int stampDecode(int i) {
     gStamp[i].scene = any ? scene : 0;
     gStamp[i].sceneA = words[0];
     gStamp[i].sceneB = words[1];
-    // Lane P's pose words (rows 7, 9, 11 and their complements); all-zero pairs read as none.
-    uint64_t pw[3] = {0, 0, 0};
+    // Lane P's pose words (rows 7, 9, 11, 13 and their complements); all-zero pairs read as none.
+    uint64_t pw[4] = {0, 0, 0, 0};
     int pose = 1, anyPose = 0;
-    for (int w = 0; w < 3 && pose == 1; w++)
+    for (int w = 0; w < 4 && pose == 1; w++)
         for (int bit = 0; bit < 64; bit++) {
             int one = stampBit(i, bit, 7 + 2 * w), other = stampBit(i, bit, 8 + 2 * w);
             anyPose |= one | other;
@@ -587,7 +587,7 @@ static int stampDecode(int i) {
             if (one) pw[w] |= 1ull << bit;
         }
     gStamp[i].pose = anyPose ? pose : 0;
-    for (int w = 0; w < 3; w++) gStamp[i].poseW[w] = pw[w];
+    for (int w = 0; w < 4; w++) gStamp[i].poseW[w] = pw[w];
     return 1;
 }
 
@@ -675,7 +675,7 @@ static int stampScene(int i, unsigned gen, uint64_t* a, uint64_t* b) {
 
 static int stampPose(int i, unsigned gen, uint64_t* words) {
     if (i < 0 || i >= STAMP_SLOTS || gStamp[i].gen != gen || !gStamp[i].decoded || gStamp[i].result != 1) return -1;
-    for (int w = 0; w < 3; w++) words[w] = gStamp[i].poseW[w];
+    for (int w = 0; w < 4; w++) words[w] = gStamp[i].poseW[w];
     return gStamp[i].pose;
 }
 

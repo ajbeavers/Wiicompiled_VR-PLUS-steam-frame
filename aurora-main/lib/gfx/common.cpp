@@ -380,12 +380,25 @@ static void note_eye_pose(uint32_t eye, const StereoReplayEye& view, const Stere
     scene.poseTime[eye] = frame.displayTimeNanos;
     scene.poseToken[eye] = frame.frameToken;
     scene.pose[eye] = view.viewFromCenter;
+    scene.projection[eye] = view.projection;
     return;
   }
   if (scene.poseTime[eye] != frame.displayTimeNanos || scene.poseToken[eye] != frame.frameToken ||
-      std::memcmp(&scene.pose[eye], &view.viewFromCenter, sizeof(Mat3x4<float>)) != 0) {
+      std::memcmp(&scene.pose[eye], &view.viewFromCenter, sizeof(Mat3x4<float>)) != 0 ||
+      std::memcmp(&scene.projection[eye], &view.projection, sizeof(Mat4x4<float>)) != 0) {
     if (scene.poseMixed[eye] != UINT16_MAX) ++scene.poseMixed[eye];
   }
+}
+// The bytes the fill wrote for an eye's first range, at its offset in g_uniformBuffer (after write_stereo_uniform).
+static void note_eye_probe(uint32_t eye, uint32_t offset, std::span<const uint8_t> written) noexcept {
+  if (eye >= 2 || t_eyeScene.probed[eye]) return;
+  auto& scene = t_eyeScene;
+  const uint32_t size = static_cast<uint32_t>(std::min<size_t>(written.size(), scene.probeBytes[eye].size())) & ~3u;
+  if (size == 0 || (offset & 3u) != 0) return;
+  scene.probed[eye] = true;
+  scene.probeOffset[eye] = offset;
+  scene.probeSize[eye] = size;
+  std::memcpy(scene.probeBytes[eye].data(), written.data(), size);
 }
 static void count_eye_scene(uint16_t& counter) noexcept {
   if (counter != UINT16_MAX) ++counter;
@@ -1026,7 +1039,9 @@ void initialize() {
     };
     out = g_device.CreateBuffer(&descriptor);
   };
-  createBuffer(g_uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
+  // CopySrc: lane P's uniform probe reads eye ranges back after a set's eyes (aurora.cpp UniformProbe).
+  createBuffer(g_uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc,
+               UniformBufferSize,
                "Shared Uniform Buffer");
   createBuffer(g_vertexBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, VertexBufferSize,
                "Shared Vertex Buffer");
@@ -2000,6 +2015,7 @@ static bool prepare_stereo_replay_uniforms(const StereoReplayFrame& stereoFrame,
         write_stereo_uniform({eyeUniform.data(), range.size}, layout, eye, gameProjection, drawViewport, uniformRegion,
                              hudScreen, false, drawScissor, clipOffset);
         std::memcpy(uniform.data(), eyeUniform.data(), range.size);
+        if (layout.perspective) note_eye_probe(eyeIndex, range.offset, {eyeUniform.data(), range.size});
       }
     }
   }
@@ -2628,6 +2644,8 @@ bool prepare_late_stereo_replay(SealedFrame& frame, wgpu::CommandEncoder& cmd, c
       write_stereo_uniform({bytes + saved.eyes[eye].offset - data.uploadOffset, saved.eyes[eye].size}, layout,
                            stereoFrame.eyes[eye], projection, saved.viewport, saved.displayRegion, data.hudScreen,
                            stereoFrame.interpolateInAnchor, saved.scissor, saved.clipOffset);
+      if (layout.perspective)
+        note_eye_probe(eye, saved.eyes[eye].offset, {bytes + saved.eyes[eye].offset - data.uploadOffset, saved.eyes[eye].size});
       if (layout.perspective && eye < 2) count_eye_scene(interpolated ? scene.interpolated[eye] : scene.current[eye]);
     }
   }

@@ -59,7 +59,10 @@ Lane G additions:
   display time an eye set was located for and the eye into a 256x12 pixel block of each eye image;
   the mock copies the block out at every release and, for every projection layer, compares it with
   the locate the layer's poses came from ("xrmock: stamps" line; a mismatch is an ERROR). This is
-  the exact check that a shown image and the poses submitted with it belong together.
+  the exact check that a shown image and the poses submitted with it belong together. Lane P: the
+  block is 64x15 pixels, one pixel a bit, and also carries per eye the packet, eye orientation and
+  frustum that eye's uniform fill wrote; "xrmock: pose stamps" compares them with the layer's
+  submitted pose and field of view and the two eyes of a set with each other (any difference is an ERROR).
 - `MOCK_XR_PREDICT_JITTER=<ms>`: predictedDisplayTime off its refresh by up to +-ms (deterministic);
   an app that ends a layer with another display time than its poses were located for shows up as
   "for an earlier one / a later one" in the summary.

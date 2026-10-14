@@ -25,6 +25,7 @@ int AuroraDawnVulkanDrain(void* handle);
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -32,26 +33,30 @@ int AuroraDawnVulkanDrain(void* handle);
 namespace aurora::vulkan_win32 {
 namespace {
 Module Log("aurora::vulkan_win32");
-// KARTFRAME_FRAME_STAMP=1 (tests only): each eye image gets a 256x12 pixel block in its top left
+// KARTFRAME_FRAME_STAMP=1 (tests only): each eye image gets a 64x15 pixel block in its top left
 // corner naming the display time its poses were located for and the eye, written after the eye
 // copy. The mock runtime (MOCK_XR_STAMP) reads it back from the image a projection layer submits
-// and compares it with the locate the layer's poses came from. Layout, 4x4 pixel cells, white = 1:
+// and compares it with the locate the layer's poses came from. Layout, one pixel a cell, white = 1:
 // row 0 the 64 bits of the display time (steady clock ns, bit 0 first), row 1 their complement,
 // row 2: cell 0 the eye (1 = right), cell 1 its complement, cells 2-5 the marker 1 0 1 0.
 // Lane L, the scene state this eye's draws used (stereo::EyeScene), rows 3 and 5 two 64-bit words, rows 4
-// and 6 their complements (the block is 256x28 pixels):
+// and 6 their complements:
 // row 3: bits 0-15 weight x 65535, 16-31 previous game frame (low 16 bits), 32-47 current game frame,
 //        48 valid, 49 late (filled at the set's sample time), 50 anchored, 51 continuous, 56-63 set (low 8);
 // row 5: perspective draws filled from the pair (bits 0-15), filled current-only (16-31), drawn with the
 //        recorded uniform (32-47), drawn with a range outside this set's fill (48-63).
 // Lane P, the head pose this eye's uniform fill wrote (stereo::EyeScene::pose*), rows 7, 9 and 11 three
-// 64-bit words, rows 8, 10 and 12 their complements (the block is 256x52 pixels):
+// 64-bit words, rows 8, 10 and 12 their complements:
 // row 7: the display time (steady ns) of the packet whose eye transform the fill wrote (0: none);
 // row 9: the eye's orientation recovered from that transform, x, y, z, w as signed 16-bit (x 32767);
 // row 11: bits 0-15 draws of this eye filled with another packet or transform, 16-47 the packet's token
-//         (low 32 bits), 48 a pose was recorded.
-constexpr uint32_t kStampCell = 4;
-constexpr uint32_t kStampRows = 13;
+//         (low 32 bits), 48 a pose was recorded;
+// row 13: the tangents of that fill's eye frustum, left, right, down, up as signed 16-bit (x 8192); row 14
+//         its complement.
+// Lane P: one pixel a cell (the block is 64x15 pixels; it was 4x4-pixel cells, 256x28, before): the mock
+// reads the image raw, and the smaller block keeps the test stamp's cost out of the frame's timing.
+constexpr uint32_t kStampCell = 1;
+constexpr uint32_t kStampRows = 15;
 std::array<uint64_t, 2> SceneWords(const stereo::EyeScene& scene) {
   if (!scene.valid) return {0, 0};
   const uint64_t weight = static_cast<uint64_t>(std::lround(std::clamp(scene.weight, 0.f, 1.f) * 65535.f));
@@ -63,15 +68,20 @@ std::array<uint64_t, 2> SceneWords(const stereo::EyeScene& scene) {
                      (static_cast<uint64_t>(scene.recorded) << 32) | (static_cast<uint64_t>(scene.outside) << 48);
   return {a, b};
 }
-std::array<uint64_t, 3> PoseWords(const stereo::EyeScene& scene) {
-  if (!scene.valid || scene.poseTime == 0) return {0, 0, 0};
+std::array<uint64_t, 4> PoseWords(const stereo::EyeScene& scene) {
+  if (!scene.valid || scene.poseTime == 0) return {0, 0, 0, 0};
   uint64_t q = 0;
   for (uint32_t k = 0; k < 4; ++k) {
     const auto v = static_cast<int16_t>(std::lround(std::clamp(scene.poseOrientation[k], -1.f, 1.f) * 32767.f));
     q |= static_cast<uint64_t>(static_cast<uint16_t>(v)) << (16 * k);
   }
   const uint64_t e = static_cast<uint64_t>(scene.poseMixed) | ((scene.poseToken & 0xffffffffull) << 16) | (1ull << 48);
-  return {scene.poseTime, q, e};
+  uint64_t t = 0;
+  for (uint32_t k = 0; k < 4; ++k) {
+    const auto v = static_cast<int16_t>(std::lround(std::clamp(scene.poseTangents[k], -3.99f, 3.99f) * 8192.f));
+    t |= static_cast<uint64_t>(static_cast<uint16_t>(v)) << (16 * k);
+  }
+  return {scene.poseTime, q, e, t};
 }
 bool StampEnabled() {
   static const bool enabled = [] {
@@ -82,7 +92,7 @@ bool StampEnabled() {
 }
 // The whole block is built on the CPU and written into a small texture per eye (queue.WriteTexture runs
 // before this set's submission and after the last one's, so reusing it per eye is safe), then copied into
-// the eye image with one copy (the 4x4 cell copies of the first version were 400 commands a set).
+// the eye image with one copy. One pixel a bit (lane P; 4x4 cells before): 64x15 pixels, 3.8 KB an eye.
 void WriteStamp(wgpu::CommandEncoder& encoder, const wgpu::Texture& target, wgpu::TextureFormat format, uint64_t value,
                 uint32_t eye, const stereo::EyeScene& scene) {
   constexpr uint32_t kWidth = 64 * kStampCell, kHeight = kStampRows * kStampCell;
@@ -101,8 +111,7 @@ void WriteStamp(wgpu::CommandEncoder& encoder, const wgpu::Texture& target, wgpu
     blocks[slot] = webgpu::g_device.CreateTexture(&descriptor);
     blockFormats[slot] = format;
   }
-  static std::vector<uint8_t> pixels;
-  pixels.assign(static_cast<size_t>(kWidth) * kHeight * 4, 0);
+  std::array<uint8_t, size_t{kWidth} * kHeight * 4> pixels;
   const auto cell = [&](uint32_t column, uint32_t row, bool one) {
     for (uint32_t y = 0; y < kStampCell; ++y)
       for (uint32_t x = 0; x < kStampCell; ++x) {
@@ -111,30 +120,21 @@ void WriteStamp(wgpu::CommandEncoder& encoder, const wgpu::Texture& target, wgpu
         p[3] = 255;
       }
   };
-  for (uint32_t bit = 0; bit < 64; ++bit) {
-    const bool one = ((value >> bit) & 1u) != 0;
-    cell(bit, 0, one);
-    cell(bit, 1, !one);
-  }
-  cell(0, 2, eye == 1);
-  cell(1, 2, eye != 1);
-  for (uint32_t k = 0; k < 4; ++k) cell(2 + k, 2, (k & 1u) == 0);
+  const auto word = [&](uint32_t row, uint64_t bits) {
+    for (uint32_t bit = 0; bit < 64; ++bit) {
+      const bool one = ((bits >> bit) & 1u) != 0;
+      cell(bit, row, one);
+      cell(bit, row + 1, !one);
+    }
+  };
+  word(0, value);
+  for (uint32_t column = 0; column < 64; ++column)
+    cell(column, 2, column == 0 ? eye == 1 : column == 1 ? eye != 1 : column < 6 ? ((column - 2) & 1u) == 0 : false);
   const auto words = SceneWords(scene);
-  for (uint32_t word = 0; word < 2; ++word) {
-    for (uint32_t bit = 0; bit < 64; ++bit) {
-      const bool one = ((words[word] >> bit) & 1u) != 0;
-      cell(bit, 3 + 2 * word, one);
-      cell(bit, 4 + 2 * word, !one);
-    }
-  }
+  word(3, words[0]);
+  word(5, words[1]);
   const auto pose = PoseWords(scene);
-  for (uint32_t word = 0; word < 3; ++word) {
-    for (uint32_t bit = 0; bit < 64; ++bit) {
-      const bool one = ((pose[word] >> bit) & 1u) != 0;
-      cell(bit, 7 + 2 * word, one);
-      cell(bit, 8 + 2 * word, !one);
-    }
-  }
+  for (uint32_t k = 0; k < pose.size(); ++k) word(7 + 2 * k, pose[k]);
   const wgpu::TexelCopyTextureInfo block{.texture = blocks[slot]};
   const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = kWidth * 4, .rowsPerImage = kHeight};
   webgpu::g_queue.WriteTexture(&block, pixels.data(), pixels.size(), &layout, &size);

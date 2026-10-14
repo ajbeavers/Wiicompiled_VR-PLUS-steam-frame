@@ -52,7 +52,10 @@
 //   MOCK_XR_STAMP=1           Vulkan, with KARTFRAME_FRAME_STAMP=1 in the app: every eye image a
 //                             projection layer submits carries the display time its poses were
 //                             located for (a block in its corner); compared with the locate the
-//                             layer's poses came from (summary line "stamps")
+//                             layer's poses came from (summary line "stamps"); lane P: plus the
+//                             packet, eye orientation and frustum each eye's uniform fill wrote,
+//                             against the layer's submitted pose and fov and the other eye (lines
+//                             "pose stamps")
 //   MOCK_XR_PREDICT_JITTER=<ms>  predictedDisplayTime is off its refresh by up to +-<ms> (uniform,
 //                             at most 3; default 0.02, SteamVR's on the Frame in the third headset
 //                             session), as SteamVR's prediction is not always exactly one period
@@ -460,6 +463,7 @@ static struct {
     unsigned gen;
     XrTime expect;  // the time the layer's poses were located for
     XrQuaternionf sub;  // lane P: the orientation the layer submitted for this eye
+    XrFovf fov;         // and its field of view
 } gStampPending[STAMP_PENDING];
 static int gStampPendingCount = 0;
 static int gStampChecked = 0, gStampMatch = 0, gStampOther = 0, gStampOtherEye = 0, gStampNone = 0, gStampLost = 0, gStampUnknownPose = 0;
@@ -498,6 +502,7 @@ typedef struct {
     uint64_t value, poseTime;
     uint32_t token;
     int eye, mixed;
+    int fovOff;      // the eye frustum's tangents not the submitted field of view's
     double err;      // degrees between the stamped and the submitted eye orientation
     double offRefr;  // that error in refreshes of the mock's head motion at the submitted time (0: none)
 } PoseRec;
@@ -506,15 +511,17 @@ static int gPoseN = 0, gPoseCap = 0;
 static int gPoseImages = 0, gPoseAbsent = 0, gPoseBroken = 0, gPoseTimeOff = 0, gPoseMixedImages = 0;
 static int gPoseErrHist[4];  // <0.01 deg, 0.01-0.1, 0.1-1, >=1
 static int gPoseSlow = 0;    // images at the sway's turning points (motion under 0.02 deg a refresh)
+static int gPoseFovOff = 0, gPoseFovOther = 0;  // frustum not the submitted fov; of those, the other eye's fov
+static double gPoseFovWorst = 0;
 static float headYawAt(XrTime t) {
     float yaw;
     XrPosef pose;
     headPose(t, &yaw, &pose);
     return yaw;
 }
-static void poseAdd(uint64_t value, int eye, int slot, unsigned gen, XrQuaternionf sub, XrTime expect, int fresh) {
+static void poseAdd(uint64_t value, int eye, int slot, unsigned gen, XrQuaternionf sub, XrFovf fov, XrTime expect, int fresh) {
     if (!gGfx->stamp_pose) return;
-    uint64_t w[3] = {0, 0, 0};
+    uint64_t w[4] = {0, 0, 0, 0};
     int r = gGfx->stamp_pose(slot, gen, w);
     if (r < 0) {
         gPoseBroken++;
@@ -554,6 +561,24 @@ static void poseAdd(uint64_t value, int eye, int slot, unsigned gen, XrQuaternio
     gPoseErrHist[err < 0.01 ? 0 : err < 0.1 ? 1 : err < 1.0 ? 2 : 3]++;
     int mixed = (int)(w[2] & 0xffff);
     if (mixed) gPoseMixedImages++;
+    // The eye frustum: tangents left, right, down, up (x 8192) against the submitted field of view, and
+    // against the other eye's (the mock's right eye mirrors the left: left/right swapped and negated).
+    const double want[4] = {tan(fov.angleLeft), tan(fov.angleRight), tan(fov.angleDown), tan(fov.angleUp)};
+    const double other[4] = {-want[1], -want[0], want[2], want[3]};
+    double worst = 0, worstOther = 0;
+    for (int k = 0; k < 4; k++) {
+        double t = (double)(int16_t)(uint16_t)((w[3] >> (16 * k)) & 0xffff) / 8192.0;
+        worst = fmax(worst, fabs(t - want[k]));
+        worstOther = fmax(worstOther, fabs(t - other[k]));
+    }
+    int fovOff = worst > 2.0 / 8192.0;
+    if (worst > gPoseFovWorst) gPoseFovWorst = worst;
+    if (fovOff) {
+        gPoseFovOff++;
+        if (worstOther <= 2.0 / 8192.0) gPoseFovOther++;
+        if (gPoseFovOff <= 10) trace("ERROR pose: eye %d image filled with a frustum %.5f off the submitted field of view", eye, worst);
+        gErrors++;
+    }
     int64_t dt = (int64_t)w[0] - (int64_t)(expect - gTimeOffset);
     if (dt <= -200000 || dt >= 200000) gPoseTimeOff++;
     if (err >= 0.01 || mixed || dt <= -200000 || dt >= 200000) {
@@ -570,7 +595,7 @@ static void poseAdd(uint64_t value, int eye, int slot, unsigned gen, XrQuaternio
         gPoseCap = gPoseCap ? 2 * gPoseCap : 4096;
         gPose = (PoseRec*)realloc(gPose, (size_t)gPoseCap * sizeof(PoseRec));
     }
-    gPose[gPoseN++] = (PoseRec){value, w[0], (uint32_t)((w[2] >> 16) & 0xffffffffu), eye, mixed, err, off};
+    gPose[gPoseN++] = (PoseRec){value, w[0], (uint32_t)((w[2] >> 16) & 0xffffffffu), eye, mixed, fovOff, err, off};
 }
 static int poseCmp(const void* x, const void* y) {
     const PoseRec* p = (const PoseRec*)x;
@@ -583,9 +608,9 @@ static void poseReport(void) {
     fprintf(stderr,
             "xrmock: pose stamps: %d eye images with the pose their fill wrote (%d without, %d broken): against the submitted eye pose "
             "<0.01 deg %d, 0.01-0.1 %d, 0.1-1 %d, >=1 %d; packet time not the layer's locate %d; with mixed draws %d; at the sway's turning "
-            "points %d\n",
+            "points %d; eye frustum not the submitted field of view %d (the other eye's %d; worst tangent error %.5f)\n",
             gPoseImages, gPoseAbsent, gPoseBroken, gPoseErrHist[0], gPoseErrHist[1], gPoseErrHist[2], gPoseErrHist[3], gPoseTimeOff,
-            gPoseMixedImages, gPoseSlow);
+            gPoseMixedImages, gPoseSlow, gPoseFovOff, gPoseFovOther, gPoseFovWorst);
     if (!gPoseN) return;
     qsort(gPose, (size_t)gPoseN, sizeof(PoseRec), poseCmp);
     int sets = 0, diffPacket = 0, rightOff = 0, leftOff = 0, bothOff = 0, single = 0;
@@ -606,7 +631,7 @@ static void poseReport(void) {
         }
         sets++;
         int dp = l->poseTime != r->poseTime || l->token != r->token;
-        int lo = l->err >= 0.01 || l->mixed, ro = r->err >= 0.01 || r->mixed;
+        int lo = l->err >= 0.01 || l->mixed || l->fovOff, ro = r->err >= 0.01 || r->mixed || r->fovOff;
         diffPacket += dp;
         leftOff += lo && !ro;
         rightOff += ro && !lo;
@@ -785,8 +810,8 @@ static void stampPoll(int wait) {
             if (sameTime && eye == gStampPending[i].eye) {
                 gStampMatch++;
                 if (gStampPending[i].fresh) sceneAdd(value, eye, gStampPending[i].slot, gStampPending[i].gen);
-                poseAdd(value, eye, gStampPending[i].slot, gStampPending[i].gen, gStampPending[i].sub, gStampPending[i].expect,
-                        gStampPending[i].fresh);
+                poseAdd(value, eye, gStampPending[i].slot, gStampPending[i].gen, gStampPending[i].sub, gStampPending[i].fov,
+                        gStampPending[i].expect, gStampPending[i].fresh);
             }
             else if (sameTime) {
                 gStampOtherEye++;
@@ -1301,6 +1326,20 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
     }
     int64_t wake = gT0 + (int64_t)gWaits * gPeriod;
     gWaitWakeSched = wake;
+    // Lane P: the mock's own bookkeeping (stamp read-backs, the compositor model, the release snapshots)
+    // runs before the sleep, not after the wake-up: SteamVR returns at the wake-up, and work here was
+    // counted in "end after wake-up" (the larger test stamp's decoding alone moved it by 2 %).
+    if (gStampOn && gGfx && gGfx->stamp_read) stampPoll(0);
+    compResolve(0);
+    if (gGfx && gGfx->poll_snapshots) {
+        int changed = gGfx->poll_snapshots(0);
+        for (int k = 0; k < changed; k++) {
+            trace("ERROR an image changed after its release: released before the GPU finished");
+            gErrors++;
+            gBusyReleases++;
+        }
+    }
+    now = nowNs();
     if (wake > now) {
         struct timespec ts = {(time_t)((wake - now) / 1000000000ll), (long)((wake - now) % 1000000000ll)};
         nanosleep(&ts, NULL);
@@ -1325,16 +1364,6 @@ static XrResult XRAPI_CALL mWaitFrame(XrSession s, const XrFrameWaitInfo* wi, Xr
     gLastWakeNs = nowNs();
     gDetailWake = wake;
     trace("waitFrame");
-    if (gStampOn && gGfx && gGfx->stamp_read) stampPoll(0);
-    compResolve(0);
-    if (gGfx && gGfx->poll_snapshots) {
-        int changed = gGfx->poll_snapshots(0);
-        for (int k = 0; k < changed; k++) {
-            trace("ERROR an image changed after its release: released before the GPU finished");
-            gErrors++;
-            gBusyReleases++;
-        }
-    }
     return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL mBeginFrame(XrSession s, const XrFrameBeginInfo* bi) {
@@ -1384,6 +1413,7 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
                         gStampPending[gStampPendingCount].fresh = fresh;
                         gStampPending[gStampPendingCount].expect = locateTime(located);
                         gStampPending[gStampPendingCount].sub = p->views[v].pose.orientation;
+                        gStampPending[gStampPendingCount].fov = p->views[v].fov;
                         gStampPendingCount++;
                     } else
                         gStampLost++;

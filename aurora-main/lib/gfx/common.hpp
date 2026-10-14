@@ -401,7 +401,13 @@ struct EyeSceneRecord {
   std::array<bool, 2> posed{};
   std::array<uint64_t, 2> poseTime{}, poseToken{};
   std::array<Mat3x4<float>, 2> pose{};
+  std::array<Mat4x4<float>, 2> projection{};  // the eye's frustum (StereoReplayEye::projection) of that draw
   std::array<uint16_t, 2> poseMixed{};
+  // The GPU uniform probe (aurora.cpp UniformProbe): per eye, the first filled range's offset in
+  // g_uniformBuffer and the first bytes the fill wrote there, read back after the set's eyes.
+  std::array<bool, 2> probed{};
+  std::array<uint32_t, 2> probeOffset{}, probeSize{};
+  std::array<std::array<uint8_t, 64>, 2> probeBytes{};
 };
 EyeSceneRecord& eye_scene_record() noexcept;
 

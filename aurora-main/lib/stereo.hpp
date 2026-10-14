@@ -32,6 +32,8 @@ struct EyeScene {
   uint64_t poseTime = 0;
   uint64_t poseToken = 0;
   std::array<float, 4> poseOrientation{0.f, 0.f, 0.f, 1.f};
+  // The tangents of the eye frustum that fill used: left, right, down, up.
+  std::array<float, 4> poseTangents{};
   uint16_t poseMixed = 0;
 };
 

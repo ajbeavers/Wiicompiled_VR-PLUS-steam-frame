@@ -56,8 +56,8 @@ typedef struct MockGfx {
     // Lane L: the slot's scene words (rows 3 and 5 of the block; see the app's vulkan_win32_interop.cpp)
     // once stamp_read returned 1: 1 both words valid, 0 none written (an older app), -1 broken.
     int (*stamp_scene)(int slot, unsigned gen, uint64_t* sceneA, uint64_t* sceneB);
-    // Lane P: the slot's pose words (rows 7, 9, 11: the packet time, the eye orientation, token and mixed
-    // draws), same returns as stamp_scene.
+    // Lane P: the slot's four pose words (rows 7, 9, 11, 13: the packet time, the eye orientation, token and
+    // mixed draws, the eye frustum's tangents), same returns as stamp_scene.
     int (*stamp_pose)(int slot, unsigned gen, uint64_t* words);
 } MockGfx;
 

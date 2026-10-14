@@ -1174,7 +1174,8 @@ struct PendingStereoSink {
 // frame stamp) and, with KARTFRAME_FRAME_LOG=1, one line per set:
 // XRS t=<display time, steady ms> s=<set> f=<previous>/<current game frame> w=<weight> late=<0 seal fill, 1
 // sample-time fill> L=<interpolated>/<current>/<recorded>/<outside> R=<same> (perspective draws: filled from the
-// pair, filled current-only, drawn with the recorded uniform, drawn with a range outside this set's fill).
+// pair, filled current-only, drawn with the recorded uniform, drawn with a range outside this set's fill),
+// then lane P's XRP fields (in take_eye_scene).
 // Lane P: an eye's orientation (x, y, z, w) from the view transform written into its uniforms: the view
 // rotation is the inverse of the eye's orientation (lean aside), so this is the conjugate of its quaternion.
 std::array<float, 4> eye_orientation(const Mat3x4<float>& view) noexcept {
@@ -1200,7 +1201,109 @@ std::array<float, 4> eye_orientation(const Mat3x4<float>& view) noexcept {
   return {-x * sign, -y * sign, -z * sign, w * sign};
 }
 
-void take_eye_scene(stereo::SinkFrame& frame) noexcept {
+// Lane P: the GPU uniform probe. Every refresh set of one game frame rewrites the same g_uniformBuffer region
+// (the sealed frame's eye ranges) at its start; the eye draws read it. If a set's draws could ever see the
+// next set's bytes (its copy overlapping them on the GPU), the right eye, drawn last, would be rendered with
+// the next set's head pose. After both eyes of a set, each eye's first filled range is copied back and
+// compared with the bytes the fill wrote. On with KARTFRAME_FRAME_LOG=1 or KARTFRAME_UNIFORM_PROBE=1; the
+// counts go into the "VR eye poses" line. Frame worker, except the map callback.
+class UniformProbe {
+public:
+  static bool enabled() noexcept {
+    static const bool on = [] {
+      const char* probe = std::getenv("KARTFRAME_UNIFORM_PROBE");
+      if (probe != nullptr && *probe != '\0') return probe[0] == '1';
+      const char* log = std::getenv("KARTFRAME_FRAME_LOG");
+      return log != nullptr && log[0] == '1';
+    }();
+    return on;
+  }
+  // Records the copies for this set (after its eyes, in its encoder). The slot is mapped on the next call,
+  // when this set's command buffer has been submitted.
+  void record(wgpu::CommandEncoder& encoder, const gfx::EyeSceneRecord& scene) noexcept {
+    request_maps();
+    if (!scene.probed[0] || !scene.probed[1] || !gfx::g_uniformBuffer) return;
+    Slot* free = nullptr;
+    {
+      std::lock_guard lock(mutex_);
+      for (auto& slot : slots_) {
+        if (slot.state == State::Mapped) {
+          slot.readback.Unmap();
+          slot.state = State::Free;
+        }
+        if (slot.state == State::Free && free == nullptr) free = &slot;
+      }
+      if (free == nullptr) {
+        ++skipped_;
+        return;
+      }
+      free->state = State::Recorded;
+    }
+    if (!free->readback) {
+      const wgpu::BufferDescriptor descriptor{.label = "Eye uniform probe",
+                                              .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                              .size = 2 * kBytes};
+      free->readback = g_device.CreateBuffer(&descriptor);
+    }
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+      free->size[eye] = scene.probeSize[eye];
+      free->expected[eye] = scene.probeBytes[eye];
+      encoder.CopyBufferToBuffer(gfx::g_uniformBuffer, scene.probeOffset[eye], free->readback, eye * kBytes,
+                                 scene.probeSize[eye]);
+    }
+  }
+  // Read back so far: sets, sets whose left / right eye range differed from what its fill wrote; resets.
+  std::array<uint32_t, 4> take() noexcept {
+    std::lock_guard lock(mutex_);
+    const std::array<uint32_t, 4> out{checked_, differs_[0], differs_[1], skipped_};
+    checked_ = differs_[0] = differs_[1] = skipped_ = 0;
+    return out;
+  }
+
+private:
+  static constexpr uint64_t kBytes = 64;
+  enum class State { Free, Recorded, Mapping, Mapped };
+  struct Slot {
+    wgpu::Buffer readback;
+    State state = State::Free;
+    std::array<uint32_t, 2> size{};
+    std::array<std::array<uint8_t, 64>, 2> expected{};
+  };
+  void request_maps() noexcept {
+    for (size_t i = 0; i < slots_.size(); ++i) {
+      {
+        std::lock_guard lock(mutex_);
+        if (slots_[i].state != State::Recorded) continue;
+        slots_[i].state = State::Mapping;
+      }
+      slots_[i].readback.MapAsync(
+          wgpu::MapMode::Read, 0, 2 * kBytes, wgpu::CallbackMode::AllowSpontaneous,
+          [this, i](wgpu::MapAsyncStatus status, wgpu::StringView) {
+            auto& slot = slots_[i];
+            std::lock_guard lock(mutex_);
+            if (status != wgpu::MapAsyncStatus::Success) {
+              slot.state = State::Free;
+              return;
+            }
+            const auto* bytes = static_cast<const uint8_t*>(slot.readback.GetConstMappedRange(0, 2 * kBytes));
+            if (bytes != nullptr) {
+              ++checked_;
+              for (uint32_t eye = 0; eye < 2; ++eye) {
+                if (std::memcmp(bytes + eye * kBytes, slot.expected[eye].data(), slot.size[eye]) != 0) ++differs_[eye];
+              }
+            }
+            slot.state = State::Mapped;
+          });
+    }
+  }
+  std::mutex mutex_;
+  std::array<Slot, 8> slots_{};
+  uint32_t checked_ = 0, skipped_ = 0;
+  std::array<uint32_t, 2> differs_{};
+};
+UniformProbe g_uniformProbe;
+
+void take_eye_scene(stereo::SinkFrame& frame, wgpu::CommandEncoder& encoder) noexcept {
   static uint32_t sets = 0;
   auto& record = gfx::eye_scene_record();
   if (frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && record.valid) {
@@ -1215,6 +1318,10 @@ void take_eye_scene(stereo::SinkFrame& frame) noexcept {
         frame.scene[eye].poseTime = record.poseTime[eye];
         frame.scene[eye].poseToken = record.poseToken[eye];
         frame.scene[eye].poseOrientation = eye_orientation(record.pose[eye]);
+        float projection[16];
+        std::memcpy(projection, &record.projection[eye], sizeof(projection));
+        const auto fov = gfx::foveation::fov_from_projection(projection);
+        frame.scene[eye].poseTangents = {fov.tanLeft, fov.tanRight, fov.tanDown, fov.tanUp};
         frame.scene[eye].poseMixed = record.poseMixed[eye];
       }
     }
@@ -1226,6 +1333,7 @@ void take_eye_scene(stereo::SinkFrame& frame) noexcept {
       static uint32_t checked = 0, split = 0, foreign = 0, mixed = 0;
       static auto since = std::chrono::steady_clock::now();
       const auto& l = record;
+      if (UniformProbe::enabled()) g_uniformProbe.record(encoder, record);
       if (l.posed[0] && l.posed[1]) {
         ++checked;
         split += l.poseTime[0] != l.poseTime[1] || l.poseToken[0] != l.poseToken[1] ? 1 : 0;
@@ -1239,6 +1347,12 @@ void take_eye_scene(stereo::SinkFrame& frame) noexcept {
         Log.info("VR eye poses (10 s): {} sets, eyes from different packets {}, an eye not from the set's packet {}, "
                  "an eye filled with more than one transform {}",
                  checked, split, foreign, mixed);
+        if (UniformProbe::enabled()) {
+          const auto probe = g_uniformProbe.take();
+          Log.info("VR eye uniform probe (10 s): {} sets read back after their eyes, left eye's range not what its "
+                   "fill wrote {}, right eye's {} ({} sets not probed: no free slot)",
+                   probe[0], probe[1], probe[2], probe[3]);
+        }
         checked = split = foreign = mixed = 0;
         since = now;
       }
@@ -1250,21 +1364,20 @@ void take_eye_scene(stereo::SinkFrame& frame) noexcept {
     if (logSets) {
       const auto& l = frame.scene[0];
       const auto& r = frame.scene[1];
-      Log.info("XRS t={:.3f} s={} f={}/{} w={:.4f} late={} L={}/{}/{}/{} R={}/{}/{}/{}",
-               static_cast<double>(frame.displayTimeNanos) / 1e6, sets, l.previousFrame, l.currentFrame, l.weight,
-               l.late ? 1 : 0, l.interpolated, l.current, l.recorded, l.outside, r.interpolated, r.current, r.recorded,
-               r.outside);
-      // Lane P: the packet and head pose each eye's uniform fill used (XRP t=<set's display time, steady ms>
-      // tL/tR=<packet time per eye, ms> kL/kR=<packet token> yL/yR=<eye yaw, degrees> mL/mR=<draws filled
-      // with another packet or transform> same=<1 both eyes from one packet>).
+      // Lane P, on the same line (one log call per set): the packet and head pose each eye's uniform fill used.
+      // XRP tL/tR=<packet display time per eye, ms> kL/kR=<packet token> yL/yR=<eye yaw, degrees> mL/mR=<draws
+      // filled with another packet or transform> same=<1: both eyes from the set's own packet>.
       const auto yaw = [](const stereo::EyeScene& e) {
         const auto& q = e.poseOrientation;
         return std::atan2(2.f * (q[3] * q[1] + q[0] * q[2]), 1.f - 2.f * (q[1] * q[1] + q[0] * q[0])) * 57.29578f;
       };
-      Log.info("XRP t={:.3f} tL={:.3f} tR={:.3f} kL={} kR={} yL={:.4f} yR={:.4f} mL={} mR={} same={}",
-               static_cast<double>(frame.displayTimeNanos) / 1e6, static_cast<double>(l.poseTime) / 1e6,
-               static_cast<double>(r.poseTime) / 1e6, l.poseToken, r.poseToken, yaw(l), yaw(r), l.poseMixed,
-               r.poseMixed, l.poseTime == r.poseTime && l.poseToken == r.poseToken ? 1 : 0);
+      Log.info("XRS t={:.3f} s={} f={}/{} w={:.4f} late={} L={}/{}/{}/{} R={}/{}/{}/{} XRP tL={:.3f} tR={:.3f} kL={} kR={} "
+               "yL={:.4f} yR={:.4f} mL={} mR={} same={}",
+               static_cast<double>(frame.displayTimeNanos) / 1e6, sets, l.previousFrame, l.currentFrame, l.weight,
+               l.late ? 1 : 0, l.interpolated, l.current, l.recorded, l.outside, r.interpolated, r.current, r.recorded,
+               r.outside, static_cast<double>(l.poseTime) / 1e6, static_cast<double>(r.poseTime) / 1e6, l.poseToken,
+               r.poseToken, yaw(l), yaw(r), l.poseMixed, r.poseMixed,
+               l.poseTime == r.poseTime && l.poseToken == r.poseToken && l.poseTime == frame.displayTimeNanos ? 1 : 0);
     }
   }
   record = {};
@@ -1289,7 +1402,7 @@ std::optional<PendingStereoSink> run_stereo_sink(wgpu::CommandEncoder& encoder, 
       .retained = retained,
       .displayTimeNanos = displayTimeNanos,
   };
-  take_eye_scene(frame);
+  take_eye_scene(frame, encoder);
   const int orientation = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY ? webgpu::g_RaceOutputCopyMode : 0;
   const bool correction = mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY && webgpu::g_RaceOutputNeedsCopy;
   const auto directEyes = std::exchange(g_directEyes, {});
