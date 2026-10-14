@@ -454,6 +454,29 @@ static void nextTypes(const void* next, char* out, size_t n) {
 }
 // Frames by what they showed: a projection layer whose eye images were both released since
 // the last xrEndFrame (fresh), one shown again (repeat), none.
+// Lane Q: the layer list of every xrEndFrame by shape, one letter a layer in submission order: P a projection
+// with an image per eye, E one with both eyes packed in one image (the menu environment), Q a quad, O other.
+#define LAYER_SHAPES 12
+static struct {
+    char shape[9];
+    int count;
+} gLayerShapes[LAYER_SHAPES];
+static int gLayerShapesOther = 0;
+static int gQuadNeverReleased = 0;  // quad layers on a swapchain with no image released yet
+static void noteLayerShape(const char* shape) {
+    for (int i = 0; i < LAYER_SHAPES; i++) {
+        if (gLayerShapes[i].count && strcmp(gLayerShapes[i].shape, shape) == 0) {
+            gLayerShapes[i].count++;
+            return;
+        }
+        if (!gLayerShapes[i].count) {
+            snprintf(gLayerShapes[i].shape, sizeof(gLayerShapes[i].shape), "%s", shape);
+            gLayerShapes[i].count = 1;
+            return;
+        }
+    }
+    gLayerShapesOther++;
+}
 static int gEnds = 0, gFreshSets = 0, gFreshSame = 0, gFreshEarlier = 0, gFreshLater = 0, gRepeatSets = 0, gQuadEnds = 0, gEmptyEnds = 0;
 // MOCK_XR_STAMP: eye images of submitted projection layers waiting for their stamp read-back.
 static int gStampOn = 0;
@@ -1243,6 +1266,18 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
             "xrmock: frames: %d ended; %d showed newly released eyes (from one locate for the display time submitted %d, for an earlier one %d, "
             "a later one %d), %d repeated a projection layer, %d a quad, %d no layer; focus blips %d\n",
             gEnds, gFreshSets, gFreshSame, gFreshEarlier, gFreshLater, gRepeatSets, gQuadEnds, gEmptyEnds, gBlips);
+    {
+        char shapes[512] = "";
+        for (int i = 0; i < LAYER_SHAPES && gLayerShapes[i].count; i++) {
+            char t[40];
+            snprintf(t, sizeof(t), "%s%s %d", i ? ", " : "", gLayerShapes[i].shape, gLayerShapes[i].count);
+            strcat(shapes, t);
+        }
+        fprintf(stderr,
+                "xrmock: layer lists per xrEndFrame (P projection, E packed projection, Q quad, - none): %s; other %d; quads on a "
+                "swapchain never released %d\n",
+                shapes, gLayerShapesOther, gQuadNeverReleased);
+    }
     if (gStampOn) {
         if (gGfx && gGfx->stamp_read) stampPoll(1);
         fprintf(stderr,
@@ -1378,6 +1413,7 @@ static XrResult XRAPI_CALL mBeginFrame(XrSession s, const XrFrameBeginInfo* bi) 
 static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
     (void)s;
     char buf[1024] = "";
+    char shape[9] = "";
     const XrCompositionLayerProjection* eyesLayer = NULL;
     int eyesLocated = -1;
     int layerLocated[16];
@@ -1385,6 +1421,14 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
     for (uint32_t i = 0; i < ei->layerCount; i++) {
         const XrCompositionLayerBaseHeader* l = ei->layers[i];
         char t[256];
+        if (i < 8) {
+            const XrCompositionLayerProjection* lp = (const XrCompositionLayerProjection*)l;
+            shape[i] = l->type == XR_TYPE_COMPOSITION_LAYER_QUAD ? 'Q'
+                       : l->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION ? 'O'
+                       : lp->viewCount == 2 && lp->views[0].subImage.swapchain == lp->views[1].subImage.swapchain ? 'E'
+                                                                                                                : 'P';
+            shape[i + 1] = 0;
+        }
         if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
             const XrCompositionLayerProjection* p = (const XrCompositionLayerProjection*)l;
             int fresh = p->viewCount == 2 && chainOf(p->views[0].subImage.swapchain)->released &&
@@ -1432,6 +1476,11 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
             strcat(buf, "]");
         } else if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
             const XrCompositionLayerQuad* q = (const XrCompositionLayerQuad*)l;
+            if (chainOf(q->subImage.swapchain)->lastRel < 0) {
+                gQuadNeverReleased++;
+                gErrors++;
+                trace("ERROR endFrame quad layer on swapchain sc%d with no image released yet", chainId(q->subImage.swapchain));
+            }
             snprintf(t, sizeof(t), " quad[sc%d:%dx%d eye=%d]", chainId(q->subImage.swapchain), q->subImage.imageRect.extent.width,
                      q->subImage.imageRect.extent.height, (int)q->eyeVisibility);
             strcat(buf, t);
@@ -1503,6 +1552,7 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
     }
     gBegunPredicted = 0;
     gEnds++;
+    noteLayerShape(ei->layerCount ? shape : "-");
     if (ei->layerCount == 0) gEmptyEnds++;
     else if (ei->layers[0]->type == XR_TYPE_COMPOSITION_LAYER_QUAD) gQuadEnds++;
     for (int k = 0; k < gChainCount; k++) gChains[k].released = 0;

@@ -239,6 +239,211 @@ private:
     std::array<int64_t, kRing> submit_ns_{};
 };
 
+// Lane Q: the bridge's own small command buffers on Dawn's queue (taken under Dawn's queue lock, like
+// GpuCompletion's signal): the first-write barrier before each set's writes (KARTFRAME_FIRST_WRITE_BARRIER)
+// and the one-time clear of the race quad's images (KARTFRAME_RACE_QUAD). Pacing thread only.
+class BridgeCommands {
+public:
+    ~BridgeCommands() { Stop(); }
+
+    bool Start(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, VkDevice device, uint32_t family,
+               uint32_t index) {
+        Stop();
+        if (!get_proc || !instance || !device) return false;
+        const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(get_proc(instance, "vkGetDeviceProcAddr"));
+        if (!gdpa) return false;
+#define KF_DEV(name) name##_ = reinterpret_cast<PFN_##name>(gdpa(device, #name))
+        KF_DEV(vkGetDeviceQueue);
+        KF_DEV(vkQueueSubmit);
+        KF_DEV(vkCreateCommandPool);
+        KF_DEV(vkDestroyCommandPool);
+        KF_DEV(vkAllocateCommandBuffers);
+        KF_DEV(vkBeginCommandBuffer);
+        KF_DEV(vkEndCommandBuffer);
+        KF_DEV(vkCmdPipelineBarrier);
+        KF_DEV(vkCmdClearColorImage);
+        KF_DEV(vkCreateFence);
+        KF_DEV(vkDestroyFence);
+        KF_DEV(vkWaitForFences);
+        KF_DEV(vkResetFences);
+#undef KF_DEV
+        if (!vkGetDeviceQueue_ || !vkQueueSubmit_ || !vkCreateCommandPool_ || !vkDestroyCommandPool_ ||
+            !vkAllocateCommandBuffers_ || !vkBeginCommandBuffer_ || !vkEndCommandBuffer_ || !vkCmdPipelineBarrier_ ||
+            !vkCmdClearColorImage_ || !vkCreateFence_ || !vkDestroyFence_ || !vkWaitForFences_ || !vkResetFences_)
+            return false;
+        device_ = device;
+        vkGetDeviceQueue_(device, family, index, &queue_);
+        VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pool_info.queueFamilyIndex = family;
+        if (!queue_ || vkCreateCommandPool_(device, &pool_info, nullptr, &pool_) != VK_SUCCESS) {
+            pool_ = VK_NULL_HANDLE;
+            return false;
+        }
+        VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        alloc.commandPool = pool_;
+        alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        alloc.commandBufferCount = kSlots;
+        bool ok = vkAllocateCommandBuffers_(device, &alloc, buffers_.data()) == VK_SUCCESS;
+        VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        for (auto& fence : fences_) ok = ok && vkCreateFence_(device, &fence_info, nullptr, &fence) == VK_SUCCESS;
+        if (!ok) Stop();
+        return ready_ = ok;
+    }
+
+    // After the queue drained (Shutdown).
+    void Stop() {
+        if (device_ && vkDestroyFence_)
+            for (auto& fence : fences_) {
+                if (fence) vkDestroyFence_(device_, fence, nullptr);
+                fence = VK_NULL_HANDLE;
+            }
+        if (device_ && pool_ && vkDestroyCommandPool_) vkDestroyCommandPool_(device_, pool_, nullptr);
+        pool_ = VK_NULL_HANDLE;
+        buffers_ = {};
+        ready_ = false;
+    }
+
+    bool Ready() const { return ready_; }
+
+    // GalaxyFrame's barrier at the first write of an image after xrWaitSwapchainImage (H9.md section 3):
+    // everything earlier on the queue (SteamVR's client's acquire work included) and all its memory writes
+    // before anything later reads or writes the images. Layout kept: COLOR_ATTACHMENT_OPTIMAL, as the
+    // runtime hands an acquired colour image over and as Dawn tracks it. Submitted on its own, before
+    // Aurora's set; a barrier's first scope is everything earlier in submission order on the queue.
+    bool FirstWriteBarrier(const VkImage* images, uint32_t count) {
+        VkCommandBuffer cb;
+        VkFence fence;
+        if (!ready_ || count == 0 || !Begin(cb, fence)) return false;
+        std::array<VkImageMemoryBarrier, 4> barriers{};
+        count = std::min<uint32_t>(count, static_cast<uint32_t>(barriers.size()));
+        for (uint32_t i = 0; i < count; ++i) {
+            auto& b = barriers[i];
+            b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = images[i];
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        }
+        vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                              nullptr, count, barriers.data());
+        return Submit(cb, fence);
+    }
+
+    // The race quad's image: cleared to transparent black, left COLOR_ATTACHMENT_OPTIMAL, and waited for.
+    bool ClearAndWait(VkImage image) {
+        VkCommandBuffer cb;
+        VkFence fence;
+        if (!ready_ || !Begin(cb, fence)) return false;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = range;
+        vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                              nullptr, 1, &b);
+        const VkClearColorValue clear{};  // 0, 0, 0, 0: fully transparent
+        vkCmdClearColorImage_(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                              nullptr, 1, &b);
+        return Submit(cb, fence) && vkWaitForFences_(device_, 1, &fence, VK_TRUE, 1'000'000'000ull) == VK_SUCCESS;
+    }
+
+private:
+    static constexpr uint32_t kSlots = 8;
+
+    bool Begin(VkCommandBuffer& cb, VkFence& fence) {
+        const uint32_t slot = next_++ % kSlots;
+        cb = buffers_[slot];
+        fence = fences_[slot];
+        // Eight sets ago: long finished (a barrier-only submission).
+        if (vkWaitForFences_(device_, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS ||
+            vkResetFences_(device_, 1, &fence) != VK_SUCCESS)
+            return false;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        return vkBeginCommandBuffer_(cb, &begin) == VK_SUCCESS;
+    }
+
+    bool Submit(VkCommandBuffer cb, VkFence fence) {
+        if (vkEndCommandBuffer_(cb) != VK_SUCCESS) return false;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &cb;
+        void* guard = aurora_vulkan_win32_lock_queue();
+        const VkResult result = vkQueueSubmit_(queue_, 1, &submit, fence);
+        aurora_vulkan_win32_unlock_queue(guard);
+        if (result != VK_SUCCESS) {
+            // The fence stays unsignalled: make the slot usable again.
+            VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            const uint32_t slot = (next_ - 1) % kSlots;
+            vkDestroyFence_(device_, fences_[slot], nullptr);
+            if (vkCreateFence_(device_, &fence_info, nullptr, &fences_[slot]) != VK_SUCCESS) ready_ = false;
+        }
+        return result == VK_SUCCESS;
+    }
+
+    bool ready_ = false;
+    uint32_t next_ = 0;
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkQueue queue_ = VK_NULL_HANDLE;
+    VkCommandPool pool_ = VK_NULL_HANDLE;
+    std::array<VkCommandBuffer, kSlots> buffers_{};
+    std::array<VkFence, kSlots> fences_{};
+    PFN_vkGetDeviceQueue vkGetDeviceQueue_ = nullptr;
+    PFN_vkQueueSubmit vkQueueSubmit_ = nullptr;
+    PFN_vkCreateCommandPool vkCreateCommandPool_ = nullptr;
+    PFN_vkDestroyCommandPool vkDestroyCommandPool_ = nullptr;
+    PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers_ = nullptr;
+    PFN_vkBeginCommandBuffer vkBeginCommandBuffer_ = nullptr;
+    PFN_vkEndCommandBuffer vkEndCommandBuffer_ = nullptr;
+    PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier_ = nullptr;
+    PFN_vkCmdClearColorImage vkCmdClearColorImage_ = nullptr;
+    PFN_vkCreateFence vkCreateFence_ = nullptr;
+    PFN_vkDestroyFence vkDestroyFence_ = nullptr;
+    PFN_vkWaitForFences vkWaitForFences_ = nullptr;
+    PFN_vkResetFences vkResetFences_ = nullptr;
+};
+
+// KARTFRAME_FIRST_WRITE_BARRIER=all|dawn (lane Q, default all): GalaxyFrame's first-write barrier
+// (BridgeCommands::FirstWriteBarrier) before every set's writes to its swapchain images; dawn leaves
+// only Dawn's own tracked barrier (COLOR_ATTACHMENT_OUTPUT to COLOR_ATTACHMENT_OUTPUT).
+bool FirstWriteBarrierSetting() {
+    static const bool all = [] {
+        const char* env = std::getenv("KARTFRAME_FIRST_WRITE_BARRIER");
+        return !(env != nullptr && std::string_view(env) == "dawn");
+    }();
+    return all;
+}
+// KARTFRAME_RACE_QUAD=1|cycle|0 (lane Q, default 1): a frame whose only layer would be the projection
+// (races, loading, the guide) gets one more layer, a 16x16 fully transparent quad 2 m ahead, 1 cm across,
+// alpha blended, after the projection: SteamVR then never composites a projection layer alone (KartFrame's
+// menus and GalaxyFrame, both clean on the Frame, always submit quads with their projection). 1: the
+// images are cleared once and the quad shows the last released one every frame; cycle: one image is
+// acquired, waited and released every frame as well (no GPU work, GalaxyFrame's per-frame pattern).
+int RaceQuadSetting() {
+    static const int mode = [] {
+        const char* env = std::getenv("KARTFRAME_RACE_QUAD");
+        const std::string_view v = env != nullptr ? env : "1";
+        return v == "0" ? 0 : v == "cycle" ? 2 : 1;
+    }();
+    return mode;
+}
+
 bool SameVkCopyFamily(VkFormat a, VkFormat b) {
     return a == b || ((a == VK_FORMAT_R8G8B8A8_UNORM || a == VK_FORMAT_R8G8B8A8_SRGB) &&
                      (b == VK_FORMAT_R8G8B8A8_UNORM || b == VK_FORMAT_R8G8B8A8_SRGB)) ||
@@ -580,8 +785,11 @@ public:
         const auto gpu_mode = gpu_.Start(vk_get_proc_, static_cast<VkInstance>(handles.instance),
                                          static_cast<VkDevice>(handles.device), handles.queueFamily,
                                          handles.queueIndex, timeline_semaphores_);
+        const bool cmds_ready = cmds_.Start(vk_get_proc_, static_cast<VkInstance>(handles.instance),
+                                            static_cast<VkDevice>(handles.device), handles.queueFamily, handles.queueIndex);
         if (!aurora_vulkan_win32_enable(&Impl::OnAuroraSubmitted, this)) {
             gpu_.Stop();
+            cmds_.Stop();
             abandon_session();
             return Fail("Aurora could not enable its zero-readback Vulkan stereo bridge");
         }
@@ -600,7 +808,11 @@ public:
                 << static_cast<int64_t>(eye_format_) << " usage 0x" << std::hex << EyeUsage() << std::dec
                 << " (KARTFRAME_XR_FORMAT=" << (RgbaEyesSetting() ? "rgba" : "bgra") << ", KARTFRAME_XR_USAGE="
                 << (GalaxyUsageSetting() ? "galaxy" : "kart") << "), end locate "
-                << (EndLocateSetting() ? "on" : "off") << " (KARTFRAME_END_LOCATE), eyes "
+                << (EndLocateSetting() ? "on" : "off") << " (KARTFRAME_END_LOCATE), first-write barrier "
+                << (!FirstWriteBarrierSetting() ? "dawn" : cmds_ready ? "all" : "dawn (no command buffers)")
+                << " (KARTFRAME_FIRST_WRITE_BARRIER), race quad "
+                << (RaceQuadSetting() == 0 ? "off" : !cmds_ready ? "off (no command buffers)" : RaceQuadSetting() == 2 ? "cycle" : "on")
+                << " (KARTFRAME_RACE_QUAD), eyes "
                 << eye_swapchains_[0].width << 'x' << eye_swapchains_[0].height << " / "
                 << eye_swapchains_[1].width << 'x' << eye_swapchains_[1].height << ", Vulkan "
                 << VK_API_VERSION_MAJOR(instance_api_version_) << '.' << VK_API_VERSION_MINOR(instance_api_version_)
@@ -728,6 +940,18 @@ public:
             };
         }
         diagnostics::OnSwapchainAcquire(acquire_timer);
+        if (FirstWriteBarrierSetting() && cmds_.Ready()) {
+            // Lane Q: GalaxyFrame's barrier before the set's first writes (eyes, environment, panel).
+            std::array<VkImage, kOpenXREyeCount + 1> images{};
+            uint32_t image_count = 0;
+            for (uint32_t eye = 0; eye < target_count; ++eye) images[image_count++] = static_cast<VkImage>(targets[eye].resource);
+            if (panel) images[image_count++] = static_cast<VkImage>(panel_target.resource);
+            if (!cmds_.FirstWriteBarrier(images.data(), image_count) && !first_write_barrier_failed_) {
+                first_write_barrier_failed_ = true;
+                Log(OpenXRLogLevel::Warning, "OpenXR first-write barrier could not be submitted; Dawn's own barrier alone from here");
+            }
+            ++first_write_barriers_;
+        }
 
         {
             std::lock_guard lock(submission_mutex_);
@@ -1387,7 +1611,7 @@ public:
         }
         diagnostics::OnLayer(fresh);
         retained_ref_cycle_ = cycle_count_;
-        LogFrame(fresh);
+        log_fresh_ = fresh;  // logged by EndFrameWithPanel with the layer count
         const auto& frame = retained_frame_;
         if (frame.presentation.mode == OpenXRWindowsVulkanFrameMode::VirtualScreen) {
             XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
@@ -1484,12 +1708,28 @@ public:
                            uint32_t scene_count) {
         const auto& panel = frame.presentation.panel;
         XrCompositionLayerQuad panel_quad{};
-        const XrCompositionLayerBaseHeader* layers[3] = {scene[0], scene_count > 1 ? scene[1] : nullptr, nullptr};
+        XrCompositionLayerQuad race_quad{};
+        const XrCompositionLayerBaseHeader* layers[4] = {scene[0], scene_count > 1 ? scene[1] : nullptr, nullptr, nullptr};
         uint32_t count = std::min(scene_count, 2u);
         if (retained_panel_valid_ && panel.requested && panel.placed) {
             panel_quad = OpenXRPanelQuadLayer(panel, runtime_->AppSpace(), retained_panel_swapchain_.handle);
             layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel_quad);
         }
+        // Lane Q (KARTFRAME_RACE_QUAD): never a projection layer alone.
+        if (count == 1 && layers[0]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION && EnsureRaceQuad()) {
+            race_quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            race_quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            race_quad.space = runtime_->AppSpace();
+            race_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            race_quad.subImage.swapchain = race_quad_.handle;
+            race_quad.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(race_quad_.width), static_cast<int32_t>(race_quad_.height)}};
+            race_quad.subImage.imageArrayIndex = 0;
+            race_quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+            race_quad.pose.position = {0.0f, 0.0f, -2.0f};
+            race_quad.size = {0.01f, 0.01f};
+            layers[count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&race_quad);
+        }
+        LogFrame(log_fresh_, count);
         // Every frame ends with its own cycle's predicted display time: SteamVR matches a frame to
         // its refresh by that time. The layer's poses say where the images were rendered from; the
         // compositor reprojects them to the head pose at display. A pipelined set is located for
@@ -1688,8 +1928,8 @@ public:
     // at 120 Hz). XRF c=<cycle> w=<wake-up, ms since the first> e=<xrEndFrame after the wake-up, ms, at the
     // call> f=<1 a newly rendered set, 0 the retained layer again> p=<eye pair> i=<released image index
     // left/right> d=<display time step from the last frame, refreshes> l=<display time minus the poses'
-    // locate time, refreshes>. The panel recording (KARTFRAME_RECORD=raw) lines up with it frame by frame.
-    void LogFrame(bool fresh) {
+    // locate time, refreshes> n=<layers submitted> (lane Q). The panel recording (KARTFRAME_RECORD=raw) lines up with it frame by frame.
+    void LogFrame(bool fresh, uint32_t layer_count) {
         static const bool enabled = [] {
             const char* env = std::getenv("KARTFRAME_FRAME_LOG");
             return env != nullptr && env[0] == '1';
@@ -1702,13 +1942,13 @@ public:
         const double step = log_last_display_ ? static_cast<double>(active_frame_.predicted_display_time - log_last_display_) / period : 0.0;
         log_last_display_ = active_frame_.predicted_display_time;
         const double located = retained_locate_time_ ? static_cast<double>(active_frame_.predicted_display_time - retained_locate_time_) / period : 0.0;
-        char line[192];
-        std::snprintf(line, sizeof(line), "XRF c=%llu w=%.3f e=%.2f f=%d p=%u i=%d/%d d=%.2f l=%.2f",
+        char line[200];
+        std::snprintf(line, sizeof(line), "XRF c=%llu w=%.3f e=%.2f f=%d p=%u i=%d/%d d=%.2f l=%.2f n=%u",
                       static_cast<unsigned long long>(cycle_count_),
                       std::chrono::duration<double, std::milli>(wake_ - log_epoch_).count(),
                       std::chrono::duration<double, std::milli>(now - wake_).count(), fresh ? 1 : 0,
                       retained_swapchains_[0].pair_id, retained_swapchains_[0].released_index,
-                      retained_swapchains_[1].released_index, step, located);
+                      retained_swapchains_[1].released_index, step, located, layer_count);
         Log(OpenXRLogLevel::Info, line);
     }
 
@@ -1728,7 +1968,10 @@ public:
             bridge_enabled_ = false;
         }
         // The bridge's drain waited for the queue to go idle; the watcher can go.
-        if (bridge_drained) gpu_.Stop();
+        if (bridge_drained) {
+            gpu_.Stop();
+            cmds_.Stop();
+        }
         if (!bridge_drained) {
             AbandonAcquiredSwapchains();
             shutdown_unsafe_ = true;
@@ -1881,7 +2124,8 @@ private:
 
     // eye: one of the eye pairs (the menus' quad uses the left image of a pair as well); the menu
     // environment and the settings panel keep Aurora's format and the old usage (they take copies).
-    bool CreateSwapchain(EyeSwapchain& swapchain, uint32_t width, uint32_t height, const char* what, bool eye = false) {
+    bool CreateSwapchain(EyeSwapchain& swapchain, uint32_t width, uint32_t height, const char* what, bool eye = false,
+                         XrSwapchainUsageFlags usage = 0) {
         swapchain.width = width;
         swapchain.height = height;
         const VkFormat format = eye ? eye_format_ : swapchain_format_;
@@ -1892,7 +2136,9 @@ private:
         // srgb), so the images need no MUTABLE_FORMAT, which lets the driver compress them (lane I: the
         // eyes' way into the images 0.47 ms a set instead of 2.3). KARTFRAME_SINK=copy|blit: raw copies
         // through a UNORM view, which need the flag.
-        if (IsWindowsVkSrgbFormat(format) && !SrgbSinkSetting()) {
+        if (usage != 0) {
+            create.usageFlags = usage;
+        } else if (IsWindowsVkSrgbFormat(format) && !SrgbSinkSetting()) {
             // Permit a UNORM view for raw copies into the sRGB XR image.
             create.usageFlags |= XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
         }
@@ -2019,6 +2265,66 @@ private:
         }
     }
 
+    // Lane Q: the race quad's swapchain (KARTFRAME_RACE_QUAD), made at the first frame whose only layer
+    // would be the projection: 16x16 in the eyes' format, every image cleared to transparent black once
+    // (acquired, cleared, the GPU waited for, released: the eyes' rules). Mode cycle then acquires,
+    // waits and releases one image per frame without writing it. A failure is logged once; frames then
+    // go out with the projection alone.
+    bool EnsureRaceQuad() {
+        const int mode = RaceQuadSetting();
+        if (mode == 0 || race_quad_failed_ || !cmds_.Ready()) return false;
+        if (race_quad_ready_) return mode == 1 || CycleRaceQuad();
+        const XrSwapchainUsageFlags usage = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                                            XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        const auto started = std::chrono::steady_clock::now();
+        bool ok = false;
+        for (const uint32_t size : {16u, 64u}) {
+            if (CreateSwapchain(race_quad_, size, size, "race quad", true, usage)) {
+                ok = true;
+                break;
+            }
+            race_quad_ = {};
+        }
+        for (size_t i = 0; ok && i < race_quad_.images.size(); ++i) {
+            ok = AcquireSwapchain(race_quad_) && cmds_.ClearAndWait(race_quad_.images[race_quad_.acquired_index].image);
+            if (race_quad_.acquired && race_quad_.waited) {
+                const auto queue_guard = runtime_->LockGraphicsQueue();
+                // An image whose clear did not finish stays acquired (released only finished).
+                ok = ok && ReleaseSwapchain(race_quad_);
+            }
+        }
+        if (!ok) {
+            race_quad_failed_ = true;
+            if (race_quad_.handle != XR_NULL_HANDLE && race_quad_.acquired) race_quad_.release_forbidden = true;
+            else DestroyOneSwapchain(race_quad_);
+            Log(OpenXRLogLevel::Warning, "OpenXR race quad could not be made; projection-only frames stay alone");
+            return false;
+        }
+        race_quad_ready_ = true;
+        std::ostringstream message;
+        message << "OpenXR race quad layer ready: " << race_quad_.width << 'x' << race_quad_.height << " VkFormat "
+                << static_cast<int64_t>(eye_format_) << ", " << race_quad_.images.size()
+                << " images cleared to transparent in "
+                << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()
+                << " ms; a 1 cm quad 2 m ahead after every projection-only layer (KARTFRAME_RACE_QUAD="
+                << (mode == 2 ? "cycle" : "1") << ")";
+        Log(OpenXRLogLevel::Info, message.str());
+        return mode == 1 || CycleRaceQuad();
+    }
+
+    bool CycleRaceQuad() {
+        if (!AcquireSwapchain(race_quad_)) {
+            race_quad_failed_ = true;
+            return false;
+        }
+        const auto queue_guard = runtime_->LockGraphicsQueue();
+        if (!ReleaseSwapchain(race_quad_)) {
+            race_quad_failed_ = true;
+            return false;
+        }
+        return true;
+    }
+
     // The settings panel's swapchain pair, made the first time the panel opens.
     // A failure is logged once and the panel is drawn into the eyes again.
     bool EnsurePanelSwapchains() {
@@ -2106,6 +2412,8 @@ private:
     }
 
     void DestroySwapchains() {
+        DestroyOneSwapchain(race_quad_);
+        race_quad_ready_ = false;
         DestroyPanelSwapchains();
         DestroyEnvSwapchains();
         DestroySwapchainPair(eye_swapchains_);
@@ -2306,6 +2614,13 @@ private:
     uint64_t submitted_token_ = 0;
     uint64_t submitted_gpu_value_ = 0;
     GpuCompletion gpu_;
+    BridgeCommands cmds_;                   // lane Q: first-write barrier, race quad clear
+    EyeSwapchain race_quad_{};              // lane Q: KARTFRAME_RACE_QUAD
+    bool race_quad_ready_ = false;
+    bool race_quad_failed_ = false;
+    bool first_write_barrier_failed_ = false;
+    uint64_t first_write_barriers_ = 0;
+    bool log_fresh_ = false;
     PFN_vkGetInstanceProcAddr vk_get_proc_ = nullptr;
     bool submission_arrived_ = false;
     bool submission_success_ = false;
