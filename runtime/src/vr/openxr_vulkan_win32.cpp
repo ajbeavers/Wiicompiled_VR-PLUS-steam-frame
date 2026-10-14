@@ -1529,6 +1529,8 @@ public:
         if (!EndLocateSetting() || runtime_ == nullptr || runtime_->Session() == XR_NULL_HANDLE ||
             runtime_->AppSpace() == XR_NULL_HANDLE)
             return;
+        // Through the runtime's dispatch (the backend's replay test links no OpenXR loader).
+        if (locate_views_ == nullptr && !runtime_->LoadFunction("xrLocateViews", &locate_views_)) return;
         XrViewLocateInfo info{XR_TYPE_VIEW_LOCATE_INFO};
         info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         info.displayTime = display_time;
@@ -1537,7 +1539,7 @@ public:
         std::array<XrView, kOpenXREyeCount> views{};
         for (auto& view : views) view = {XR_TYPE_VIEW};
         uint32_t count = 0;
-        ObserveResult(xrLocateViews(runtime_->Session(), &info, &state, kOpenXREyeCount, &count, views.data()));
+        ObserveResult(locate_views_(runtime_->Session(), &info, &state, kOpenXREyeCount, &count, views.data()));
     }
 
     void NoteEndAfterWake() {
@@ -2286,6 +2288,7 @@ private:
     VkFormat aurora_format_ = VK_FORMAT_UNDEFINED;
     VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
     VkFormat eye_format_ = VK_FORMAT_UNDEFINED;  // lane O: the eye pairs' format (SelectSwapchainFormat)
+    PFN_xrLocateViews locate_views_ = nullptr;   // lane O: LocateAtEnd
     std::string last_error_;
 
     mutable std::mutex submission_mutex_;
