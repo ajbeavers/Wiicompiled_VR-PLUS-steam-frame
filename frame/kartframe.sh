@@ -130,6 +130,34 @@ else
     log "no vrtiming.log (disabled, or vrtiming.py / libopenvr_api.so missing)"
 fi
 
+# SteamVR's gaze-dependent eye positions (steamvr.gazeDepEyeToHeadEnable) are a GLOBAL setting.
+# KARTFRAME_GAZE_EYES=off switches them off for this launch only: the value found is kept in
+# KFHOME/.gaze-restore and put back at exit; a launch that finds a leftover file (crash, power-off)
+# puts it back first.
+GAZE_KEY=steamvr.gazeDepEyeToHeadEnable
+gaze_get() { "$VRCMD" --settings-bool "$GAZE_KEY" 2> /dev/null | sed -n "s/^$GAZE_KEY=//p" | tail -1; }
+gaze_restore() {
+    [ -f "$KFHOME/.gaze-restore" ] || return 0
+    # vrcmd takes 1/0 for booleans ("true" reads as 0).
+    local v; v=$(cat "$KFHOME/.gaze-restore"); case "$v" in true | 1) v=1 ;; *) v=0 ;; esac
+    "$VRCMD" --set-settings-bool "$GAZE_KEY" "$v" > /dev/null 2>&1 && rm -f "$KFHOME/.gaze-restore" &&
+        log "gaze-dependent eye positions restored to $v (now $(gaze_get))"
+}
+if [ -x "$VRCMD" ]; then
+    gaze_restore
+    if [ "$KARTFRAME_GAZE_EYES" = off ]; then
+        GAZE_WAS=$(gaze_get)
+        if [ -n "$GAZE_WAS" ]; then
+            echo "$GAZE_WAS" > "$KFHOME/.gaze-restore"
+            "$VRCMD" --set-settings-bool "$GAZE_KEY" 0 > /dev/null 2>&1
+            log "A/B: gaze-dependent eye positions off for this launch (was $GAZE_WAS, now $(gaze_get))"
+        else
+            log "A/B: could not read $GAZE_KEY; gaze setting left alone"
+        fi
+    fi
+    log "gaze-dependent eye positions: $(gaze_get)"
+fi
+
 # Not exec: the wrapper stays to stop the logger and write the report. A signal for the wrapper
 # (Steam stopping the app) goes on to the game.
 # The headset is in use: development builds and headless GPU runs on this machine wait while this
@@ -159,6 +187,7 @@ while kill -0 "$GAME_PID" 2> /dev/null; do
 done
 trap - TERM INT HUP
 rm -f "$HEADSET_MARK"
+[ -x "$VRCMD" ] && gaze_restore
 [ -n "$REC_PID" ] && { pkill -INT -P "$REC_PID" framecorder 2> /dev/null; kill -INT "$REC_PID" 2> /dev/null; sleep 3; }
 log "game exited with status $rc"
 [ -n "$VRT_PID" ] && { kill "$VRT_PID" 2> /dev/null; wait "$VRT_PID" 2> /dev/null; }
