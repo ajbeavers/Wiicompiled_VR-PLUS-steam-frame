@@ -133,3 +133,11 @@ pose with the median eye-to-head offset and field of view of the first 120 focus
 per-refresh eye motion from the runtime cannot reach the images. KARTFRAME_AHEAD_REFRESHES=1|2
 (default 2): locate sets one refresh ahead (sets then do not fit a refresh in races: about half late).
 Session plan: frame/perf/session-h9/README.md.
+
+## Lane O switches (the hand-over GalaxyFrame's way)
+KARTFRAME_XR_FORMAT=rgba|bgra (default rgba: eye swapchains VkFormat 43, the sRGB draw swizzles),
+KARTFRAME_XR_USAGE=galaxy|kart (default galaxy: COLOR_ATTACHMENT | SAMPLED), KARTFRAME_END_LOCATE=1|0
+(default 1: one more locate for the frame's own time before ending it, race frames), and
+KARTFRAME_XR_EXTENSIONS=galaxy (GalaxyFrame's extension list: drops hand steering, other headsets'
+profiles and the clock conversion; default stays KartFrame's). Mock: MOCK_XR_TRACE_DETAIL=1.
+Comparison and remaining candidates in frame/perf/H9.md.
