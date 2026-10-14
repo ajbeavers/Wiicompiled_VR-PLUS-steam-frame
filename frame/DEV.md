@@ -123,3 +123,13 @@ sets ahead (3 to 8) and 2 with wait. KARTFRAME_AHEAD_START_US delays each set's 
 The pacing line ends with dropped= (finished sets released unshown) and end_late= (ends more than 1 ms
 after the wake-up). Mock: MOCK_XR_LATE_END_MS (1.5) models late ends; KF_MOCKRUN_END_GATE=<percent>
 fails a run with more late ends. Details: frame/perf/H7.md.
+
+## Lane L and M switches
+KARTFRAME_FRAME_LOG=1 now also writes an XRS line per set (the scene state each eye's draws used:
+weight, game-frame pair, draw counts; the mock compares the eyes) and an XRE line per locate (each
+eye's offset from the head and its change since the last locate), plus a per-second "vr eyes" summary.
+KARTFRAME_EYE_OFFSETS=located|fixed (default located): fixed renders and submits each eye at the head
+pose with the median eye-to-head offset and field of view of the first 120 focused locates, so
+per-refresh eye motion from the runtime cannot reach the images. KARTFRAME_AHEAD_REFRESHES=1|2
+(default 2): locate sets one refresh ahead (sets then do not fit a refresh in races: about half late).
+Session plan: frame/perf/session-h9/README.md.
