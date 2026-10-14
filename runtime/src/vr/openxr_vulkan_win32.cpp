@@ -252,6 +252,53 @@ VkFormat WindowsVkSrgbSibling(VkFormat f) {
 }
 bool IsWindowsVkSrgbFormat(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB; }
 
+// Lane O (H9.md): the eye swapchains as GalaxyFrame makes them, which SteamVR on the Frame shows clean.
+// Aurora writes the eyes through an sRGB view with a draw (KARTFRAME_SINK=srgb, the default), so the
+// swapchain's channel order is free: R8G8B8A8_SRGB (VkFormat 43, GalaxyFrame's) by default,
+// KARTFRAME_XR_FORMAT=bgra the old B8G8R8A8_SRGB (50, Aurora's own order). The copy and blit sinks
+// keep Aurora's order (a copy cannot swap channels).
+bool SrgbSinkSetting() {
+    static const bool srgb = [] {
+        const char* env = std::getenv("KARTFRAME_SINK");
+        const std::string_view v = env != nullptr ? env : "";
+        return v != "copy" && v != "blit";
+    }();
+    return srgb;
+}
+bool RgbaEyesSetting() {
+    static const bool rgba = [] {
+        const char* env = std::getenv("KARTFRAME_XR_FORMAT");
+        return !(env != nullptr && std::string_view(env) == "bgra");
+    }();
+    return rgba;
+}
+// Usage of the eye swapchains: GalaxyFrame's COLOR_ATTACHMENT | SAMPLED by default (plus TRANSFER_DST
+// only where a copy can still reach an eye image: Aurora's channel order, or the test stamp);
+// KARTFRAME_XR_USAGE=kart the old COLOR_ATTACHMENT | TRANSFER_DST.
+bool GalaxyUsageSetting() {
+    static const bool galaxy = [] {
+        const char* env = std::getenv("KARTFRAME_XR_USAGE");
+        return !(env != nullptr && std::string_view(env) == "kart");
+    }();
+    return galaxy;
+}
+bool FrameStampSetting() {
+    static const bool stamp = [] {
+        const char* env = std::getenv("KARTFRAME_FRAME_STAMP");
+        return env != nullptr && env[0] == '1';
+    }();
+    return stamp;
+}
+// GalaxyFrame locates the views once more for the frame's own display time between releasing a set and
+// xrEndFrame (its pose check); KARTFRAME_END_LOCATE=0 leaves that call out.
+bool EndLocateSetting() {
+    static const bool on = [] {
+        const char* env = std::getenv("KARTFRAME_END_LOCATE");
+        return !(env != nullptr && env[0] == '0');
+    }();
+    return on;
+}
+
 const char* WindowsVkBeginStatusOperation(OpenXRFrameStatus status) noexcept {
     switch (status) {
     case OpenXRFrameStatus::Ready:
@@ -549,7 +596,11 @@ public:
                 : "OpenXR Vulkan GPU completion: not available (no Vulkan entry points); releases follow Aurora's submission");
         std::ostringstream message;
         message << "OpenXR Vulkan swapchains ready: VkFormat " << static_cast<int64_t>(swapchain_format_)
-                << " (Aurora " << static_cast<int64_t>(aurora_format_) << "), eyes "
+                << " (Aurora " << static_cast<int64_t>(aurora_format_) << "), eye swapchains VkFormat "
+                << static_cast<int64_t>(eye_format_) << " usage 0x" << std::hex << EyeUsage() << std::dec
+                << " (KARTFRAME_XR_FORMAT=" << (RgbaEyesSetting() ? "rgba" : "bgra") << ", KARTFRAME_XR_USAGE="
+                << (GalaxyUsageSetting() ? "galaxy" : "kart") << "), end locate "
+                << (EndLocateSetting() ? "on" : "off") << " (KARTFRAME_END_LOCATE), eyes "
                 << eye_swapchains_[0].width << 'x' << eye_swapchains_[0].height << " / "
                 << eye_swapchains_[1].width << 'x' << eye_swapchains_[1].height << ", Vulkan "
                 << VK_API_VERSION_MAJOR(instance_api_version_) << '.' << VK_API_VERSION_MINOR(instance_api_version_)
@@ -656,7 +707,7 @@ public:
                 reinterpret_cast<void*>(swapchain.images[swapchain.acquired_index].image),
                 swapchain.width,
                 swapchain.height,
-                static_cast<int64_t>(swapchain_format_),
+                static_cast<int64_t>(environment && eye == 1 ? swapchain_format_ : eye_format_),
             };
         }
         // The settings panel's layer image, rendered with the eyes while it is open.
@@ -1464,9 +1515,29 @@ public:
             return ok;
         }
         last_end_display_time_ = std::max(last_end_display_time_, active_frame_.predicted_display_time);
+        if (frame.presentation.mode != OpenXRWindowsVulkanFrameMode::VirtualScreen) LocateAtEnd(active_frame_.predicted_display_time);
         const bool ok = runtime_->EndFrame(active_frame_, layers, count);
         NoteEndAfterWake();
         return ok;
+    }
+
+    // Lane O: GalaxyFrame's last OpenXR call before xrEndFrame (after the set's release) is an
+    // xrLocateViews for the frame's own display time (its pose check; eye sets only, not the menus).
+    // KartFrame's last locate before an xrEndFrame was the one for the set two refreshes ahead. The
+    // result is not used.
+    void LocateAtEnd(XrTime display_time) {
+        if (!EndLocateSetting() || runtime_ == nullptr || runtime_->Session() == XR_NULL_HANDLE ||
+            runtime_->AppSpace() == XR_NULL_HANDLE)
+            return;
+        XrViewLocateInfo info{XR_TYPE_VIEW_LOCATE_INFO};
+        info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        info.displayTime = display_time;
+        info.space = runtime_->AppSpace();
+        XrViewState state{XR_TYPE_VIEW_STATE};
+        std::array<XrView, kOpenXREyeCount> views{};
+        for (auto& view : views) view = {XR_TYPE_VIEW};
+        uint32_t count = 0;
+        ObserveResult(xrLocateViews(runtime_->Session(), &info, &state, kOpenXREyeCount, &count, views.data()));
     }
 
     void NoteEndAfterWake() {
@@ -1708,6 +1779,17 @@ public:
 
 private:
     bool SelectSwapchainFormat() {
+        if (!SelectAuroraSwapchainFormat()) return false;
+        const auto& formats = runtime_->SwapchainFormats();
+        eye_format_ = swapchain_format_;
+        if (RgbaEyesSetting() && SrgbSinkSetting() && IsWindowsVkSrgbFormat(swapchain_format_) &&
+            std::find(formats.begin(), formats.end(), static_cast<int64_t>(VK_FORMAT_R8G8B8A8_SRGB)) != formats.end()) {
+            eye_format_ = VK_FORMAT_R8G8B8A8_SRGB;
+        }
+        return true;
+    }
+
+    bool SelectAuroraSwapchainFormat() {
         const auto& formats = runtime_->SwapchainFormats();
         // Aurora's UNORM target contains the gamma-encoded bytes expected by
         // the desktop compositor. OpenXR must declare the compatible sRGB
@@ -1779,34 +1861,40 @@ private:
             eye_width_[eye] = view.render_width;
             eye_height_[eye] = view.render_height;
             if (!CreateSwapchain(pair[eye], view.render_width, view.render_height,
-                                 eye == 0 ? "left eye" : "right eye")) {
+                                 eye == 0 ? "left eye" : "right eye", true)) {
                 return false;
             }
         }
         return true;
     }
 
-    bool CreateSwapchain(EyeSwapchain& swapchain, uint32_t width, uint32_t height, const char* what) {
+    // The eyes' usage flags (lane O): see GalaxyUsageSetting.
+    XrSwapchainUsageFlags EyeUsage() const {
+        if (!GalaxyUsageSetting()) return XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        XrSwapchainUsageFlags usage = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        if (eye_format_ != VK_FORMAT_R8G8B8A8_SRGB || FrameStampSetting() || !SrgbSinkSetting())
+            usage |= XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        return usage;
+    }
+
+    // eye: one of the eye pairs (the menus' quad uses the left image of a pair as well); the menu
+    // environment and the settings panel keep Aurora's format and the old usage (they take copies).
+    bool CreateSwapchain(EyeSwapchain& swapchain, uint32_t width, uint32_t height, const char* what, bool eye = false) {
         swapchain.width = width;
         swapchain.height = height;
+        const VkFormat format = eye ? eye_format_ : swapchain_format_;
 
         XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        create.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-                            XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        create.usageFlags = eye ? EyeUsage() : XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         // Aurora writes the eyes through an sRGB view (decoding them in its shader; KARTFRAME_SINK, default
         // srgb), so the images need no MUTABLE_FORMAT, which lets the driver compress them (lane I: the
         // eyes' way into the images 0.47 ms a set instead of 2.3). KARTFRAME_SINK=copy|blit: raw copies
         // through a UNORM view, which need the flag.
-        static const bool srgb_sink = [] {
-            const char* env = std::getenv("KARTFRAME_SINK");
-            const std::string_view v = env != nullptr ? env : "";
-            return v != "copy" && v != "blit";
-        }();
-        if (IsWindowsVkSrgbFormat(swapchain_format_) && !srgb_sink) {
+        if (IsWindowsVkSrgbFormat(format) && !SrgbSinkSetting()) {
             // Permit a UNORM view for raw copies into the sRGB XR image.
             create.usageFlags |= XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
         }
-        create.format = static_cast<int64_t>(swapchain_format_);
+        create.format = static_cast<int64_t>(format);
         create.sampleCount = 1;
         create.width = swapchain.width;
         create.height = swapchain.height;
@@ -2044,6 +2132,7 @@ private:
         retained_frame_ = {};
         retained_locate_time_ = 0;
         swapchain_format_ = VK_FORMAT_UNDEFINED;
+        eye_format_ = VK_FORMAT_UNDEFINED;
     }
 
     void DestroySwapchainPair(std::array<EyeSwapchain, kOpenXREyeCount>& pair) {
@@ -2196,6 +2285,7 @@ private:
     XrTime last_end_display_time_ = 0;  // the display time of the last xrEndFrame
     VkFormat aurora_format_ = VK_FORMAT_UNDEFINED;
     VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;
+    VkFormat eye_format_ = VK_FORMAT_UNDEFINED;  // lane O: the eye pairs' format (SelectSwapchainFormat)
     std::string last_error_;
 
     mutable std::mutex submission_mutex_;

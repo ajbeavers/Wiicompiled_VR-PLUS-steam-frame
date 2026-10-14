@@ -228,6 +228,11 @@ public:
     return mode;
   }
   static bool SinkBlit() { return SinkMode() != Sink::Copy; }
+  // The sRGB format of an sRGB swapchain image (VkFormat 43 or 50), for the draw that writes it.
+  static wgpu::TextureFormat TargetSrgb(int64_t vk) {
+    return vk == 43 ? wgpu::TextureFormat::RGBA8UnormSrgb : vk == 50 ? wgpu::TextureFormat::BGRA8UnormSrgb
+                                                         : wgpu::TextureFormat::Undefined;
+  }
   static wgpu::TextureFormat SrgbOf(wgpu::TextureFormat f) {
     return f == wgpu::TextureFormat::BGRA8Unorm ? wgpu::TextureFormat::BGRA8UnormSrgb
          : f == wgpu::TextureFormat::RGBA8Unorm ? wgpu::TextureFormat::RGBA8UnormSrgb
@@ -348,11 +353,16 @@ public:
     for (uint32_t i = 0; i < images; ++i) {
       const auto& eye = sources[i];
       const auto& target = targets[i];
-      if (!eye.texture || eye.size.width != target.width || eye.size.height != target.height ||
-          !CopyCompatible(VkFormat(eye.format), target.dxgiFormat)) return false;
-      const bool srgbEye = SinkMode() == Sink::Srgb && i < count && frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY &&
-                           (target.dxgiFormat == 43 || target.dxgiFormat == 50) && SrgbOf(eye.format) != eye.format;
-      auto* texture = ImportTarget(i, srgbEye ? SrgbOf(eye.format) : eye.format);
+      if (!eye.texture || eye.size.width != target.width || eye.size.height != target.height) return false;
+      // Lane O: an eye swapchain in the other channel order (R8G8B8A8_SRGB against Aurora's BGRA, as
+      // GalaxyFrame's) can only be written by the sRGB draw, which writes any order; that includes the
+      // menus' screen image (the left image of a pair), which the copy wrote before.
+      const bool swizzle = !CopyCompatible(VkFormat(eye.format), target.dxgiFormat);
+      const bool srgbTarget = TargetSrgb(target.dxgiFormat) != wgpu::TextureFormat::Undefined;
+      const bool srgbEye = SinkMode() == Sink::Srgb && srgbTarget && SrgbOf(eye.format) != eye.format &&
+                           ((i < count && frame.mode == AURORA_STEREO_FRAME_IMMERSIVE_REPLAY) || swizzle);
+      if (swizzle && !(srgbEye && eye.view != nullptr && *eye.view)) return false;
+      auto* texture = ImportTarget(i, srgbEye ? TargetSrgb(target.dxgiFormat) : eye.format);
       if (!texture) return false;
       active[i] = *texture;
     }

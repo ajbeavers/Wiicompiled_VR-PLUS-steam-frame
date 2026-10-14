@@ -709,9 +709,28 @@ public:
         AddHandMeshExtensions(config);
 #elif defined(MKW_OPENXR_LINUX_DESKTOP)
         config.required_extensions = {"XR_KHR_vulkan_enable2"};
-        config.optional_extensions = {"XR_KHR_convert_timespec_time", "XR_VALVE_frame_controller_interaction",
-                                      "XR_FB_display_refresh_rate", "XR_EXT_performance_settings"};
-        AddHandMeshExtensions(config);
+        // Lane O (H9.md): KARTFRAME_XR_EXTENSIONS=galaxy asks for exactly GalaxyFrame's list (SteamVR on the
+        // Frame shows GalaxyFrame clean): its GLES binding extensions beside Vulkan's, no
+        // XR_KHR_convert_timespec_time (display times then read XrTime as CLOCK_MONOTONIC, which is
+        // SteamVR's clock), no other controllers' profiles and no hand tracking (hand steering is off).
+        static const bool galaxy_extensions = [] {
+            const char* env = std::getenv("KARTFRAME_XR_EXTENSIONS");
+            return env != nullptr && std::string_view(env) == "galaxy";
+        }();
+        if (galaxy_extensions) {
+            config.optional_extensions = {"XR_KHR_opengl_es_enable", "XR_MNDX_egl_enable",
+                                          "XR_VALVE_frame_controller_interaction", "XR_FB_display_refresh_rate",
+                                          "XR_FB_space_warp", "XR_META_recommended_layer_resolution",
+                                          "XR_META_performance_metrics", "XR_EXT_eye_gaze_interaction"};
+        } else {
+            config.optional_extensions = {"XR_KHR_convert_timespec_time", "XR_VALVE_frame_controller_interaction",
+                                          "XR_FB_display_refresh_rate", "XR_EXT_performance_settings"};
+            AddHandMeshExtensions(config);
+        }
+        RT_LOG(RT_TAG_RUNTIME) << "OpenXR extensions asked for: "
+                               << (galaxy_extensions ? "GalaxyFrame's list (KARTFRAME_XR_EXTENSIONS=galaxy)"
+                                                     : "KartFrame's list (KARTFRAME_XR_EXTENSIONS=galaxy: GalaxyFrame's)")
+                               << std::endl;
 #else
         // Either Vulkan binding extension is acceptable; the backend picks
         // whichever the runtime enabled, preferring enable2.
@@ -2895,7 +2914,10 @@ private:
     // uses another epoch: anchor it to the first frame seen, assuming that frame shows ~2 frames out.
     int64_t MonotonicDisplayDelta(XrTime display_time, int64_t monotonic_ns) noexcept {
         const int64_t raw = static_cast<int64_t>(display_time) - monotonic_ns;
-        const bool same_clock = raw > -100'000'000ll && raw < 500'000'000ll;
+        // Decided once, at the first frame (lane O): a stalled frame later (a display time already
+        // 100 ms in the past) must not switch a CLOCK_MONOTONIC runtime to the anchored fallback.
+        if (!clock_fallback_logged_) clock_same_ = raw > -100'000'000ll && raw < 500'000'000ll;
+        const bool same_clock = clock_same_;
         if (!clock_fallback_logged_) {
             clock_fallback_logged_ = true;
             RT_LOG(RT_TAG_RUNTIME) << "OpenXR: no clock conversion; XrTime - CLOCK_MONOTONIC = "
@@ -2974,6 +2996,7 @@ private:
 #if defined(__ANDROID__) || defined(MKW_OPENXR_LINUX_DESKTOP)
     bool clock_fallback_logged_ = false;
     bool clock_offset_valid_ = false;
+    bool clock_same_ = false;  // XrTime read as CLOCK_MONOTONIC (decided at the first frame)
     int64_t clock_offset_ = 0;
 #endif
     std::atomic_bool interpolation_available_{false};
