@@ -93,3 +93,13 @@ over (controllers and laser over the screen quad, alpha blended); =under is lane
 KARTFRAME_LOG_2D_QUADS logs large 2D rectangles (to find the Blooper ink later). Mock: MOCK_XR_LEAD
 (display lead in refreshes, default 3 like SteamVR), MOCK_XR_DUMP_STEP, MOCK_XR_DUMP_ALPHA,
 MOCK_XR_HANDS=high. Details in frame/perf/H3.md.
+
+## Lane I switches
+KARTFRAME_SINK=srgb|copy|blit: how eyes reach the swapchain (default srgb: an sRGB-decoding draw
+through an sRGB view, so the swapchain needs no MUTABLE_FORMAT and the driver can compress it; copy is
+the old path). KARTFRAME_DIRECT_EYES=0|1 forces rendering straight into the swapchain images (by default
+measured per session; never applies with the srgb sink). KARTFRAME_MONO_FULL=1 and
+KARTFRAME_NATIVE_CLIP=0 restore the full native race render (by default it stops after the last copy
+the eyes sample and is clipped to it; the desktop window is black during races). KARTFRAME_FPSLOG=2
+logs a per-segment GPU profile (frame/perf/gpuprof.py tabulates it). Mock: MOCK_XR_MUTABLE=0.
+Details and the profile in frame/perf/RACE120.md; A/B pairs with frame/perf/abgp.sh.
