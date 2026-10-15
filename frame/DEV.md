@@ -174,3 +174,14 @@ KARTFRAME_SUBMIT_POSE=fresh|rendered (default rendered): fresh submits race fram
 with the check's poses (the images stay as rendered; repeats of the retained layer keep their own).
 Mock: MOCK_XR_STAMP=fresh checks such layers (poses from a locate for their own display time; each
 image against the locate of its own stamp: "fresh-pose stamps"). Plan: frame/perf/session-h12/README.md.
+
+## Lane S switches (mock only)
+MOCK_XR_SWAY=<deg>,<period s>[,<from s>] sizes the head's sway (default 17.19,2) and holds the head still
+until <from>. MOCK_XR_PRESS=<path>@<start>/<every>/<hold s>/<until s> holds a press longer (1000/1000:
+held from <start> on, e.g. A to drive) and stops it at <until>. MOCK_XR_DUMP_QUEUE=<slots> dumps eye
+images without stalling (blitted down to 1/MOCK_XR_DUMP_STEP, written when the dumps pause for 0.3 s);
+every MOCK_XR_DUMP writes <dir>/index.txt (file, swapchain, frame, and with MOCK_XR_STAMP the eye, the
+display time and the scene words). frame/perf/mockdump/dumprace.sh NAME records 240-set windows of a race
+(head still, standing with the sway, driving); frame/perf/mockdump/zigzag.py DIR applies H7's zigzag
+rule, a betweenness test and a lagdiff per eye (ZZ_INJECT=2: positive control, ZZ_TRACK=1: positions).
+Results: frame/perf/LANE_S.md; next: frame/perf/session-h13/README.md.

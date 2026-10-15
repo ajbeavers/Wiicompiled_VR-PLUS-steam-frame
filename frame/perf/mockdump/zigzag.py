@@ -129,10 +129,16 @@ for win in sorted(wins):
     if 'L' not in eyes or 'R' not in eyes:
         continue
     v0 = min(min(eyes['L']), min(eyes['R']))
-    tracks, lag = {}, {}
+    tracks, lag, btw = {}, {}, {}
     for e in 'LR':
         items = sorted((round((v - v0) / PERIOD), f) for v, f in eyes[e].items())
-        profs, cen = {}, {}
+        if os.environ.get('ZZ_INJECT') and e == 'L':
+            # Positive control: every odd set of the left eye shows the image of k sets before (the panels'
+            # zigzag: every second refresh about two refreshes of motion off the track).
+            k = int(os.environ['ZZ_INJECT'])
+            byn = dict(items)
+            items = [(n, byn[n - k] if n % 2 and n - k in byn else f) for n, f in items]
+        profs, cen, low = {}, {}, {}
         for n, f in items:
             W, H, g = ppm_gray(os.path.join(D, f))
             # view: columns of the sky, hills and track edge (head and kart turning; clear of the stamp);
@@ -143,9 +149,24 @@ for win in sorted(wins):
             profs[n] = (cols(region(g, W, x0, y0, rw, rh), rw, rh), cols(region(g, W, 2, sy0, sw, sh), sw, sh),
                         cols(region(g, W, W - 2 - sw, sy0, sw, sh), sw, sh))
             cen[n] = to16(region(g, W, W // 4, H // 8, W // 2, H // 4))
+            # Betweenness regions (any motion, also forward): the ground left and right of the kart.
+            low[n] = (to16(region(g, W, 2, H * 55 // 100, W * 30 // 100, H * 40 // 100)),
+                      to16(region(g, W, W - 2 - W * 30 // 100, H * 55 // 100, W * 30 // 100, H * 40 // 100)))
         tl, tr = track(items, profs, 1), track(items, profs, 2)
         tracks[e] = {'view': track(items, profs, 0), 'scene': {n: 0.5 * (tr[n] - tl[n]) for n in tl}}
         lag[e] = {n: (rmsdiff16(cen[n], cen[n - 1]) if n - 1 in cen else None, rmsdiff16(cen[n], cen[n - 2]) if n - 2 in cen else None) for n in cen}
+        # Betweenness r(n) = D(n-1, n+1) / mean(D(n, n-1), D(n, n+1)) per region (RMS differences, no motion
+        # compensation): smooth motion > 1 (two steps differ more than one); an image displaced about two
+        # refreshes off the track (the panels' zigzag) < 1.
+        btw[e] = {}
+        for name, get in (('upper', lambda n: cen[n]), ('ground L', lambda n: low[n][0]), ('ground R', lambda n: low[n][1])):
+            rs = {}
+            for n in cen:
+                if n - 1 in cen and n + 1 in cen:
+                    a, b, c = rmsdiff16(get(n), get(n - 1)), rmsdiff16(get(n), get(n + 1)), rmsdiff16(get(n - 1), get(n + 1))
+                    if a + b > 2.0:  # moving (still images: codec-free, but blending noise)
+                        rs[n] = c / (0.5 * (a + b))
+            btw[e][name] = rs
     span = max(max(tracks['L']['view']), max(tracks['R']['view'])) + 1
     print(f"== window {win}: sets L {len(tracks['L']['view'])}, R {len(tracks['R']['view'])} over {span} refreshes")
     # Scene position per set from the left eye's stamp (game frames).
@@ -183,6 +204,17 @@ for win in sorted(wins):
         ident = sum(1 for x, y in lag[e].values() if (x is not None and x < 0.5) or (y is not None and y < 0.5))
         print(f"  lagdiff {e}: vs set before p50 {statistics.median(l1) if l1 else 0:.1f}, two before p50 {statistics.median(l2) if l2 else 0:.1f} "
               f"gray levels; nearer n-2 than half of n-1: {stale}; identical (<0.5) to n-1 or n-2: {ident}")
+    for name in ('upper', 'ground L', 'ground R'):
+        out = []
+        for e in 'LR':
+            rs = btw[e][name]
+            v = sorted(rs.values())
+            ks = sorted(rs)
+            pairs = [(rs[k], rs[k + 1]) for k in ks if k + 1 in rs]
+            out.append(f"{e} {len(v)} sets, r p50 {statistics.median(v) if v else float('nan'):.2f} p5 {v[int(0.05 * (len(v) - 1))] if v else float('nan'):.2f}, "
+                       f"r < 1: {sum(1 for x in v if x < 1.0)}, lag-1 autocorr {corr([a for a, _ in pairs], [b for _, b in pairs]):+.2f}")
+        common = [k for k in btw['L'][name] if k in btw['R'][name]]
+        print(f"  between {name:8s}: " + "; ".join(out) + f"; L vs R corr {corr([btw['L'][name][k] for k in common], [btw['R'][name][k] for k in common]):+.2f}")
     if os.environ.get('ZZ_TRACK'):
         for n in range(span):
             print('   ', n, ' '.join(f"{tracks[e][k].get(n, float('nan')):8.2f}" for k in ('view', 'scene') for e in 'LR'),
