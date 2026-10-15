@@ -123,3 +123,49 @@ Validation layer (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`, 80 s, menus 
 stamps): 0 messages, 0 mock errors.
 
 Scratch: `$HOME/.cache/kf-laneR/runs/`.
+
+## Headset results (2026-10-15, sessions 055840 / 060012 / 060244; orchestrator's reading)
+
+Owner: launch 1 "started really well but the doubling started again"; launch 2 "started poorly with bad
+doubling in the right eye and occasional in the left, got worse over time"; launch 3 "bad for both eyes the
+whole time". The Time Trial ghost rendered flat in all three (known, phase D).
+
+Pose check, race, per 5 s window (left and right eyes read the same angle, as one head pose must):
+
+| launch | avg deg | max deg | sets shown at their own time | poses predicted ahead | race late sets |
+| --- | --- | --- | --- | --- | --- |
+| 1 measure | 0.07-0.19 | 0.26-1.10 | 4097 of 4150 | 41.4 ms | 1.8 % |
+| 2 one ahead | 0.08-0.30 | 0.80-1.61 | 2012 of 3265 (off 3.2 ms avg) | 33.4 ms | 39.6 %, last window 88 of 543 on time |
+| 3 fresh pose | 0.05-0.11 | 0.16-0.50 | 5802 of 5900 | 41.5 ms | 2.0 % |
+
+GalaxyFrame on this headset (44 windows in its own log): avg 0.023 deg median, max 0.078 median, 0.20 worst.
+Launch 1 is 3-8x GalaxyFrame's average and 2-5x its max, well under "a degree or more" on average.
+Menus (quad layer): 0.04-0.05 avg, 0.1-0.7 max in all launches.
+
+Panels (`frame/perf/panels/analyse.sh`, then H7's zigzag rule on sparse captures, `~/.cache/kf-h12/zig2.py`;
+the recorder captured every second refresh much of the time, so counts are small): zigzag share of moving
+test refreshes in the race, left / right:
+
+| launch | left | right | owner |
+| --- | --- | --- | --- |
+| 1 | 55 % (114 of 209) | 54 % (107 of 198) | doubled |
+| 2 | 22 % (49 of 221) | 79 % (165 of 208) | right bad, left occasional |
+| 3 | 79 % (103 of 130) | 28 % (36 of 127) | both bad |
+| H7 launch 1 (same rule, for scale) | 42 % | 99 % | right worse |
+
+Launch 1 by time: the first 6 s of moving refreshes after the race loaded (video 24-30 s, kart standing,
+head turning) 1 of 22 zigzag; from video 32 s on (driving) 55-95 % per 2 s window. That is the owner's
+"started well, then the doubling started". Pacing in launch 1 after the course load: 0 late, GPU 4.6-5.3 ms,
+end p50 0.3-0.4 ms; nothing in the pacing changes where the zigzag starts.
+
+Reading: launch 3 handed SteamVR a pose for the very display time of each race frame and the doubling stayed
+(both eyes per the owner, left-dominant per the panels), so the prediction distance of the hand-over is not
+the cause; launch 2 did not fit a refresh on the headset (26 % late sets overall, 13.7 % retained repeats,
+rising through the race) and says nothing beyond that. New facts for the next lane: (1) the affected eye is
+not fixed: right in launch 2 and H7, left in launch 3, both in launch 1, i.e. decided per launch (a parity
+of something set at start-up); (2) the zigzag was absent while the kart stood still with the head turning
+and began with driving (scene motion), in launch 1; (3) the pose error is identical for both eyes, so the
+eye poses are not it. Next per the plan: an xrprobe session that submits KartFrame's own race eye images
+through GalaxyFrame's loop; and, headless first, a mock run that dumps 2 s of consecutive eye images while
+driving with the mock's head sway, measured with the panel scripts, to see whether the period-2 jump is in
+the images KartFrame renders (interpolation phase per eye) before any headset time is spent.
