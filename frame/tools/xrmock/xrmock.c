@@ -442,6 +442,12 @@ static XrResult XRAPI_CALL mAcquire(XrSwapchain sc, const XrSwapchainImageAcquir
         return XR_ERROR_CALL_ORDER_INVALID;
     }
     *idx = (uint32_t)c->next;
+    // Lane U, strict release check (MOCK_XR_BUSY_MS): nothing may write an image between its release and
+    // its next acquire, whatever the app's queue order.
+    if (gGfx && gGfx->acquire_check && getenv("MOCK_XR_BUSY_MS") && gGfx->acquire_check(c->images, (int)*idx)) {
+        trace("ERROR sc%d image %u changed between its release and its next acquire", chainId(sc), *idx);
+        gErrors++;
+    }
     c->next = (c->next + 1) % c->count;
     c->acquired++;
     compAcquire(chainId(sc), (int)*idx);
@@ -449,6 +455,7 @@ static XrResult XRAPI_CALL mAcquire(XrSwapchain sc, const XrSwapchainImageAcquir
     return XR_SUCCESS;
 }
 static int gReleases = 0, gBusyReleases = 0;
+static int gWaits;
 static double gBusyMaxMs = 0.0;
 static int gWaitHist[5];
 static int gPoseAge[6];  // display time minus locate time in refreshes: <0, 0, 1, 2, 3, more
@@ -1280,7 +1287,7 @@ static XrResult XRAPI_CALL mRelease(XrSwapchain sc, const XrSwapchainImageReleas
         // Exact: the image's bytes at the release against its bytes once all work queued
         // before the release completed (xrmock_vk.c).  Other work in the queue does not count.
         int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
-        gGfx->release_snapshot(c->images, idx);
+        gGfx->release_snapshot(c->images, idx, chainId(sc), gWaits);
         gReleases++;
     } else if (busyCheck && gGfx && gGfx->release_wait_ms) {
         // The wait includes other processes' GPU work (the desktop's
@@ -1334,6 +1341,7 @@ static XrResult XRAPI_CALL mEndSession(XrSession s) {
         gErrors += changed;
         gBusyReleases += changed;
     }
+    if (gGfx && gGfx->release_report && getenv("MOCK_XR_BUSY_MS")) gGfx->release_report();
     if (gGfx && gGfx->snapshots_checked)
         fprintf(stderr, "xrmock: exact release check: %d releases compared after the GPU passed them, %d changed after release\n",
                 gGfx->snapshots_checked(), gBusyReleases);

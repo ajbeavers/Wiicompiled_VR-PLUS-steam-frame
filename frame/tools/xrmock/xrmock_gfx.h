@@ -37,7 +37,8 @@ typedef struct MockGfx {
     // Exact check (MOCK_XR_BUSY_MS, Vulkan): at a release, sample the released image's memory
     // and mark the queue; once the GPU passed the mark, sample again: a difference means the
     // GPU was still writing the image when it was released.  Null: not available.
-    void (*release_snapshot)(void* images, int index);
+    // Lane U: chain (swapchain id) and frame (xrWaitFrame count) label the release-queue latency.
+    void (*release_snapshot)(void* images, int index, int chain, int frame);
     // Compares the snapshots whose marks the GPU passed (wait != 0: all of them, waiting);
     // returns how many changed after their release.
     int (*poll_snapshots)(int wait);
@@ -64,6 +65,11 @@ typedef struct MockGfx {
     // starting "<file> <tag>"). Null: not available.
     int (*dump_async)(void* images, int index, int width, int height, int64_t format, int step, const char* path, const char* tag);
     void (*dump_flush)(void);
+    // Lane U, strict check (MOCK_XR_BUSY_MS): at xrAcquireSwapchainImage, 1 when the image changed since
+    // its last release. Null: not available.
+    int (*acquire_check)(void* images, int index);
+    // Lane U: prints the strict check and the release-queue latency lines at the session's end.
+    void (*release_report)(void);
 } MockGfx;
 
 extern const MockGfx kMockGfxGles;

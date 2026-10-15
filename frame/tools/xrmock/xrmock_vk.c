@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
@@ -270,71 +271,204 @@ static double releaseWaitMs(void) {
 
 // The exact check: SAMPLES chunks of the image's memory at its release, compared again once
 // an empty submission made at the release (so after all work queued before it) completed.
+// Lane U: a waiter thread waits those submissions in order and times them: the time from the release
+// to the completion of a submission made inside xrReleaseSwapchainImage is how long SteamVR's own
+// client submission there waits behind the app's queued GPU work (the release-queue line). And the
+// strict check (no queue involved): the image's bytes at its release against its bytes at its next
+// acquire; any difference is a write after the release, however it was ordered on the queue.
 #define SAMPLES 512
 #define CHUNK 64
-#define PENDING 32
+#define PENDING 64
+#define LAT_CHAINS 64
 static struct {
-    int image;
+    int image, chain, frame;
+    int64_t t0;
     VkFence fence;
     unsigned char bytes[SAMPLES * CHUNK];
 } gPending[PENDING];
-static int gPendingCount = 0, gChecked = 0;
+static int gHead = 0, gCount = 0, gChecked = 0, gChanged = 0, gChangedTaken = 0, gThreadUp = 0;
 static VkFence gFreeFences[PENDING];
 static int gFreeFenceCount = 0;
+static pthread_mutex_t gPendMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gPendCond = PTHREAD_COND_INITIALIZER;
+static pthread_t gWaiter;
+// Release-queue latencies (ms) per swapchain and frame parity.
+static struct { float* ms; int n, cap; } gLat[LAT_CHAINS][2];
+// Strict: per image, its sample at the last release (valid until the next acquire).
+static unsigned char* gRelBytes[MAX_IMAGES];
+static int gRelValid[MAX_IMAGES];
+static int gStrictChecked = 0, gStrictChanged = 0;
+
+static int64_t vkNowNs(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000ll + t.tv_nsec;
+}
 
 static void sample(int image, unsigned char* out) {
     VkDeviceSize step = gImages[image].size / SAMPLES;
     for (int k = 0; k < SAMPLES; k++) memcpy(out + k * CHUNK, gImages[image].map + (VkDeviceSize)k * step, CHUNK);
 }
 
-static int pollSnapshots(int wait) {
-    int changed = 0;
-    unsigned char now[SAMPLES * CHUNK];
-    for (int i = 0; i < gPendingCount;) {
-        VkResult r = wait ? DEV(vkWaitForFences)(gDevice, 1, &gPending[i].fence, VK_TRUE, 2000000000ull)
-                          : DEV(vkGetFenceStatus)(gDevice, gPending[i].fence);
-        if (r != VK_SUCCESS) {
-            i++;
-            continue;
+static void* waiterMain(void* arg) {
+    (void)arg;
+    static unsigned char now[SAMPLES * CHUNK];
+    for (;;) {
+        pthread_mutex_lock(&gPendMutex);
+        while (gCount == 0) pthread_cond_wait(&gPendCond, &gPendMutex);
+        int i = gHead;
+        VkFence fence = gPending[i].fence;
+        pthread_mutex_unlock(&gPendMutex);
+        // Ring slot i stays ours until it is popped below.
+        while (DEV(vkWaitForFences)(gDevice, 1, &fence, VK_TRUE, 100000000ull) == VK_TIMEOUT) {
         }
+        int64_t t1 = vkNowNs();
         sample(gPending[i].image, now);
-        if (memcmp(now, gPending[i].bytes, sizeof(now)) != 0) changed++;
+        int changed = memcmp(now, gPending[i].bytes, sizeof(now)) != 0;
+        DEV(vkResetFences)(gDevice, 1, &fence);
+        pthread_mutex_lock(&gPendMutex);
+        int c = gPending[i].chain, par = gPending[i].frame & 1;
+        if (c >= 0 && c < LAT_CHAINS) {
+            if (gLat[c][par].n == gLat[c][par].cap) {
+                gLat[c][par].cap = gLat[c][par].cap ? 2 * gLat[c][par].cap : 4096;
+                gLat[c][par].ms = (float*)realloc(gLat[c][par].ms, sizeof(float) * (size_t)gLat[c][par].cap);
+            }
+            gLat[c][par].ms[gLat[c][par].n++] = (float)((t1 - gPending[i].t0) / 1e6);
+        }
+        gChanged += changed;
         gChecked++;
-        DEV(vkResetFences)(gDevice, 1, &gPending[i].fence);
-        gFreeFences[gFreeFenceCount++] = gPending[i].fence;
-        gPending[i] = gPending[--gPendingCount];
+        gFreeFences[gFreeFenceCount++] = fence;
+        gHead = (gHead + 1) % PENDING;
+        gCount--;
+        pthread_cond_broadcast(&gPendCond);
+        pthread_mutex_unlock(&gPendMutex);
     }
+    return NULL;
+}
+
+// Returns how many released images changed after their release since the last call (wait != 0: once
+// every queued check finished).
+static int pollSnapshots(int wait) {
+    pthread_mutex_lock(&gPendMutex);
+    if (wait) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += 3;
+        while (gCount > 0 && pthread_cond_timedwait(&gPendCond, &gPendMutex, &until) == 0) {
+        }
+    }
+    int changed = gChanged - gChangedTaken;
+    gChangedTaken = gChanged;
+    pthread_mutex_unlock(&gPendMutex);
     return changed;
 }
 
-// At a release, inside xrReleaseSwapchainImage: the app holds its queue lock (SteamVR's client
-// submits there too).
-static void releaseSnapshot(void* images, int index) {
-    if (!gQueue) return;
-    VkImage image = ((VkImage*)images)[index];
-    int found = -1;
+static int findMapped(VkImage image) {
     for (int k = 0; k < gImageCount; k++)
-        if (gImages[k].image == image && gImages[k].map && gImages[k].size >= SAMPLES * CHUNK) found = k;
-    if (found < 0 || gPendingCount == PENDING) return;
-    VkFence fence;
-    if (gFreeFenceCount) fence = gFreeFences[--gFreeFenceCount];
-    else {
+        if (gImages[k].image == image && gImages[k].map && gImages[k].size >= SAMPLES * CHUNK) return k;
+    return -1;
+}
+
+// At a release, inside xrReleaseSwapchainImage: the app holds its queue lock (SteamVR's client
+// submits there too). chain, frame: the swapchain and the xrWaitFrame count, for the latency lines.
+static void releaseSnapshot(void* images, int index, int chain, int frame) {
+    if (!gQueue) return;
+    int found = findMapped(((VkImage*)images)[index]);
+    if (found < 0) return;
+    int64_t t0 = vkNowNs();
+    pthread_mutex_lock(&gPendMutex);
+    if (!gThreadUp) gThreadUp = pthread_create(&gWaiter, NULL, waiterMain, NULL) == 0 ? 1 : -1;
+    if (gThreadUp < 0 || gCount == PENDING) {
+        pthread_mutex_unlock(&gPendMutex);
+        return;
+    }
+    VkFence fence = gFreeFenceCount ? gFreeFences[--gFreeFenceCount] : VK_NULL_HANDLE;
+    int slot = (gHead + gCount) % PENDING;  // only this thread adds; the waiter only pops the head
+    pthread_mutex_unlock(&gPendMutex);
+    if (fence == VK_NULL_HANDLE) {
         VkFenceCreateInfo fi;
         memset(&fi, 0, sizeof(fi));
         fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         if (DEV(vkCreateFence)(gDevice, &fi, NULL, &fence) != VK_SUCCESS) return;
     }
-    sample(found, gPending[gPendingCount].bytes);
+    sample(found, gPending[slot].bytes);
+    if (!gRelBytes[found]) gRelBytes[found] = (unsigned char*)malloc(SAMPLES * CHUNK);
+    if (gRelBytes[found]) {
+        memcpy(gRelBytes[found], gPending[slot].bytes, SAMPLES * CHUNK);
+        gRelValid[found] = 1;
+    }
     VkSubmitInfo si;
     memset(&si, 0, sizeof(si));
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     if (DEV(vkQueueSubmit)(gQueue, 1, &si, fence) != VK_SUCCESS) {
+        pthread_mutex_lock(&gPendMutex);
         gFreeFences[gFreeFenceCount++] = fence;
+        pthread_mutex_unlock(&gPendMutex);
         return;
     }
-    gPending[gPendingCount].image = found;
-    gPending[gPendingCount].fence = fence;
-    gPendingCount++;
+    pthread_mutex_lock(&gPendMutex);
+    gPending[slot].image = found;
+    gPending[slot].chain = chain;
+    gPending[slot].frame = frame;
+    gPending[slot].t0 = t0;
+    gPending[slot].fence = fence;
+    gCount++;
+    pthread_cond_broadcast(&gPendCond);
+    pthread_mutex_unlock(&gPendMutex);
+}
+
+// Strict check at xrAcquireSwapchainImage: 1 when the image's bytes differ from those at its last
+// release (written after it was released), 0 same or not checked.
+static int acquireCheck(void* images, int index) {
+    int found = findMapped(((VkImage*)images)[index]);
+    if (found < 0 || !gRelValid[found]) return 0;
+    static unsigned char now[SAMPLES * CHUNK];
+    sample(found, now);
+    gRelValid[found] = 0;
+    gStrictChecked++;
+    int changed = memcmp(now, gRelBytes[found], SAMPLES * CHUNK) != 0;
+    gStrictChanged += changed;
+    return changed;
+}
+
+static int cmpFloat(const void* a, const void* b) {
+    float x = *(const float*)a, y = *(const float*)b;
+    return x < y ? -1 : x > y;
+}
+static float pct(float* v, int n, double p) { return n ? v[(int)(p * (n - 1) + 0.5)] : 0.f; }
+
+// Summary lines (stderr): the strict check and, per swapchain with releases, the release-queue latency.
+static void releaseReport(void) {
+    fprintf(stderr, "xrmock: strict release check: %d images compared at their next acquire, %d changed after release\n",
+            gStrictChecked, gStrictChanged);
+    pthread_mutex_lock(&gPendMutex);
+    for (int c = 0; c < LAT_CHAINS; c++) {
+        int n = gLat[c][0].n + gLat[c][1].n;
+        if (n < 10) continue;
+        char part[2][96];
+        float* all = (float*)malloc(sizeof(float) * (size_t)n);
+        int over1 = 0, over2 = 0, over4 = 0, k = 0;
+        for (int par = 0; par < 2; par++) {
+            qsort(gLat[c][par].ms, (size_t)gLat[c][par].n, sizeof(float), cmpFloat);
+            snprintf(part[par], sizeof(part[par]), "p50 %.2f p90 %.2f", pct(gLat[c][par].ms, gLat[c][par].n, 0.5),
+                     pct(gLat[c][par].ms, gLat[c][par].n, 0.9));
+            for (int j = 0; j < gLat[c][par].n; j++) {
+                float v = gLat[c][par].ms[j];
+                all[k++] = v;
+                over1 += v > 1.f;
+                over2 += v > 2.f;
+                over4 += v > 4.f;
+            }
+        }
+        qsort(all, (size_t)n, sizeof(float), cmpFloat);
+        fprintf(stderr,
+                "xrmock: release queue sc%d: %d releases, ms p50 %.2f p90 %.2f p99 %.2f max %.2f; >1 ms %.1f %%, >2 ms %.1f %%, "
+                ">4 ms %.1f %%; even frames %s, odd frames %s\n",
+                c, n, pct(all, n, 0.5), pct(all, n, 0.9), pct(all, n, 0.99), all[n - 1], 100.0 * over1 / n, 100.0 * over2 / n,
+                100.0 * over4 / n, part[0], part[1]);
+        free(all);
+    }
+    pthread_mutex_unlock(&gPendMutex);
 }
 
 static int snapshotsChecked(void) { return gChecked; }
@@ -938,4 +1072,4 @@ static int dumpAsync(void* images, int index, int width, int height, int64_t for
 
 const MockGfx kMockGfxVk = {"vk", ownsBinding, describeBinding, getProc, formats, formatOf, createImages, fillImages, releaseWaitMs,
                             releaseSnapshot, pollSnapshots, snapshotsChecked, dumpImage, stampCapture, stampRead, stampScene, stampPose,
-                            dumpAsync, dumpFlush};
+                            dumpAsync, dumpFlush, acquireCheck, releaseReport};
