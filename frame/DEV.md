@@ -185,3 +185,13 @@ display time and the scene words). frame/perf/mockdump/dumprace.sh NAME records 
 (head still, standing with the sway, driving); frame/perf/mockdump/zigzag.py DIR applies H7's zigzag
 rule, a betweenness test and a lagdiff per eye (ZZ_INJECT=2: positive control, ZZ_TRACK=1: positions).
 Results: frame/perf/LANE_S.md; next: frame/perf/session-h13/README.md.
+
+## Lane T (session 13: the recorded race images through xrprobe)
+`frame/tools/xrprobe/xrprobe.c --replay DIR` plays a dumprace.sh recording's eye images at their recorded
+poses and fov (one set per refresh by display time; `--replay-window standing|driving`, `--replay-offset`,
+`--replay-pairs 3` KartFrame's sets ahead, `--replay-quad` the race quad, `--replay-hold 2`). Build:
+`cmake -S frame/tools/xrprobe -B ~/.cache/kf-xrprobe -G Ninja -DCMAKE_C_COMPILER=clang` (OpenXR headers from
+GalaxyFrame's tree, or -DOPENXR_INCLUDE=...), then the build under the KartFrame lock. `replay-case.sh N`
+runs case N (1..6); `frame/perf/session-h13/queue.sh BINARY RECORDING` queues the six as KartFrame launches
+(KARTFRAME_EXE in a session.queue file, recorded). Headless: `PROBE_MOCK=1 PROBE_SET=replay run-probes.sh`
+(the mock runtime, detailed trace per case), then `frame/perf/session-h13/replaycheck.py DIR`.

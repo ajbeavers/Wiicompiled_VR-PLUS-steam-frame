@@ -11,7 +11,7 @@
 set -u
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 CASES=(
-"1|1-standing|1 StAnd|--replay-window standing"
+"1|1-standing|1 StAnd|--replay-window standing --replay-sets 168"
 "2|2-driving|2 drivE|--replay-window driving"
 "3|3-phase|3 PHASE|--replay-window driving --replay-offset 1"
 "4|4-pairs|4 PAIrS|--replay-window driving --replay-pairs 3"
