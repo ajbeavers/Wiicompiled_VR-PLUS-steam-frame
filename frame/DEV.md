@@ -125,6 +125,8 @@ The default `pipelined` loop renders each set two refreshes ahead and ends every
 wake-up with the newest finished set (else the retained layer), never waiting inside the cycle.
 KARTFRAME_PIPELINED=wait restores the old one-set-at-a-time loop. KARTFRAME_EYE_PAIRS defaults to 3 with
 sets ahead (3 to 8) and 2 with wait. KARTFRAME_AHEAD_START_US delays each set's start after the wake-up.
+KARTFRAME_END_DELAY_US (test only, default 0, max 8000) sleeps that long after the wake-up before the frame is ended (same
+set; the next set starts at the wake-up, before the sleep); the XRF e= field and end_late= then show the lateness by design.
 The pacing line ends with dropped= (finished sets released unshown) and end_late= (ends more than 1 ms
 after the wake-up). Mock: MOCK_XR_LATE_END_MS (1.5) models late ends; KF_MOCKRUN_END_GATE=<percent>
 fails a run with more late ends. Details: frame/perf/H7.md.

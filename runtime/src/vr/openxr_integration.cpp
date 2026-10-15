@@ -859,6 +859,10 @@ public:
                                            ? "; each set starts " + std::to_string(ahead_start_delay_.count()) +
                                                  " us after the wake-up (KARTFRAME_AHEAD_START_US)"
                                            : std::string())
+                                   << (ahead_ && ahead_end_delay_.count() > 0
+                                           ? "; each frame is ended " + std::to_string(ahead_end_delay_.count()) +
+                                                 " us after the wake-up (KARTFRAME_END_DELAY_US, test only)"
+                                           : std::string())
                                    << std::endl;
         }
         running_.store(true, std::memory_order_release);
@@ -1531,6 +1535,13 @@ private:
             start_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
         }
         ahead_start_delay_ = std::chrono::microseconds(start_us);
+        // KARTFRAME_END_DELAY_US (test only, default 0): after the wake-up the pacing thread sleeps this
+        // long before it ends the frame (same set as without; the next set still starts at the wake-up).
+        long end_delay_us = 0;
+        if (const char* env = std::getenv("KARTFRAME_END_DELAY_US"); env != nullptr && *env != '\0') {
+            end_delay_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
+        }
+        ahead_end_delay_ = std::chrono::microseconds(end_delay_us);
         // KARTFRAME_AHEAD_REFRESHES=1 (lane M): each set is located for the next refresh's display time
         // instead of two refreshes ahead: one refresh less pose prediction (about 33 ms instead of 42),
         // one refresh less for its encode and GPU work. Up to two sets stay in flight either way.
@@ -1970,7 +1981,7 @@ private:
         const bool render_tick = (!st.half_rate || st.odd_tick) &&
                                  interpolation_pacing_.ShouldRender(target, interpolation_target);
         bool started_early = false;
-        if (ahead_lead_ == 1) {
+        if (ahead_lead_ == 1 || ahead_end_delay_.count() > 0) {
             const XrTime gone = chosen >= 0 ? ahead_sets_[static_cast<size_t>(chosen)].set.xr_frame.predicted_display_time
                                             : ahead_shown_time_;
             size_t in_flight = 0;
@@ -1981,6 +1992,12 @@ private:
                 backend_->EndCycleRetained();
                 return started;
             }
+        }
+        // KARTFRAME_END_DELAY_US (test only): the next set has started above (or waits for the start after the
+        // end if Aurora was busy); the frame is ended this long after the wake-up, bounded by the cycle's end.
+        if (ahead_end_delay_.count() > 0) {
+            std::this_thread::sleep_until(std::min(backend_->CycleWakeTime() + ahead_end_delay_,
+                                                   backend_->CycleWakeTime() + std::chrono::nanoseconds(period) - pacing_margin_));
         }
         if (chosen >= 0) {
             auto& a = ahead_sets_[static_cast<size_t>(chosen)];
@@ -3083,6 +3100,7 @@ private:
     bool ahead_ = false;
     bool ahead_wanted_ = false;
     std::chrono::microseconds ahead_start_delay_{0};
+    std::chrono::microseconds ahead_end_delay_{0};
     size_t ahead_lead_ = 2; // refreshes between a set's start and its display time (KARTFRAME_AHEAD_REFRESHES)
     std::vector<double> prediction_ms_;  // lane R: NotePrediction
     std::chrono::steady_clock::time_point prediction_since_{};
