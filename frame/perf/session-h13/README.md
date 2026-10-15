@@ -135,3 +135,21 @@ The mock runtime (never SteamVR), 120 Hz, 1728 eyes, `MOCK_XR_TRACE_DETAIL=1`, `
 - The wrapper path: queue.sh into a scratch KARTFRAME_HOME, then `frame/kartframe.sh` with the mock's
   XR_RUNTIME_JSON: the queue file became session.env, the wrapper ran replay-case.sh, xrprobe.log landed in the
   session folder, the queue advanced to the next case.
+
+## Headset results (2026-10-15, orchestrator's reading)
+
+Owner, six launches in order: launch 1 "no doubling at all when moving my head"; launches 2 to 5 "no
+doubling"; launch 6 "no doubling". Remark: a quality difference, "not full 3D all the way around" (expected:
+the replay shows fixed recorded images, half resolution (dump step 2), moved with the head, so nothing new
+appears at the edges on a head turn).
+
+Reading: KartFrame's race eye images, through GalaxyFrame's loop AND through KartFrame's own order (three
+pairs, locate two refreshes ahead, the race quad), with the 60 Hz content phase either way, and held two
+refreshes, are all clean on this SteamVR. So the images (lane S), the poses and prediction distance (H12),
+the layer structure, pair count, quad and content phase (this session) are all cleared. What is left is what
+differs between the probe and the live game at submission: the game's GPU work on the swapchain image and
+when SteamVR sees it (the probe's images are uploaded once; the game renders into the image every set and
+releases after its fence), Dawn's queue and the point at which its commands are really submitted relative to
+the fence the release waits on, the Vulkan layer chain of the game process, and GPU contention from the
+game's own ~5 ms per set. Strongest old clue in this light: H7 found the jump size follows the pair count
+(2 pairs: clean +-2-refresh jumps; 6 pairs: 1 to 8 refreshes), i.e. the swapchain image reuse distance.
