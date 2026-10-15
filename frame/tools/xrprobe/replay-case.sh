@@ -21,6 +21,9 @@ CASES=(
 if [ "${1:-}" = --list ]; then printf '%s\n' "${CASES[@]}"; exit 0; fi
 N=${KF_REPLAY_CASE:-}
 case "${1:-}" in [1-6]) N=$1; shift ;; esac
+# Run as the game by the wrapper (the case from the queue file): Steam's launcher appends its own
+# arguments (--oom-score-adjust ...), which the game ignores and xrprobe rejects; drop them.
+[ -n "${KF_REPLAY_CASE:-}" ] && set --
 [ -n "$N" ] && [ "$N" -ge 1 ] 2> /dev/null && [ "$N" -le 6 ] || { echo "replay-case: no case 1..6 given" >&2; exit 2; }
 IFS='|' read -r _ NAME LABEL ARGS <<< "${CASES[$((N - 1))]}"
 BIN=${XRPROBE:-$HERE/xrprobe}
