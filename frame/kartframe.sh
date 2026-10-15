@@ -10,6 +10,7 @@
 # Environment (all optional; session.env below is the way to set them from the Steam library):
 #   KARTFRAME_HOME          data folder, default ~/.local/share/KartFrame (game/, build/, sessions/)
 #   KARTFRAME_REFRESH_HZ    refresh rate asked of SteamVR, 90 or 120 (default 120)
+#   KARTFRAME_EYE_PX        per-eye resolution override asked of SteamVR (default 1728; tests only, 1728 is the floor)
 #   KARTFRAME_FDM_LAYER=0   sets DISABLE_VULKAN_FDM_INJECTION_LAYER=1 (A/B: Valve's FDM layer off)
 #   KARTFRAME_SYSMEM=0      leaves Turnip in tiled mode; default 1 sets TU_DEBUG=sysmem (measured: the
 #                           race holds 120 Hz at 1728 only with it)
@@ -90,7 +91,7 @@ case "$HZ" in 90 | 120) ;; *) log "KARTFRAME_REFRESH_HZ=$HZ is not 90 or 120, us
 VRCMD=${KARTFRAME_VRCMD:-$(command -v vrcmd || echo /opt/steamvr/bin/linuxarm64/vrcmd)}
 VRSETTINGS=${KARTFRAME_VRSETTINGS:-$HOME/.config/openvr/config/steamvr.vrsettings}
 STEAMVR_DIR=${KARTFRAME_STEAMVR_DIR:-/opt/steamvr/bin/linuxarm64}
-SETTINGS="preferredRefreshRate=$HZ framesToThrottle=0 additionalFramesToPredict=0 motionSmoothingOverride=2 resolutionOverride=1728"
+SETTINGS="preferredRefreshRate=$HZ framesToThrottle=0 additionalFramesToPredict=0 motionSmoothingOverride=2 resolutionOverride=${KARTFRAME_EYE_PX:-1728}"
 if [ -z "$SteamAppId" ]; then
     log "no SteamAppId: SteamVR per-app settings NOT applied (not a Steam library launch)"
 elif [ ! -x "$VRCMD" ]; then

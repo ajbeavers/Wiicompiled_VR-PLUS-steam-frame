@@ -48,3 +48,22 @@ not depend on it.
   60 Hz GPU load.
 - Pacing in launch 2: expect xrEndFrame later than 1 ms after the wake-up in about 10-13 % of frames (the
   drain's round trip; mock), no late sets. Late sets above a few percent make launch 2 unreadable.
+
+## Headset results (2026-10-15, orchestrator's reading)
+
+Owner: launch 1 (no desktop) "bad, right eye in particular doubling"; launch 2 (release idle) "bad too, but
+the left eye didn't have doubling, just a lag spike every 3-4 seconds; the right eye was bad".
+
+Logs: launch 1 ran headless (aurora "headless: N frames presented to the offscreen target"; no desktop
+swapchain), race 119.6 sets/s, 0.7 % late, GPU 5.3 ms p50, ends > 1 ms 3.3 %: the desktop present is NOT
+the cause. Launch 2: the drain before the releases took 4-4.9 ms mean (> 4 ms in ~85 % of releases: the
+set's own render, not a backlog), before the end 0.4-1.3 ms; cost: 36.8 % late sets, 36 % retained repeats,
+ends > 1 ms 91 %, 76.6 sets/s (the lag spikes). SteamVR's compositor timing (vrtiming) is identical between
+the doubled launch 1 and session 13's clean probe case 4: 120 frames/s, 0 reused/dropped, compositor GPU
+0.85 vs 0.77 ms, vsyncs to photons 1.00.
+
+Reading: candidates 1 (desktop present) and 2 (backlog at release) are out. What remains is candidate 3,
+our GPU work (3-5 ms per set, heavy and light sets alternating at 60 Hz) against the compositor's per-eye
+compose inside the refresh; launch 2 shifted our render by ~4 ms and cleared the LEFT eye only, which fits
+a phase collision that hits one eye's compose window. Session 15 tests the load from both sides: 90 Hz at
+1728 (11.1 ms refresh) and 120 Hz at 1200 px (half the work, measurement only).
