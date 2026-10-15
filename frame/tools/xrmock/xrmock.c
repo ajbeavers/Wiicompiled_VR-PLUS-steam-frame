@@ -1681,7 +1681,7 @@ static int gLocateNext = 0;
 static double gSwayRad = 0.3, gSwayHz = 0.5, gSwayFrom = 0.0;
 static void headPose(XrTime displayTime, float* yaw, XrPosef* pose) {
     double t = (double)(displayTime - gTimeOffset - gT0) / 1e9;
-    *yaw = t < gSwayFrom ? 0.0f : (float)(gSwayRad * sin((t - gSwayFrom) * 2.0 * 3.14159265 * gSwayHz));
+    *yaw = gSwayFrom > 0.0 && t < gSwayFrom ? 0.0f : (float)(gSwayRad * sin((t - gSwayFrom) * 2.0 * 3.14159265 * gSwayHz));
     pose->orientation = (XrQuaternionf){0, sinf(*yaw * 0.5f), 0, cosf(*yaw * 0.5f)};
     // The head also rises 0.1 mm a second, so no two locates share a pose: the sway alone repeats
     // (yaw at t and at a time mirrored about a sine peak), and the pose check matched such a twin
