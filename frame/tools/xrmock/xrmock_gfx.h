@@ -59,6 +59,11 @@ typedef struct MockGfx {
     // Lane P: the slot's four pose words (rows 7, 9, 11, 13: the packet time, the eye orientation, token and
     // mixed draws, the eye frustum's tangents), same returns as stamp_scene.
     int (*stamp_pose)(int slot, unsigned gen, uint64_t* words);
+    // Lane S, MOCK_XR_DUMP_QUEUE: queue a downscaled copy of image `index` and its stamp rows without waiting
+    // (1 queued); dump_flush waits for the queued copies and writes them (PPM, and a line in <dir>/index.txt
+    // starting "<file> <tag>"). Null: not available.
+    int (*dump_async)(void* images, int index, int width, int height, int64_t format, int step, const char* path, const char* tag);
+    void (*dump_flush)(void);
 } MockGfx;
 
 extern const MockGfx kMockGfxGles;

@@ -72,83 +72,118 @@ def corr(a, b):
 
 # index.txt: file sc frame eye displayns
 wins = collections.defaultdict(dict)  # window -> eye -> {display ns: file}
+scene = collections.defaultdict(dict)  # window -> {display ns: (weight, previous, current game frame)} (left eye)
 for line in open(os.path.join(D, 'index.txt')):
-    f, sc, fr, eye, val = line.split()
+    parts = line.split()
+    f, sc, fr, eye, val = parts[:5]
     if int(eye) < 0 or not os.path.exists(os.path.join(D, f)):
         continue
     wins[f.split('-')[0]].setdefault('LR'[int(eye)], {})[int(val)] = f
+    if len(parts) >= 7 and int(eye) == 0 and (int(parts[5]) >> 48) & 1:
+        a = int(parts[5])
+        scene[f.split('-')[0]][int(val)] = ((a & 0xffff) / 65535.0, (a >> 16) & 0xffff, (a >> 32) & 0xffff)
 PERIOD = 1e9 / float(os.environ.get('MOCK_XR_HZ', '120'))
+
+
+def rule(pos):
+    """H7's zigzag rule on a position track {refresh: px}: (tests, zigzags, mean |dev| in refreshes of motion,
+    lag-1 autocorrelation of the deviation, speed median, |dev| p95 over all sets, deviations by refresh)."""
+    tests = zz = 0
+    amps, z, vs, allz = [], {}, [], []
+    for n in sorted(pos):
+        if n - 1 not in pos or n + 1 not in pos:
+            continue
+        zp = pos[n] - 0.5 * (pos[n - 1] + pos[n + 1])
+        allz.append(abs(zp))
+        ks = [k for k in range(n - 4, n + 6) if k in pos]
+        if ks[-1] - ks[0] < 4:
+            continue
+        v = (pos[ks[-1]] - pos[ks[0]]) / (ks[-1] - ks[0])
+        vs.append(abs(v))
+        if abs(v) < 2:
+            continue
+        tests += 1
+        z[n] = zp
+        if abs(zp) >= 1 and abs(zp / v) >= 0.75:
+            zz += 1
+            amps.append(abs(zp / v))
+    a1 = [(z[k], z[k + 1]) for k in sorted(z) if k + 1 in z]
+    q = sorted(allz)
+    return dict(tests=tests, zz=zz, amp=statistics.fmean(amps) if amps else 0.0, ac1=corr([x for x, _ in a1], [y for _, y in a1]),
+                speed=statistics.median(vs) if vs else 0.0, p95=q[int(0.95 * (len(q) - 1))] if q else float('nan'),
+                ge1=sum(1 for x in q if x >= 1), n=len(q), z=z)
+
+
+def track(items, profs, axis):
+    pos, p, prevn = {}, 0.0, None
+    for n, _ in items:
+        if prevn is not None:
+            p += fit(profs[prevn][axis], profs[n][axis])
+        pos[n] = p
+        prevn = n
+    return pos
+
+
 for win in sorted(wins):
     eyes = wins[win]
     if 'L' not in eyes or 'R' not in eyes:
         continue
     v0 = min(min(eyes['L']), min(eyes['R']))
-    track, dev, lag = {}, {}, {}
+    tracks, lag = {}, {}
     for e in 'LR':
         items = sorted((round((v - v0) / PERIOD), f) for v, f in eyes[e].items())
-        W = H = None
-        prof, cen = {}, {}
+        profs, cen = {}, {}
         for n, f in items:
             W, H, g = ppm_gray(os.path.join(D, f))
-            if len(sys.argv) > 5:
-                x0, y0, rw, rh = map(int, sys.argv[2:6])
-            else:
-                x0, y0, rw, rh = W // 10, W // 12, W * 8 // 10, W * 3 // 10  # sky, hills, track edge; not the stamp
-            prof[n] = cols(region(g, W, x0, y0, rw, rh), rw, rh)
-            cen[n] = to16(region(g, W, W // 4, W // 8, W // 2, W // 4))
-        pos, p, prevn = {}, 0.0, None
-        for n, _ in items:
-            if prevn is not None:
-                p += fit(prof[prevn], prof[n])
-            pos[n] = p
-            prevn = n
-        track[e] = pos
+            # view: columns of the sky, hills and track edge (head and kart turning; clear of the stamp);
+            # left / right: columns of the track-side strips at the horizon (fences, banners): forward motion
+            # moves them apart (scene: (right - left) / 2), turning moves them together.
+            x0, y0, rw, rh = W // 10, H // 12, W * 8 // 10, H * 3 // 10
+            sy0, sh, sw = H * 28 // 100, H * 18 // 100, W * 30 // 100
+            profs[n] = (cols(region(g, W, x0, y0, rw, rh), rw, rh), cols(region(g, W, 2, sy0, sw, sh), sw, sh),
+                        cols(region(g, W, W - 2 - sw, sy0, sw, sh), sw, sh))
+            cen[n] = to16(region(g, W, W // 4, H // 8, W // 2, H // 4))
+        tl, tr = track(items, profs, 1), track(items, profs, 2)
+        tracks[e] = {'view': track(items, profs, 0), 'scene': {n: 0.5 * (tr[n] - tl[n]) for n in tl}}
         lag[e] = {n: (rmsdiff16(cen[n], cen[n - 1]) if n - 1 in cen else None, rmsdiff16(cen[n], cen[n - 2]) if n - 2 in cen else None) for n in cen}
-    span = max(max(track['L']), max(track['R'])) + 1
-    print(f"== window {win}: sets L {len(track['L'])}, R {len(track['R'])} over {span} refreshes (gaps: L {span - len(track['L'])}, R {span - len(track['R'])})")
+    span = max(max(tracks['L']['view']), max(tracks['R']['view'])) + 1
+    print(f"== window {win}: sets L {len(tracks['L']['view'])}, R {len(tracks['R']['view'])} over {span} refreshes")
+    # Scene position per set from the left eye's stamp (game frames).
+    sp = {}
+    for v, (w, prev, cur) in scene.get(win, {}).items():
+        span_f = (cur - prev) & 0xffff
+        sp[round((v - v0) / PERIOD)] = (cur - span_f + w * span_f, w, cur)
+    pos_s = {}
+    if sp:
+        ks = sorted(sp)
+        base = sp[ks[0]][2]
+        pos_s = {k: sp[k][0] + 65536 * round((base - sp[k][2]) / 65536) for k in ks}
+        steps = [pos_s[k] - pos_s[k - 1] for k in ks if k - 1 in pos_s]
+        alt = sum(1 for k in ks if k - 1 in pos_s and k - 2 in pos_s and abs((pos_s[k] - pos_s[k - 1]) - (pos_s[k - 1] - pos_s[k - 2])) >= 0.3)
+        ws = collections.Counter(round(sp[k][1], 2) for k in ks)
+        print(f"  scene stamp: steps between sets one refresh apart mean {statistics.fmean(steps):.3f} sd {statistics.pstdev(steps):.3f} game frames; "
+              f"consecutive steps differing by 0.3+ {alt} of {len(steps)}; weight 1.0 in {ws.get(1.0, 0)}, 0.0 in {ws.get(0.0, 0)} sets")
+    devs = {}
+    for kind in ('view', 'scene'):
+        for e in 'LR':
+            r = rule(tracks[e][kind])
+            devs[kind, e] = r['z']
+            pos = tracks[e][kind]
+            st = [(pos[k] - pos[k - 1], pos_s[k] - pos_s[k - 1]) for k in pos if k - 1 in pos and k in pos_s and k - 1 in pos_s]
+            cs = corr([a for a, _ in st], [b for _, b in st]) if st else float('nan')
+            print(f"  {kind:6s} {e}: speed p50 {r['speed']:.2f} px/refresh; |dev| p95 {r['p95']:.2f} px (>=1 px {r['ge1']} of {r['n']}); moving {r['tests']}, "
+                  f"zigzag {r['zz']} ({100.0 * r['zz'] / max(r['tests'], 1):.1f} %, mean {r['amp']:.2f} refreshes); lag-1 autocorr {r['ac1']:+.2f}; "
+                  f"step vs scene step corr {cs:+.2f}")
+        common = [n for n in devs[kind, 'L'] if n in devs[kind, 'R']]
+        print(f"  {kind:6s} eyes: deviation L vs R corr {corr([devs[kind, 'L'][n] for n in common], [devs[kind, 'R'][n] for n in common]):+.2f} over {len(common)} moving sets")
     for e in 'LR':
-        pos = track[e]
-        tests = zz = 0
-        amps, z, vs, still, copy2, allz = [], {}, [], [], 0, []
-        for n in sorted(pos):
-            if n - 1 not in pos or n + 1 not in pos:
-                continue
-            zp = pos[n] - 0.5 * (pos[n - 1] + pos[n + 1])
-            allz.append(abs(zp))
-            ks = [k for k in range(n - 4, n + 6) if k in pos]
-            if ks[-1] - ks[0] < 4:
-                continue
-            v = (pos[ks[-1]] - pos[ks[0]]) / (ks[-1] - ks[0])
-            vs.append(abs(v))
-            if abs(v) < 2:
-                still.append(abs(zp))
-                continue
-            tests += 1
-            z[n] = zp
-            if n - 2 in pos and abs(pos[n] - pos[n - 2]) < 0.25:
-                copy2 += 1
-            if abs(zp) >= 1 and abs(zp / v) >= 0.75:
-                zz += 1
-                amps.append(abs(zp / v))
-        dev[e] = z
-        ks = sorted(z)
-        a1 = [(z[k], z[k + 1]) for k in ks if k + 1 in z]
-        ac1 = corr([x for x, _ in a1], [y for _, y in a1])
-        q = sorted(allz)
-        p95 = q[int(0.95 * (len(q) - 1))] if q else float('nan')
-        print(f"  {e}: speed median {statistics.median(vs) if vs else 0:.2f} px/refresh; |dev| all sets p50 {statistics.median(q) if q else 0:.2f} "
-              f"p95 {p95:.2f} px, >=1 px {sum(1 for x in q if x >= 1)} of {len(q)}; moving tests {tests}, zigzag {zz} "
-              f"({100.0 * zz / max(tests, 1):.1f} %), mean |dev| {statistics.fmean(amps) if amps else 0:.2f} refreshes; lag-1 autocorr "
-              f"{ac1:+.2f}; at set n-2's position {copy2}")
         l1 = [x for x, y in lag[e].values() if x is not None]
         l2 = [y for x, y in lag[e].values() if y is not None]
         stale = sum(1 for x, y in lag[e].values() if x is not None and y is not None and y < 0.5 * x)
         ident = sum(1 for x, y in lag[e].values() if (x is not None and x < 0.5) or (y is not None and y < 0.5))
-        print(f"     lagdiff (gray levels): vs set before p50 {statistics.median(l1) if l1 else 0:.1f}, vs two before p50 "
-              f"{statistics.median(l2) if l2 else 0:.1f}; closer to n-2 than half of n-1 {stale}; identical (<0.5) to n-1 or n-2 {ident}")
-    common = [n for n in dev['L'] if n in dev['R']]
-    print(f"  eyes: deviations L vs R corr {corr([dev['L'][n] for n in common], [dev['R'][n] for n in common]):+.2f} over {len(common)} sets; "
-          f"position step L vs R corr {corr([track['L'][n] - track['L'][n - 1] for n in track['L'] if n - 1 in track['L'] and n in track['R'] and n - 1 in track['R']], [track['R'][n] - track['R'][n - 1] for n in track['L'] if n - 1 in track['L'] and n in track['R'] and n - 1 in track['R']]):+.2f}")
+        print(f"  lagdiff {e}: vs set before p50 {statistics.median(l1) if l1 else 0:.1f}, two before p50 {statistics.median(l2) if l2 else 0:.1f} "
+              f"gray levels; nearer n-2 than half of n-1: {stale}; identical (<0.5) to n-1 or n-2: {ident}")
     if os.environ.get('ZZ_TRACK'):
         for n in range(span):
-            print('   ', n, ' '.join(f"{track[e].get(n, float('nan')):8.2f}" for e in 'LR'))
+            print('   ', n, ' '.join(f"{tracks[e][k].get(n, float('nan')):8.2f}" for k in ('view', 'scene') for e in 'LR'),
+                  f"{pos_s.get(n, float('nan')):.3f}", sp.get(n, ('',))[1:2])

@@ -88,6 +88,10 @@
 //                             time (e.g. 1000: from <start> on), none from <until> s on (0: never stops)
 //   MOCK_XR_SWAY=<deg>,<period s>[,<from s>]  (lane S) the head's side-to-side sway (17.19,2), still
 //                             (yaw 0) until <from> s after the session began
+//   MOCK_XR_DUMP_QUEUE=<slots>  (lane S, Vulkan) dumps without stalling: each image blitted down to
+//                             1/MOCK_XR_DUMP_STEP (linear filter) into one of <slots> host slots and written
+//                             once the dumps pause for 0.3 s (index.txt: file, swapchain, frame, eye, display
+//                             time, the two scene words of the stamp)
 //   MOCK_XR_DUMP also writes <dir>/index.txt: per image the file, swapchain, frame, and with
 //                             MOCK_XR_STAMP the eye and the display time its stamp names (lane S)
 // The graphics API is chosen by the app's binding (xrmock_gfx.h).
@@ -1183,6 +1187,9 @@ static XrResult XRAPI_CALL mWaitImage(XrSwapchain sc, const XrSwapchainImageWait
     }
     return XR_SUCCESS;
 }
+// MOCK_XR_DUMP_QUEUE (lane S): queued dumps are written once none was queued for 0.3 s (mEndFrame) and at the end.
+static int64_t gDumpLastNs;
+static int gDumpPending;
 // MOCK_XR_DUMP (see the top): the image being released, written at the dump times.
 static void maybeDump(Chain* c, XrSwapchain sc) {
     static const char* dir = NULL;
@@ -1215,6 +1222,18 @@ static void maybeDump(Chain* c, XrSwapchain sc) {
     int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
     char path[512];
     snprintf(path, sizeof(path), "%s/t%05.1f-sc%d-%03d.ppm", dir, at[mark - 1], chainId(sc), c->dumped);
+    static int queued = -1;
+    if (queued < 0) queued = getenv("MOCK_XR_DUMP_QUEUE") && gGfx->dump_async;
+    if (queued) {
+        char tag[64];
+        snprintf(tag, sizeof(tag), "sc%d f%d", chainId(sc), gFrame);
+        if (gGfx->dump_async(c->images, idx, c->w, c->h, c->format, step, path, tag)) {
+            gDumpLastNs = nowNs();
+            gDumpPending = 1;
+        }
+        c->dumped++;  // never the stalling path (the race quad and other small chains are not queued)
+        return;
+    }
     if (gGfx->dump_image(c->images, idx, c->w, c->h, c->format, step, path)) {
         trace("dump sc%d %s", chainId(sc), path);
         // Lane S: <dir>/index.txt, one line per image: file, swapchain, frame (xrWaitFrame count), and with
@@ -1308,6 +1327,8 @@ static XrResult XRAPI_CALL mBeginSession(XrSession s, const XrSessionBeginInfo* 
 }
 static XrResult XRAPI_CALL mEndSession(XrSession s) {
     (void)s;
+    if (gDumpPending && gGfx && gGfx->dump_flush) gGfx->dump_flush();
+    gDumpPending = 0;
     if (gGfx && gGfx->poll_snapshots) {
         int changed = gGfx->poll_snapshots(1);
         gErrors += changed;
@@ -1634,6 +1655,10 @@ static XrResult XRAPI_CALL mEndFrame(XrSession s, const XrFrameEndInfo* ei) {
         gEndTimeMatch++;
     }
     gBegunPredicted = 0;
+    if (gDumpPending && nowNs() - gDumpLastNs > 300000000ll && gGfx && gGfx->dump_flush) {
+        gGfx->dump_flush();
+        gDumpPending = 0;
+    }
     gEnds++;
     noteLayerShape(ei->layerCount ? shape : "-");
     if (ei->layerCount == 0) gEmptyEnds++;
