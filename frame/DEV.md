@@ -61,11 +61,16 @@ every refresh always by default (a late set repeats the retained layer, which St
 half rate is 60 Hz content shown twice, the judder H1 rejected); KARTFRAME_HALF_RATE=1 always every
 second refresh (measurements), =auto drops after more than 5 % late over 30 s and stays there for
 the session; KARTFRAME_PACING_DEBUG=1 per-set timelines;
-KARTFRAME_NO_GPU_WAIT=1 negative test only. The wrapper sets TU_DEBUG=sysmem unless
+KARTFRAME_NO_GPU_WAIT=1 negative test only. KARTFRAME_RELEASE=idle (lane U, headset A/B) drains Dawn's
+queue (vkQueueWaitIdle under the queue guard) right before each set's releases and its xrEndFrame, so
+SteamVR's client submissions there never wait behind our next set's GPU work; logs `release idle
+drain` every 10 s (frame/perf/LANE_U.md). The wrapper sets TU_DEBUG=sysmem unless
 KARTFRAME_SYSMEM=0 (the race holds 120 Hz at 1728 only with it). Log line per second:
 `vr pacing: t= hz= mode= ticks= rendered= interpolated= late= missed= repeats= gpu_ms=p50/p99 encode_ms=p50/p99`
 (format in runtime/include/vr/openxr_diagnostics.h); session-report.py reads it with vrtiming.log.
-Mock: MOCK_XR_BUSY_MS (exact released-unfinished check), MOCK_XR_FOCUS_BLIP=<ms>[@<s>],
+Mock: MOCK_XR_BUSY_MS (exact released-unfinished check; lane U: plus the strict check, bytes at the
+release against the next acquire, and `release queue scN` lines: how long a submission made inside
+xrReleaseSwapchainImage waits behind the app's queued GPU work, per swapchain and frame parity), MOCK_XR_FOCUS_BLIP=<ms>[@<s>],
 MOCK_XR_PROFILE, MOCK_XR_EYE, MOCK_XR_TIME_OFFSET_S, MOCK_XR_DUMP=<dir> (released images as PPM at
 MOCK_XR_DUMP_AT seconds); mockrun seeds welcome/tutorial done so the demo race starts by itself
 (KF_MOCKRUN_INTRO=1 shows them). KARTFRAME_FPSLOG=1 logs the game frame rate every 5 s;

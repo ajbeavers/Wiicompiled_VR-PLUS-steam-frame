@@ -186,6 +186,16 @@ public:
         return failed_;
     }
 
+    // Lane U, KARTFRAME_RELEASE=idle: the caller holds the queue guard (Dawn's device lock); drains
+    // Dawn's queue so that nothing of ours is queued or running on the GPU when SteamVR's client
+    // submits inside xrReleaseSwapchainImage. Returns the wait in ms (-1: no queue).
+    double DrainHeldMs() {
+        if (!queue_ || !vkQueueWaitIdle_) return -1.0;
+        const int64_t start = diagnostics::detail::NowNs();
+        vkQueueWaitIdle_(queue_);
+        return static_cast<double>(diagnostics::detail::NowNs() - start) / 1.0e6;
+    }
+
 private:
     static constexpr uint64_t kRing = 64;
 
@@ -1770,11 +1780,13 @@ public:
             OpenXRFrame located = active_frame_;
             located.predicted_display_time = retained_locate_time_;
             last_end_display_time_ = retained_locate_time_;
+            DrainBeforeEnd();
             const bool ok = runtime_->EndFrame(located, layers, count);
             NoteEndAfterWake();
             return ok;
         }
         last_end_display_time_ = std::max(last_end_display_time_, active_frame_.predicted_display_time);
+        DrainBeforeEnd();
         const bool ok = runtime_->EndFrame(active_frame_, layers, count);
         NoteEndAfterWake();
         return ok;
@@ -2318,8 +2330,63 @@ private:
         return true;
     }
 
+    // Lane U: KARTFRAME_RELEASE=idle drains Dawn's queue (vkQueueWaitIdle, queue guard held) right before
+    // the releases, so SteamVR's client submission inside xrReleaseSwapchainImage never waits behind our
+    // next set's GPU work (the probe, clean on the headset, had nothing queued there). Default: the set's
+    // own GPU-complete wait only. Logs the drain's cost every 10 s.
+    static bool ReleaseIdleSetting() {
+        static const bool idle = [] {
+            const char* env = std::getenv("KARTFRAME_RELEASE");
+            return env != nullptr && std::string_view(env) == "idle";
+        }();
+        return idle;
+    }
+    struct ReleaseDrainStats {
+        int64_t since_ns = 0;
+        uint32_t count[2] = {}, over1[2] = {}, over4[2] = {};
+        double sum[2] = {}, max[2] = {};
+    } release_drain_;
+
+    // which: 0 before the releases, 1 before xrEndFrame.
+    void NoteReleaseDrain(double ms, int which) {
+        if (ms < 0.0) return;
+        auto& d = release_drain_;
+        const int64_t now = diagnostics::detail::NowNs();
+        if (d.since_ns == 0) d.since_ns = now;
+        ++d.count[which];
+        d.sum[which] += ms;
+        d.max[which] = std::max(d.max[which], ms);
+        d.over1[which] += ms > 1.0;
+        d.over4[which] += ms > 4.0;
+        if (now - d.since_ns < 10'000'000'000ll) return;
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "release idle drain (KARTFRAME_RELEASE=idle): before release %u, mean %.2f ms, max %.2f, >1 ms %u, >4 ms %u; "
+                      "before end %u, mean %.2f ms, max %.2f, >1 ms %u",
+                      d.count[0], d.count[0] ? d.sum[0] / d.count[0] : 0.0, d.max[0], d.over1[0], d.over4[0], d.count[1],
+                      d.count[1] ? d.sum[1] / d.count[1] : 0.0, d.max[1], d.over1[1]);
+        Log(OpenXRLogLevel::Info, line);
+        d = {};
+        d.since_ns = now;
+    }
+
+    // KARTFRAME_RELEASE=idle: the same drain before xrEndFrame of a frame that released eye images (the frame
+    // worker may have submitted the next set since the releases; SteamVR's client submits in xrEndFrame too).
+    void DrainBeforeEnd() {
+        if (!ReleaseIdleSetting() || runtime_ == nullptr || !released_eyes_) return;
+        released_eyes_ = false;
+        const auto queue_guard = runtime_->LockGraphicsQueue();
+        if (queue_guard.token) NoteReleaseDrain(gpu_.DrainHeldMs(), 1);
+    }
+    bool released_eyes_ = false;
+
     bool ReleaseAcquiredSwapchains() {
         const auto queue_guard = runtime_ ? runtime_->LockGraphicsQueue() : OpenXRRuntime::GraphicsQueueGuard{nullptr, nullptr};
+        if (ReleaseIdleSetting() && queue_guard.token &&
+            (eye_swapchains_[0].acquired || eye_swapchains_[1].acquired)) {
+            NoteReleaseDrain(gpu_.DrainHeldMs(), 0);
+            released_eyes_ = true;
+        }
         bool success = true;
         for (auto& swapchain : eye_swapchains_) {
             success = ReleaseSwapchain(swapchain) && success;
