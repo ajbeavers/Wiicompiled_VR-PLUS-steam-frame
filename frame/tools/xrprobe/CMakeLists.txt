@@ -2,6 +2,9 @@
 # synthesis on the Steam Frame. Not part of the game build.
 #   cmake -S tools/xrprobe -B tools/xrprobe/build -G Ninja -DCMAKE_C_COMPILER=clang
 #   flock ~/Games/GalaxyQuest/.build.lock cmake --build tools/xrprobe/build
+# KartFrame (frame/tools/xrprobe): build outside the worktree, under KartFrame's build lock:
+#   cmake -S frame/tools/xrprobe -B ~/.cache/kf-xrprobe -G Ninja -DCMAKE_C_COMPILER=clang
+#   flock ~/Games/KartFrame/.build.lock cmake --build ~/.cache/kf-xrprobe
 cmake_minimum_required(VERSION 3.20)
 project(xrprobe C)
 
@@ -24,6 +27,8 @@ execute_process(COMMAND git rev-parse --path-format=absolute --git-common-dir
 if(_git_common)
   list(APPEND _xr_candidates ${_git_common}/../third_party/openxr/prefab/modules/headers/include)
 endif()
+# KartFrame keeps no OpenXR SDK of its own: GalaxyFrame's copy (1.1.42 or newer for XR_EXT_frame_synthesis).
+list(APPEND _xr_candidates $ENV{HOME}/Games/GalaxyQuest/src/third_party/openxr/prefab/modules/headers/include)
 find_path(OPENXR_INCLUDE openxr/openxr.h PATHS ${_xr_candidates} NO_DEFAULT_PATH)
 if(NOT OPENXR_INCLUDE)
   message(FATAL_ERROR "OpenXR headers not found: run tools/fetch_openxr.sh or pass -DOPENXR_INCLUDE=<dir>")

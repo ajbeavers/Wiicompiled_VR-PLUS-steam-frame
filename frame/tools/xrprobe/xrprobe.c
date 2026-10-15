@@ -85,7 +85,7 @@ static const uint32_t kHeavyFrag[] =
 
 // ---------------------------------------------------------------- options
 
-enum Mode { MODE_NONE, MODE_PACE, MODE_PACE_FENCE, MODE_SYNTH, MODE_DEPTH, MODE_SEQUENCE, MODE_SW, MODE_SEQUENCE_SW };
+enum Mode { MODE_NONE, MODE_PACE, MODE_PACE_FENCE, MODE_SYNTH, MODE_DEPTH, MODE_SEQUENCE, MODE_SW, MODE_SEQUENCE_SW, MODE_REPLAY };
 
 static struct {
     enum Mode mode;
@@ -97,7 +97,11 @@ static struct {
     double fps;
     double gpuMs;
     const char* log;
-} g_opt = {MODE_NONE, 0, 0, 0, 0.0f, 30.0, -1.0, 14.0, "xrprobe.log"};
+    const char* replayDir;     // --replay DIR
+    const char* replayWindow;  // standing | driving | a dump-time prefix
+    const char* replayLabel;
+    int replayOffset, replayPairs, replayQuad, replayHold, replaySets;
+} g_opt = {MODE_NONE, 0, 0, 0, 0.0f, 30.0, -1.0, 14.0, "xrprobe.log", NULL, "driving", "", 0, 0, 0, 1, 0};
 
 static const char* modeName(void) {
     switch (g_opt.mode) {
@@ -108,6 +112,7 @@ static const char* modeName(void) {
     case MODE_SEQUENCE: return "sequence";
     case MODE_SW: return g_opt.noMv ? "spacewarp-no-mv" : "spacewarp";
     case MODE_SEQUENCE_SW: return "sequence-sw";
+    case MODE_REPLAY: return "replay";
     default: return "none";
     }
 }
@@ -155,6 +160,14 @@ static uint32_t segChar(char c) {
     case 'P': return 0x73;
     case 't': return 0x78;
     case 'Y': return 0x6E;
+    case 'r': return 0x50;
+    case 'i': return 0x10;
+    case 'v': return 0x1C;
+    case 'H': return 0x76;
+    case 'L': return 0x38;
+    case 'q': return 0x67;
+    case 'U': return 0x3E;
+    case 'I': return 0x30;
     case '-': return 0x40;
     default: return 0;
     }
@@ -581,13 +594,15 @@ typedef struct {
     uint32_t acquired;
 } Chain;
 
-// Returns 0 on success; logs the runtime's answer either way.
+// Returns 0 on success; logs the runtime's answer either way. g_chainUsage, when set, replaces the usage.
+static XrSwapchainUsageFlags g_chainUsage;
 static int createChain(XrSession session, VkDevice dev, const char* what, int64_t format, int32_t w, int32_t h,
                        Chain* c) {
     memset(c, 0, sizeof(*c));
     XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    ci.usageFlags = isDepthFormat(format) ? XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
-                                          : XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.usageFlags = g_chainUsage                ? g_chainUsage
+                    : isDepthFormat(format) ? XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                            : XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
     ci.format = format;
     ci.sampleCount = 1;
     ci.width = (uint32_t)w;
@@ -726,6 +741,8 @@ static void usage(FILE* f, const char* argv0) {
             "  --spacewarp       XR_FB_space_warp (MV + depth), new content every second display slot\n"
             "  --spacewarp --no-mv  the same frame rate, nothing chained\n"
             "  --sequence-sw     the two SpaceWarp cases (6, 7) in one session\n"
+            "  --replay DIR      KartFrame's recorded eye images (a MOCK_XR_DUMP_QUEUE dump with index.txt) at\n"
+            "                    their recorded poses, one set per refresh (frame/perf/session-h13/README.md)\n"
             "options:\n"
             "  --hz N            request display refresh rate N (XR_FB_display_refresh_rate)\n"
             "  --seconds N       seconds per case, counted only while the session is VISIBLE or\n"
@@ -735,7 +752,17 @@ static void usage(FILE* f, const char* argv0) {
             "                    SpaceWarp cases, display rate otherwise)\n"
             "  --gpu-ms N        GPU load target of the pace modes, default 14\n"
             "  --mv-head         motion vectors include head motion (default: object motion only)\n"
-            "  --dry-run         parse, print the configuration, exit\n",
+            "  --dry-run         parse, print the configuration, exit\n"
+            "replay options:\n"
+            "  --replay-window W standing (the first dump window), driving (the second, default) or a\n"
+            "                    dump-time prefix such as t056.5\n"
+            "  --replay-offset N start N sets later (1: the other 60 Hz content phase)\n"
+            "  --replay-pairs N  KartFrame's sets ahead over N eye swapchain pairs (3..8; default: GalaxyFrame\n"
+            "                    order, one swapchain per eye)\n"
+            "  --replay-quad     KartFrame's race quad (1 cm, transparent, 2 m ahead) after the projection\n"
+            "  --replay-hold N   each set for N refreshes (2: 60 Hz content)\n"
+            "  --replay-sets N   play only the first N sets of the window (less memory)\n"
+            "  --replay-label S  label drawn above the image (seven-segment cells, max 8)\n",
             argv0);
 }
 
@@ -805,6 +832,27 @@ static int parseArgs(int argc, char** argv) {
             g_opt.gpuMs = d;
         } else if ((v = optVal(argc, argv, &i, "--log"))) {
             g_opt.log = v;
+        } else if ((v = optVal(argc, argv, &i, "--replay-window"))) {
+            g_opt.replayWindow = v;
+        } else if ((v = optVal(argc, argv, &i, "--replay-label"))) {
+            g_opt.replayLabel = v;
+        } else if ((v = optVal(argc, argv, &i, "--replay-offset"))) {
+            if (parseNum(v, 0, 100000, &d)) goto bad;
+            g_opt.replayOffset = (int)d;
+        } else if ((v = optVal(argc, argv, &i, "--replay-pairs"))) {
+            if (parseNum(v, 3, 8, &d)) goto bad;
+            g_opt.replayPairs = (int)d;
+        } else if ((v = optVal(argc, argv, &i, "--replay-hold"))) {
+            if (parseNum(v, 1, 100, &d)) goto bad;
+            g_opt.replayHold = (int)d;
+        } else if ((v = optVal(argc, argv, &i, "--replay-sets"))) {
+            if (parseNum(v, 2, 100000, &d)) goto bad;
+            g_opt.replaySets = (int)d;
+        } else if (!strcmp(a, "--replay-quad")) {
+            g_opt.replayQuad = 1;
+        } else if ((v = optVal(argc, argv, &i, "--replay"))) {
+            if (setMode(MODE_REPLAY)) goto twoModes;
+            g_opt.replayDir = v;
         } else {
             fprintf(stderr, "xrprobe: unknown or incomplete option '%s'\n", a);
             usage(stderr, argv[0]);
@@ -829,6 +877,10 @@ static int parseArgs(int argc, char** argv) {
     }
     if (g_opt.mvHead && !(g_opt.mode == MODE_SEQUENCE || g_opt.mode == MODE_SEQUENCE_SW || ((g_opt.mode == MODE_SYNTH || g_opt.mode == MODE_SW) && !g_opt.noMv))) {
         fprintf(stderr, "xrprobe: --mv-head goes with --synth (with motion vectors) or --sequence\n");
+        return -1;
+    }
+    if (g_opt.mode != MODE_REPLAY && (g_opt.replayOffset || g_opt.replayPairs || g_opt.replayQuad || g_opt.replayHold != 1)) {
+        fprintf(stderr, "xrprobe: the --replay-* options go with --replay\n");
         return -1;
     }
     return 0;
@@ -1108,6 +1160,675 @@ static void summarize(const char* name, RecList* recs, uint64_t endFailures) {
     recs->n = 0;
 }
 
+// ---------------------------------------------------------------- --replay (KartFrame session 13)
+//
+// Plays eye images recorded from KartFrame in the mock (frame/perf/session-h13/README.md) at their
+// recorded poses: index.txt of a MOCK_XR_DUMP_QUEUE dump, one window (the dump-time prefix of the file
+// names), sets (both eyes of one display time) in display-time order, every image uploaded once into a
+// texture array. Frame n shows set k = (hold * floor(slot / hold) + offset) mod N, slot = round((display
+// time - first display time) / period): a missed refresh skips a set, as in the game. Each eye's image is
+// blitted (linear) into its swapchain image; the layer carries the recording's pose and fov, not the
+// locate's, so SteamVR places the race world-fixed in front of the startup direction.
+
+#define REPLAY_MAX_PAIRS 8
+
+typedef struct {
+    XrTime t;          // recorded display time (ns)
+    char file[2][96];  // left, right
+} RSet;
+static RSet* g_rs;
+static int g_nrs, g_rw, g_rh;
+static char g_rwin[16];
+
+// The recording's view: MOCK_XR_SWAY=0 (head still, yaw 0), the mock's eyes at x -+32 mm, the Frame's own
+// per-eye fields of view (degrees left, right, up, down; the mock's defaults).
+static const float kRecFovDeg[2][4] = {{-59.08f, 50.39f, 49.47f, -60.00f}, {-50.29f, 59.16f, 49.88f, -59.55f}};
+static XrPosef recPose(int e) {
+    XrPosef p = {{0, 0, 0, 1}, {e ? 0.032f : -0.032f, 0, 0}};
+    return p;
+}
+static XrFovf recFov(int e) {
+    const float r = (float)M_PI / 180.0f;
+    return (XrFovf){kRecFovDeg[e][0] * r, kRecFovDeg[e][1] * r, kRecFovDeg[e][2] * r, kRecFovDeg[e][3] * r};
+}
+
+static int cmpSet(const void* a, const void* b) {
+    XrTime x = ((const RSet*)a)->t, y = ((const RSet*)b)->t;
+    return (x > y) - (x < y);
+}
+static int cmpWin(const void* a, const void* b) { return strcmp((const char*)a, (const char*)b); }
+
+static FILE* openPpm(const char* name, int* w, int* h) {
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/%s", g_opt.replayDir, name);
+    FILE* f = fopen(path, "rb");
+    int maxv = 0;
+    if (f && (fscanf(f, "P6 %d %d %d", w, h, &maxv) != 3 || maxv != 255 || fgetc(f) == EOF)) {
+        fclose(f);
+        f = NULL;
+    }
+    return f;
+}
+
+// index.txt: <file> sc<n> f<n> <eye> <display ns> <scene word A> <scene word B>. Windows sorted by name
+// (t052.5 < t056.5): standing = the first, driving = the second, or a name prefix itself.
+static int loadReplayIndex(void) {
+    char path[1200], line[512], file[128];
+    snprintf(path, sizeof(path), "%s/index.txt", g_opt.replayDir);
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "xrprobe: cannot read %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    char wins[32][16];
+    int nw = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char* dash;
+        if (sscanf(line, "%127s", file) != 1 || !(dash = strchr(file, '-')) || dash - file >= 16) continue;
+        *dash = 0;
+        int known = 0;
+        for (int i = 0; i < nw; i++) known |= !strcmp(wins[i], file);
+        if (!known && nw < 32) snprintf(wins[nw++], 16, "%s", file);
+    }
+    qsort(wins, (size_t)nw, sizeof(wins[0]), cmpWin);
+    const char* want = g_opt.replayWindow;
+    int wi = !strcmp(want, "standing") ? 0 : !strcmp(want, "driving") ? 1 : -1;
+    for (int i = 0; wi < 0 && i < nw; i++)
+        if (!strcmp(wins[i], want)) wi = i;
+    if (wi < 0 || wi >= nw) {
+        fprintf(stderr, "xrprobe: window '%s' not in %s (%d windows)\n", want, path, nw);
+        fclose(f);
+        return -1;
+    }
+    snprintf(g_rwin, sizeof(g_rwin), "%s", wins[wi]);
+    rewind(f);
+    int cap = 0, broken = 0;
+    while (fgets(line, sizeof(line), f)) {
+        int eye;
+        long long t;
+        if (sscanf(line, "%127s %*s %*s %d %lld", file, &eye, &t) != 3 || strncmp(file, g_rwin, strlen(g_rwin)) ||
+            file[strlen(g_rwin)] != '-')
+            continue;
+        if (eye < 0 || eye > 1 || t <= 0) {
+            broken++;
+            continue;
+        }
+        int s = g_nrs - 1;
+        while (s >= 0 && g_rs[s].t != t) s--;
+        if (s < 0) {
+            if (g_nrs == cap) g_rs = realloc(g_rs, (size_t)(cap = cap ? cap * 2 : 256) * sizeof(RSet));
+            s = g_nrs++;
+            memset(&g_rs[s], 0, sizeof(RSet));
+            g_rs[s].t = t;
+        }
+        snprintf(g_rs[s].file[eye], sizeof(g_rs[s].file[eye]), "%s", file);
+    }
+    fclose(f);
+    int whole = 0;
+    for (int s = 0; s < g_nrs; s++)
+        if (g_rs[s].file[0][0] && g_rs[s].file[1][0]) g_rs[whole++] = g_rs[s];
+    int halves = g_nrs - whole;
+    g_nrs = whole;
+    qsort(g_rs, (size_t)g_nrs, sizeof(RSet), cmpSet);
+    if (g_opt.replaySets > 0 && g_nrs > g_opt.replaySets) g_nrs = g_opt.replaySets;
+    if (g_nrs < 2) {
+        fprintf(stderr, "xrprobe: window %s has %d whole sets\n", g_rwin, g_nrs);
+        return -1;
+    }
+    FILE* p = openPpm(g_rs[0].file[0], &g_rw, &g_rh);
+    if (!p) {
+        fprintf(stderr, "xrprobe: %s is not a binary PPM\n", g_rs[0].file[0]);
+        return -1;
+    }
+    fclose(p);
+    // Recorded display-time steps between consecutive sets, in refreshes of the median step.
+    XrTime* d = malloc(sizeof(XrTime) * (size_t)g_nrs);
+    for (int s = 1; s < g_nrs; s++) d[s - 1] = g_rs[s].t - g_rs[s - 1].t;
+    double* dd = malloc(sizeof(double) * (size_t)g_nrs);
+    for (int s = 0; s < g_nrs - 1; s++) dd[s] = (double)d[s];
+    double med, p95, mx;
+    percentiles(dd, (size_t)g_nrs - 1, &med, &p95, &mx);
+    int one = 0;
+    for (int s = 0; s < g_nrs - 1; s++) one += lround(dd[s] / med) == 1;
+    printf("replay: window %s: %d sets of %dx%d (%d half sets, %d unstamped images left out); recorded steps: "
+           "%d of %d one refresh (%.3f ms)\n",
+           g_rwin, g_nrs, g_rw, g_rh, halves, broken, one, g_nrs - 1, med * 1e-6);
+    free(d);
+    free(dd);
+    return 0;
+}
+
+static int replaySet(long slot) {
+    long h = g_opt.replayHold, s = (slot >= 0 ? slot / h : -((-slot + h - 1) / h)) * h + g_opt.replayOffset;
+    return (int)(((s % g_nrs) + g_nrs) % g_nrs);
+}
+
+// Every image of the window once into one R8G8B8A8_SRGB array (layer 2k + eye), 16 layers per upload.
+static VkImage replayUpload(const Vk* vk, VkCommandPool pool, VkDeviceMemory* memOut) {
+    const uint32_t layers = 2u * (uint32_t)g_nrs, batch = 16;
+    const VkDeviceSize one = (VkDeviceSize)g_rw * g_rh * 4;
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_SRGB;
+    ici.extent = (VkExtent3D){(uint32_t)g_rw, (uint32_t)g_rh, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = layers;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VkImage img;
+    VK_CHECK(vkCreateImage(vk->device, &ici, NULL, &img));
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(vk->device, img, &req);
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = memoryType(vk, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(vk->device, &mai, NULL, memOut));
+    VK_CHECK(vkBindImageMemory(vk->device, img, *memOut, 0));
+
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = one * batch;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkBuffer buf;
+    VK_CHECK(vkCreateBuffer(vk->device, &bci, NULL, &buf));
+    vkGetBufferMemoryRequirements(vk->device, buf, &req);
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = memoryType(vk, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkDeviceMemory bmem;
+    VK_CHECK(vkAllocateMemory(vk->device, &mai, NULL, &bmem));
+    VK_CHECK(vkBindBufferMemory(vk->device, buf, bmem, 0));
+    unsigned char* map;
+    VK_CHECK(vkMapMemory(vk->device, bmem, 0, VK_WHOLE_SIZE, 0, (void**)&map));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    VkCommandBuffer cmd;
+    VK_CHECK(vkAllocateCommandBuffers(vk->device, &cai, &cmd));
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence;
+    VK_CHECK(vkCreateFence(vk->device, &fci, NULL, &fence));
+    unsigned char* rgb = malloc((size_t)g_rw * 3);
+    double t0 = nowSec();
+    for (uint32_t base = 0; base < layers; base += batch) {
+        uint32_t n = layers - base < batch ? layers - base : batch;
+        VkBufferImageCopy reg[16];
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t layer = base + i;
+            const char* name = g_rs[layer / 2].file[layer % 2];
+            int w, h;
+            FILE* f = openPpm(name, &w, &h);
+            if (!f || w != g_rw || h != g_rh) {
+                LOG("FAIL replay image %s missing or not %dx%d", name, g_rw, g_rh);
+                die();
+            }
+            unsigned char* dst = map + one * i;
+            for (int y = 0; y < h; y++) {
+                if (fread(rgb, 3, (size_t)w, f) != (size_t)w) {
+                    LOG("FAIL replay image %s is short", name);
+                    die();
+                }
+                for (int x = 0; x < w; x++, dst += 4) {
+                    dst[0] = rgb[3 * x];
+                    dst[1] = rgb[3 * x + 1];
+                    dst[2] = rgb[3 * x + 2];
+                    dst[3] = 255;
+                }
+            }
+            fclose(f);
+            reg[i] = (VkBufferImageCopy){one * i, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1}, {0, 0, 0},
+                                         {(uint32_t)g_rw, (uint32_t)g_rh, 1}};
+        }
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img;
+        b.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+        if (base == 0) {
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        }
+        vkCmdCopyBufferToImage(cmd, buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, reg);
+        if (base + n == layers) {
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        }
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        VK_CHECK(vkQueueSubmit(vk->queue, 1, &si, fence));
+        VK_CHECK(vkWaitForFences(vk->device, 1, &fence, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(vk->device, 1, &fence));
+    }
+    free(rgb);
+    vkDestroyFence(vk->device, fence, NULL);
+    vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
+    vkDestroyBuffer(vk->device, buf, NULL);
+    vkFreeMemory(vk->device, bmem, NULL);
+    LOG("replay: %u images (%.0f MB) uploaded in %.1f s", layers, (double)one * layers / 1048576.0, nowSec() - t0);
+    return img;
+}
+
+static void drawPanel(VkCommandBuffer cmd, VkPipelineLayout layout, const Mat4* vp, Mat4 model, const Mat4* aux) {
+    Push p;
+    p.mvp = matMul(vp, &model);
+    p.aux = *aux;
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(p), &p);
+    vkCmdDraw(cmd, 6, 1, 0, 0);
+}
+
+// One set into the acquired images of an eye pair: blit, then the label strip (case label and set
+// number, world-locked with the image) above the horizon.
+static void replayRecord(VkCommandBuffer cmd, Chain* pair, VkImage src, int k, VkFilter filter, VkPipelineLayout layout,
+                         VkPipeline pipe, const Mat4 vpRec[2]) {
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkResetCommandBuffer(cmd, 0));
+    VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+    for (int e = 0; e < 2; e++) {
+        Chain* c = &pair[e];
+        VkImage img = c->images[c->acquired].image;
+        imageBarrier(cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkImageBlit blit = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)(2 * k + e), 1},
+                            {{0, 0, 0}, {g_rw, g_rh, 1}},
+                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                            {{0, 0, 0}, {c->width, c->height, 1}}};
+        vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+        imageBarrier(cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        if (!g_opt.replayLabel[0]) continue;
+        VkRenderingAttachmentInfoKHR att = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+        att.imageView = c->views[c->acquired];
+        att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfoKHR ri = {VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+        ri.renderArea.extent = (VkExtent2D){(uint32_t)c->width, (uint32_t)c->height};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &att;
+        pfnBeginRendering(cmd, &ri);
+        VkViewport vp = {0, 0, (float)c->width, (float)c->height, 0, 1};
+        VkRect2D sc = {{0, 0}, {(uint32_t)c->width, (uint32_t)c->height}};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        Mat4 aux;
+        memset(&aux, 0, sizeof(aux));
+        aux.m[0] = 2.0f;  // label
+        for (int i = 0; i < 8 && g_opt.replayLabel[i]; i++) aux.m[4 + i] = (float)segChar(g_opt.replayLabel[i]);
+        drawPanel(cmd, layout, &vpRec[e], placeQuad(-0.2f, 0.75f, -1.5f, 0.6f, 0.12f), &aux);
+        memset(&aux, 0, sizeof(aux));
+        aux.m[0] = 1.0f;  // number panel: the set, a hue and a ticker stepping with it
+        aux.m[1] = (float)k;
+        aux.m[2] = (float)fmod(k / 12.0, 1.0);
+        drawPanel(cmd, layout, &vpRec[e], placeQuad(0.3f, 0.75f, -1.5f, 0.3f, 0.12f), &aux);
+        pfnEndRendering(cmd);
+    }
+    VK_CHECK(vkEndCommandBuffer(cmd));
+}
+
+static void submitWith(const Vk* vk, VkCommandBuffer cmd, VkFence fence) {
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    VK_CHECK(vkQueueSubmit(vk->queue, 1, &si, fence));
+}
+
+static void locateFor(XrSession session, XrSpace space, XrTime t) {
+    XrViewLocateInfo vli = {XR_TYPE_VIEW_LOCATE_INFO};
+    vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    vli.displayTime = t;
+    vli.space = space;
+    XrViewState vs = {XR_TYPE_VIEW_STATE};
+    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    uint32_t nv = 0;
+    XR_CHECK(xrLocateViews(session, &vli, &vs, 2, &nv, views));
+}
+
+// The frame loop of --replay. pairs 0: GalaxyFrame's order (locate, acquire, blit, fence wait, release,
+// end), one swapchain per eye. pairs >= 3: KartFrame's sets ahead: end each frame at once with the newest
+// finished set due by its display time (else the retained layer), then start the set for two refreshes
+// ahead in the next pair (first in, first out; never the pair on display or one in flight).
+static int runReplay(XrSession session, XrSpace local, Vk* vk, const XrViewConfigurationView vcv[2], int64_t colorFormat) {
+    const int pairsMode = g_opt.replayPairs >= 3, nPairs = pairsMode ? g_opt.replayPairs : 1;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(vk->phys, VK_FORMAT_R8G8B8A8_SRGB, &fp);
+    VkFilter filter = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    vkGetPhysicalDeviceFormatProperties(vk->phys, (VkFormat)colorFormat, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+        LOG("FAIL the eye format %s cannot be a blit destination", vkFormatName(colorFormat));
+        die();
+    }
+    LOG("replay: window %s, %d sets of %dx%d, %s, %d eye pair(s), offset %d, hold %d, blit filter %s, label \"%s\"", g_rwin,
+        g_nrs, g_rw, g_rh, pairsMode ? "KartFrame's sets ahead" : "GalaxyFrame order", nPairs, g_opt.replayOffset,
+        g_opt.replayHold, filter == VK_FILTER_LINEAR ? "linear" : "nearest", g_opt.replayLabel);
+    LOG("replay: layer poses identity, eyes at x -+0.032 m in LOCAL; fov L %.2f,%.2f,%.2f,%.2f R %.2f,%.2f,%.2f,%.2f deg%s",
+        kRecFovDeg[0][0], kRecFovDeg[0][1], kRecFovDeg[0][2], kRecFovDeg[0][3], kRecFovDeg[1][0], kRecFovDeg[1][1],
+        kRecFovDeg[1][2], kRecFovDeg[1][3], g_opt.replayQuad ? "; race quad 1 cm 2 m ahead after the projection" : "");
+
+    Chain eyes[REPLAY_MAX_PAIRS][2], quad;
+    memset(&quad, 0, sizeof(quad));
+    g_chainUsage = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    for (int p = 0; p < nPairs; p++)
+        for (int e = 0; e < 2; e++) {
+            char what[32];
+            snprintf(what, sizeof(what), "pair%d eye%d", p, e);
+            if (createChain(session, vk->device, what, colorFormat, (int32_t)vcv[e].recommendedImageRectWidth,
+                            (int32_t)vcv[e].recommendedImageRectHeight, &eyes[p][e])) {
+                LOG("FAIL eye swapchain refused");
+                die();
+            }
+        }
+    if (g_opt.replayQuad) {
+        g_chainUsage = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        if (createChain(session, vk->device, "race quad", colorFormat, 16, 16, &quad)) {
+            LOG("FAIL race quad swapchain refused");
+            die();
+        }
+    }
+    g_chainUsage = 0;
+
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push)};
+    VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    lci.pushConstantRangeCount = 1;
+    lci.pPushConstantRanges = &pcr;
+    VkPipelineLayout layout;
+    VK_CHECK(vkCreatePipelineLayout(vk->device, &lci, NULL, &layout));
+    VkPipeline pipe = makePipeline(vk->device, layout, kQuadVert, sizeof(kQuadVert), kSceneFrag, sizeof(kSceneFrag),
+                                   (VkFormat)colorFormat, VK_FORMAT_UNDEFINED);
+    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = vk->queueFamily;
+    VkCommandPool pool;
+    VK_CHECK(vkCreateCommandPool(vk->device, &pci, NULL, &pool));
+    VkCommandBuffer cmds[REPLAY_MAX_PAIRS];
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                       REPLAY_MAX_PAIRS};
+    VK_CHECK(vkAllocateCommandBuffers(vk->device, &cai, cmds));
+    VkFence fences[REPLAY_MAX_PAIRS];
+    for (int i = 0; i < REPLAY_MAX_PAIRS; i++) {
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT};
+        VK_CHECK(vkCreateFence(vk->device, &fci, NULL, &fences[i]));
+    }
+    VkDeviceMemory srcMem;
+    VkImage src = replayUpload(vk, pool, &srcMem);
+
+    // The race quad: every image cleared to transparent once (acquired, cleared, the GPU waited for, released).
+    for (uint32_t i = 0; quad.handle && i < quad.count; i++) {
+        acquireChain(&quad);
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VK_CHECK(vkWaitForFences(vk->device, 1, &fences[0], VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(vk->device, 1, &fences[0]));
+        VK_CHECK(vkResetCommandBuffer(cmds[0], 0));
+        VK_CHECK(vkBeginCommandBuffer(cmds[0], &bi));
+        VkImage qi = quad.images[quad.acquired].image;
+        imageBarrier(cmds[0], qi, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkClearColorValue clear = {{0, 0, 0, 0}};
+        VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmds[0], qi, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+        imageBarrier(cmds[0], qi, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        VK_CHECK(vkEndCommandBuffer(cmds[0]));
+        submitWith(vk, cmds[0], fences[0]);
+        VK_CHECK(vkWaitForFences(vk->device, 1, &fences[0], VK_TRUE, UINT64_MAX));
+        releaseChain(&quad);
+    }
+
+    Mat4 vpRec[2];
+    XrCompositionLayerProjectionView pvT[REPLAY_MAX_PAIRS][2];
+    for (int e = 0; e < 2; e++) {
+        Mat4 pr = projectionFov(recFov(e), NEAR_Z, FAR_Z), vw = viewFromPose(recPose(e));
+        vpRec[e] = matMul(&pr, &vw);
+        for (int p = 0; p < nPairs; p++) {
+            pvT[p][e] = (XrCompositionLayerProjectionView){XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+            pvT[p][e].pose = recPose(e);
+            pvT[p][e].fov = recFov(e);
+            pvT[p][e].subImage.swapchain = eyes[p][e].handle;
+            pvT[p][e].subImage.imageRect.extent.width = eyes[p][e].width;
+            pvT[p][e].subImage.imageRect.extent.height = eyes[p][e].height;
+        }
+    }
+    XrCompositionLayerQuad ql = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    ql.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    ql.space = local;
+    ql.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    ql.subImage.swapchain = quad.handle;
+    ql.subImage.imageRect.extent.width = quad.width;
+    ql.subImage.imageRect.extent.height = quad.height;
+    ql.pose.orientation.w = 1;
+    ql.pose.position.z = -2.0f;
+    ql.size = (XrExtent2Df){0.01f, 0.01f};
+
+    struct { int active, k; XrTime t; } fl[REPLAY_MAX_PAIRS];
+    memset(fl, 0, sizeof(fl));
+    int running = 1, sessionRunning = 0, exitRequested = 0, retained = -1, retainedK = -1, lastK = -1;
+    XrSessionState state = XR_SESSION_STATE_UNKNOWN;
+    double started = nowSec(), lastWait = 0, caseTime = 0, winStart = started;
+    XrTime t0 = 0, per = 0, lastLayerPdt = 0;
+    uint64_t n = 0, layered = 0, fresh = 0, repeats = 0, empty = 0, setsStarted = 0, dropped = 0, late = 0, skipped = 0;
+    uint64_t matched = 0, steps[4] = {0}, dsteps[4] = {0}, winLayered = 0;
+    double* fenceMs = malloc(sizeof(double) * (size_t)(g_opt.seconds * 1000 + 60000));
+    size_t nFence = 0, capFence = (size_t)(g_opt.seconds * 1000 + 60000);
+    LOG("CASE 1 start (replay %s)", g_opt.replayLabel);
+    FLOG("R columns: n (xrWaitFrame count, from 1) pdt slot (refreshes since the first) set (shown, -1 none) "
+         "want (the set for this display time) rec (recorded display ns of the set) new pair started(k@pair) fence_ms");
+
+    while (running) {
+        double t = nowSec();
+        if ((g_quit || caseTime >= g_opt.seconds || t - started > g_opt.seconds + 240.0) && !exitRequested) {
+            if (!sessionRunning) break;
+            LOG("requesting exit (%s)", g_quit ? "signal" : caseTime >= g_opt.seconds ? "case done" : "wall-clock cap");
+            xrRequestExitSession(session);
+            exitRequested = 1;
+        }
+        XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
+        while (xrPollEvent(g_instance, &ev) == XR_SUCCESS) {
+            if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+                state = ((XrEventDataSessionStateChanged*)&ev)->state;
+                LOG("session state %d", (int)state);
+                if (state == XR_SESSION_STATE_READY) {
+                    XrSessionBeginInfo sbi = {XR_TYPE_SESSION_BEGIN_INFO};
+                    sbi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                    XR_CHECK(xrBeginSession(session, &sbi));
+                    sessionRunning = 1;
+                    started = winStart = nowSec();
+                } else if (state == XR_SESSION_STATE_STOPPING) {
+                    xrEndSession(session);
+                    sessionRunning = 0;
+                    running = 0;
+                } else if (state == XR_SESSION_STATE_EXITING || state == XR_SESSION_STATE_LOSS_PENDING) {
+                    running = 0;
+                }
+            } else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+                LOG("display refresh rate now %.2f Hz", ((XrEventDataDisplayRefreshRateChangedFB*)&ev)->toDisplayRefreshRate);
+            } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+                running = 0;
+            }
+            ev = (XrEventDataBuffer){XR_TYPE_EVENT_DATA_BUFFER};
+        }
+        if (!running) break;
+        if (!sessionRunning) {
+            struct timespec ts = {0, 10 * 1000 * 1000};
+            nanosleep(&ts, NULL);
+            continue;
+        }
+
+        XrFrameState fs = {XR_TYPE_FRAME_STATE};
+        XR_CHECK(xrWaitFrame(session, NULL, &fs));
+        n++;
+        double w1 = nowSec();
+        if (lastWait > 0 && fs.shouldRender && (state == XR_SESSION_STATE_VISIBLE || state == XR_SESSION_STATE_FOCUSED))
+            caseTime += w1 - lastWait < 0.1 ? w1 - lastWait : 0.1;
+        lastWait = w1;
+        XR_CHECK(xrBeginFrame(session, NULL));
+        const XrTime pdt = fs.predictedDisplayTime;
+        if (!t0 && fs.shouldRender) {
+            t0 = pdt;
+            per = fs.predictedDisplayPeriod > 0 ? fs.predictedDisplayPeriod : 8333333;
+            LOG("replay: first display time %lld, period %.4f ms", (long long)t0, per * 1e-6);
+        }
+        long slot = t0 ? lround((double)(pdt - t0) / (double)per) : 0;
+        int shownK = -1, isNew = 0, shownPair = -1, startK = -1, startPair = -1;
+        double fms = -1;
+        if (fs.shouldRender && !pairsMode) {
+            locateFor(session, local, pdt);
+            for (int e = 0; e < 2; e++) acquireChain(&eyes[0][e]);
+            VK_CHECK(vkWaitForFences(vk->device, 1, &fences[0], VK_TRUE, UINT64_MAX));
+            VK_CHECK(vkResetFences(vk->device, 1, &fences[0]));
+            shownK = replaySet(slot);
+            replayRecord(cmds[0], eyes[0], src, shownK, filter, layout, pipe, vpRec);
+            submitWith(vk, cmds[0], fences[0]);
+            double f0 = nowSec();
+            VK_CHECK(vkWaitForFences(vk->device, 1, &fences[0], VK_TRUE, UINT64_MAX));
+            fms = (nowSec() - f0) * 1e3;
+            if (nFence < capFence) fenceMs[nFence++] = fms;
+            for (int e = 0; e < 2; e++) releaseChain(&eyes[0][e]);
+            isNew = 1;
+            shownPair = 0;
+        } else if (fs.shouldRender) {
+            int best = -1, due = 0;
+            for (int p = 0; p < nPairs; p++) {
+                if (!fl[p].active || fl[p].t > pdt + per / 2) continue;
+                due = 1;
+                if (vkGetFenceStatus(vk->device, fences[p]) == VK_SUCCESS && (best < 0 || fl[p].t > fl[best].t)) best = p;
+            }
+            if (best >= 0) {
+                for (int p = 0; p < nPairs; p++)  // overtaken finished sets: released unshown
+                    if (p != best && fl[p].active && fl[p].t < fl[best].t && vkGetFenceStatus(vk->device, fences[p]) == VK_SUCCESS) {
+                        for (int e = 0; e < 2; e++) releaseChain(&eyes[p][e]);
+                        fl[p].active = 0;
+                        dropped++;
+                    }
+                for (int e = 0; e < 2; e++) releaseChain(&eyes[best][e]);
+                fl[best].active = 0;
+                retained = best;
+                retainedK = fl[best].k;
+                isNew = 1;
+            } else if (due) {
+                late++;
+            }
+            if (retained >= 0) {
+                shownK = retainedK;
+                shownPair = retained;
+            }
+        }
+        XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        const XrCompositionLayerBaseHeader* layers[2];
+        uint32_t nl = 0;
+        if (shownK >= 0) {
+            proj.space = local;
+            proj.viewCount = 2;
+            proj.views = pvT[shownPair];
+            layers[nl++] = (const XrCompositionLayerBaseHeader*)&proj;
+            if (quad.handle) layers[nl++] = (const XrCompositionLayerBaseHeader*)&ql;
+            layered++;
+            winLayered++;
+            fresh += (uint64_t)isNew;
+            repeats += (uint64_t)!isNew;
+            matched += (uint64_t)(shownK == replaySet(slot));
+            if (lastK >= 0) steps[(shownK - lastK + g_nrs) % g_nrs < 3 ? (shownK - lastK + g_nrs) % g_nrs : 3]++;
+            lastK = shownK;
+            if (lastLayerPdt) {
+                long d = lround((double)(pdt - lastLayerPdt) / (double)per);
+                dsteps[d >= 1 && d <= 2 ? d : 3]++;
+            }
+            lastLayerPdt = pdt;
+        } else {
+            empty++;
+        }
+        XrFrameEndInfo fei = {XR_TYPE_FRAME_END_INFO};
+        fei.displayTime = pdt;
+        fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        fei.layerCount = nl;
+        fei.layers = layers;
+        XrResult er = xrEndFrame(session, &fei);
+        if (XR_FAILED(er)) {
+            LOG("xrEndFrame frame %llu -> %s", (unsigned long long)n, xrStr(er));
+            if (er == XR_ERROR_SESSION_LOST || er == XR_ERROR_INSTANCE_LOST) die();
+        }
+        if (pairsMode && fs.shouldRender) {
+            int p = (int)(setsStarted % (uint64_t)nPairs);
+            if (fl[p].active || p == retained) {
+                skipped++;
+            } else {
+                locateFor(session, local, pdt + 2 * per);
+                for (int e = 0; e < 2; e++) acquireChain(&eyes[p][e]);
+                VK_CHECK(vkWaitForFences(vk->device, 1, &fences[p], VK_TRUE, UINT64_MAX));
+                VK_CHECK(vkResetFences(vk->device, 1, &fences[p]));
+                startK = replaySet(slot + 2);
+                startPair = p;
+                replayRecord(cmds[p], eyes[p], src, startK, filter, layout, pipe, vpRec);
+                submitWith(vk, cmds[p], fences[p]);
+                fl[p].active = 1;
+                fl[p].k = startK;
+                fl[p].t = pdt + 2 * per;
+                setsStarted++;
+            }
+        }
+        FLOG("R n=%llu pdt=%lld slot=%ld set=%d want=%d rec=%lld new=%d pair=%d started=%d@%d fence_ms=%.3f",
+             (unsigned long long)n, (long long)pdt, slot, shownK, fs.shouldRender ? replaySet(slot) : -1,
+             shownK >= 0 ? (long long)g_rs[shownK].t : -1ll, isNew, shownPair, startK, startPair, fms);
+        if (w1 - winStart >= 5.0) {
+            LOG("replay: %.1f of %.0f s counted; last %.1f s: %llu frames with a layer, state %d", caseTime, g_opt.seconds,
+                w1 - winStart, (unsigned long long)winLayered, (int)state);
+            winStart = w1;
+            winLayered = 0;
+        }
+    }
+
+    vkDeviceWaitIdle(vk->device);
+    for (int p = 0; p < nPairs; p++)  // sets still in flight
+        if (fl[p].active)
+            for (int e = 0; e < 2; e++) releaseChain(&eyes[p][e]);
+    double a, b, c;
+    LOG("SUMMARY replay %s: %llu frames, %llu with a layer (%llu new sets, %llu repeats of the retained one), %llu without",
+        g_opt.replayLabel, (unsigned long long)n, (unsigned long long)layered, (unsigned long long)fresh,
+        (unsigned long long)repeats, (unsigned long long)empty);
+    if (pairsMode)
+        LOG("SUMMARY replay sets ahead: %llu started, %llu released unshown, %llu frames with a due set unfinished, %llu starts "
+            "skipped (pair busy)", (unsigned long long)setsStarted, (unsigned long long)dropped, (unsigned long long)late,
+            (unsigned long long)skipped);
+    LOG("SUMMARY replay content: the shown set was the one for the frame's display time on %llu of %llu frames; set steps "
+        "between shown frames 0: %llu, 1: %llu, 2: %llu, other: %llu (window of %d sets, looping)",
+        (unsigned long long)matched, (unsigned long long)layered, (unsigned long long)steps[0], (unsigned long long)steps[1],
+        (unsigned long long)steps[2], (unsigned long long)steps[3], g_nrs);
+    LOG("SUMMARY replay display time steps between frames with a layer: 1: %llu, 2: %llu, other: %llu",
+        (unsigned long long)dsteps[1], (unsigned long long)dsteps[2], (unsigned long long)dsteps[3]);
+    if (nFence) {
+        percentiles(fenceMs, nFence, &a, &b, &c);
+        LOG("SUMMARY replay fence wait before release ms p50 %.3f p95 %.3f max %.3f", a, b, c);
+    }
+    LOG("cases completed: %d of 1", caseTime >= g_opt.seconds);
+    free(fenceMs);
+    for (int i = 0; i < REPLAY_MAX_PAIRS; i++) vkDestroyFence(vk->device, fences[i], NULL);
+    vkDestroyCommandPool(vk->device, pool, NULL);
+    vkDestroyPipeline(vk->device, pipe, NULL);
+    vkDestroyPipelineLayout(vk->device, layout, NULL);
+    vkDestroyImage(vk->device, src, NULL);
+    vkFreeMemory(vk->device, srcMem, NULL);
+    for (int p = 0; p < nPairs; p++)
+        for (int e = 0; e < 2; e++) destroyChain(vk->device, &eyes[p][e]);
+    destroyChain(vk->device, &quad);
+    xrDestroySpace(local);
+    xrDestroySession(session);
+    xrDestroyInstance(g_instance);
+    vkDestroyDevice(vk->device, NULL);
+    vkDestroyInstance(vk->instance, NULL);
+    LOG("clean exit");
+    fclose(g_log);
+    return caseTime >= g_opt.seconds ? 0 : 4;
+}
+
 // ---------------------------------------------------------------- main
 
 int main(int argc, char** argv) {
@@ -1134,6 +1855,7 @@ int main(int argc, char** argv) {
              "mode %s, %d case(s) of %.1f s, hz %s%.1f, fps cap %s, gpu target %.1f ms, mv %s, log %s",
              modeName(), nCases, g_opt.seconds, g_opt.hz > 0 ? "" : "(unchanged) ", g_opt.hz, fpsStr, g_opt.gpuMs,
              g_opt.mvHead ? "object+head" : "object only", g_opt.log);
+    if (g_opt.mode == MODE_REPLAY && loadReplayIndex()) return 2;
     if (g_opt.dryRun) {
         printf("xrprobe dry run: %s\n", cfg);
         return 0;
@@ -1349,6 +2071,8 @@ int main(int argc, char** argv) {
             colorFormat = formats[i];
             break;
         }
+
+    if (g_opt.mode == MODE_REPLAY) return runReplay(session, local, &vk, vcv, colorFormat);
 
     Chain eyes[2], mv[2], depthMv[2], depthEye[2];
     memset(mv, 0, sizeof(mv));
