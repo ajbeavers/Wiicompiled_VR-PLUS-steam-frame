@@ -83,7 +83,13 @@
 //   MOCK_XR_PRESS=<path>@<start s>/<every s>[;...]  scripted presses for the current profile
 //                             (MOCK_XR_PROFILE): the action bound to <path> (e.g.
 //                             /user/hand/right/input/a/click) is held for 150 ms every <every> s from
-//                             <start> s on; actions of that profile then report isActive
+//                             <start> s on; actions of that profile then report isActive;
+//                             <path>@<start>/<every>/<hold s>/<until s> (lane S): held <hold> s each
+//                             time (e.g. 1000: from <start> on), none from <until> s on (0: never stops)
+//   MOCK_XR_SWAY=<deg>,<period s>[,<from s>]  (lane S) the head's side-to-side sway (17.19,2), still
+//                             (yaw 0) until <from> s after the session began
+//   MOCK_XR_DUMP also writes <dir>/index.txt: per image the file, swapchain, frame, and with
+//                             MOCK_XR_STAMP the eye and the display time its stamp names (lane S)
 // The graphics API is chosen by the app's binding (xrmock_gfx.h).
 //
 // Checks (ERROR lines in the trace, and a summary on stderr when the session
@@ -1208,8 +1214,27 @@ static void maybeDump(Chain* c, XrSwapchain sc) {
     if (c->dumped >= frames || t - at[mark - 1] > 5.0) return;
     int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
     char path[512];
-    snprintf(path, sizeof(path), "%s/t%05.1f-sc%d-%02d.ppm", dir, at[mark - 1], chainId(sc), c->dumped);
-    if (gGfx->dump_image(c->images, idx, c->w, c->h, c->format, step, path)) trace("dump sc%d %s", chainId(sc), path);
+    snprintf(path, sizeof(path), "%s/t%05.1f-sc%d-%03d.ppm", dir, at[mark - 1], chainId(sc), c->dumped);
+    if (gGfx->dump_image(c->images, idx, c->w, c->h, c->format, step, path)) {
+        trace("dump sc%d %s", chainId(sc), path);
+        // Lane S: <dir>/index.txt, one line per image: file, swapchain, frame (xrWaitFrame count), and with
+        // MOCK_XR_STAMP the eye and display time (ns, CLOCK_MONOTONIC) its stamp names (-1 without).
+        static FILE* index = NULL;
+        if (!index) {
+            char ip[512];
+            snprintf(ip, sizeof(ip), "%s/index.txt", dir);
+            index = fopen(ip, "a");
+        }
+        uint64_t value = 0;
+        int eye = -1;
+        if (!(gStampOn && gGfx->stamp_read && c->stampSlot >= 0 && gGfx->stamp_read(c->stampSlot, c->stampGen, 1, &value, &eye) == 1))
+            eye = -1;
+        if (index) {
+            fprintf(index, "%s sc%d f%d %d %lld\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, chainId(sc), gFrame, eye,
+                    eye >= 0 ? (long long)value : -1ll);
+            fflush(index);
+        }
+    }
     c->dumped++;
 }
 
@@ -1254,13 +1279,13 @@ static XrResult XRAPI_CALL mRelease(XrSwapchain sc, const XrSwapchainImageReleas
             gErrors++;
         }
     }
-    maybeDump(c, sc);
     {
         int idx = ((c->next - c->acquired) % c->count + c->count) % c->count;
         if (gStampOn && gGfx && gGfx->stamp_capture) {
             c->stampSlot = gGfx->stamp_capture(c->images, idx, c->w, c->h, &c->stampGen);
             compRelease(chainId(sc), idx, c->stampSlot, c->stampGen);
         }
+        maybeDump(c, sc);
         c->lastRel = idx;
     }
     c->acquired--;
@@ -1626,9 +1651,12 @@ static struct {
     double callMs;    // and when, after that frame's scheduled wake-up
 } gLocates[LOCATES];
 static int gLocateNext = 0;
+// MOCK_XR_SWAY=<amplitude deg>,<period s>[,<from s>] (lane S): the sway's size and speed (default 17.19, 2:
+// 0.3 rad), and the head still (yaw 0) until <from> s after the session began, the sway starting there.
+static double gSwayRad = 0.3, gSwayHz = 0.5, gSwayFrom = 0.0;
 static void headPose(XrTime displayTime, float* yaw, XrPosef* pose) {
     double t = (double)(displayTime - gTimeOffset - gT0) / 1e9;
-    *yaw = (float)(0.3 * sin(t * 2.0 * 3.14159265 * 0.5));
+    *yaw = t < gSwayFrom ? 0.0f : (float)(gSwayRad * sin((t - gSwayFrom) * 2.0 * 3.14159265 * gSwayHz));
     pose->orientation = (XrQuaternionf){0, sinf(*yaw * 0.5f), 0, cosf(*yaw * 0.5f)};
     // The head also rises 0.1 mm a second, so no two locates share a pose: the sway alone repeats
     // (yaw at t and at a time mirrored about a sine peak), and the pose check matched such a twin
@@ -1790,7 +1818,7 @@ static struct {
 static int gBindingCount = 0;
 static struct {
     char path[128];
-    double start, every;
+    double start, every, hold, until;  // lane S: held for `hold` s (0.15) each time, none from `until` s on
 } gPresses[16];
 static int gPressCount = 0;
 static const char* pathString(XrPath p) {
@@ -1808,8 +1836,9 @@ static int pressed(XrAction action, XrPath sub, int* active) {
         if (gBindings[b].action != action || (hand && strncmp(gBindings[b].path, hand, strlen(hand)) != 0)) continue;
         for (int k = 0; k < gPressCount; k++) {
             if (strcmp(gPresses[k].path, gBindings[b].path) != 0 || t < gPresses[k].start) continue;
+            if (gPresses[k].until > 0.0 && t >= gPresses[k].until) continue;
             double phase = fmod(t - gPresses[k].start, gPresses[k].every);
-            if (phase < 0.15) return 1;
+            if (phase < gPresses[k].hold) return 1;
         }
     }
     return 0;
@@ -1985,6 +2014,14 @@ static void init(void) {
     gProfile = getenv("MOCK_XR_PROFILE");
     if (gProfile && !*gProfile) gProfile = NULL;
     gStampOn = getenv("MOCK_XR_STAMP") != NULL;
+    if (getenv("MOCK_XR_SWAY")) {
+        const char* sw = getenv("MOCK_XR_SWAY");
+        gSwayRad = atof(sw) * 3.14159265 / 180.0;
+        const char* comma = strchr(sw, ',');
+        if (comma && atof(comma + 1) > 0.0) gSwayHz = 1.0 / atof(comma + 1);
+        const char* from = comma ? strchr(comma + 1, ',') : NULL;
+        if (from) gSwayFrom = atof(from + 1);
+    }
     gStampFresh = gStampOn && !strcmp(getenv("MOCK_XR_STAMP"), "fresh");
     gHands = getenv("MOCK_XR_HANDS") != NULL;
     const char* presses = getenv("MOCK_XR_PRESS");
@@ -1999,6 +2036,10 @@ static void init(void) {
             const char* every = strchr(at + 1, '/');
             gPresses[gPressCount].every = every ? atof(every + 1) : 1.0;
             if (gPresses[gPressCount].every < 0.3) gPresses[gPressCount].every = 0.3;
+            const char* hold = every ? strchr(every + 1, '/') : NULL;
+            gPresses[gPressCount].hold = hold && atof(hold + 1) > 0.0 ? atof(hold + 1) : 0.15;
+            const char* until = hold ? strchr(hold + 1, '/') : NULL;
+            gPresses[gPressCount].until = until ? atof(until + 1) : 0.0;
             gPressCount++;
         }
         free(copy);
