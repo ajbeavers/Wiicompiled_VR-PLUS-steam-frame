@@ -113,7 +113,7 @@ between two CLOCK_MONOTONIC reads), the refresh period (from the vsyncs of succe
 p5 / p50 and update end p50 / p95 over the last 120 compositor frames (no-update-time frames left out), and
 the write time.
 Game: the pacing thread re-reads the file at most every 50 ms (open, pread 64 bytes, close; about 10 us) and
-aims the end at a phase of the vsync nearest to the wake-up:
+aims the end at a phase of the vsync at or before the wake-up (1 ms slack):
 - `KARTFRAME_END_PHASE=after[:us]` -> vsync + update end p95 + us (default 300),
 - `KARTFRAME_END_PHASE=before[:us]` -> vsync + update start p50 - us (default 1500),
 bounded to [now, wake-up + period - pacing margin]. It falls back to `KARTFRAME_END_DELAY_US` (or 4000 us, the

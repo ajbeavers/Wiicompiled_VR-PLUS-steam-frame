@@ -218,3 +218,17 @@ start) and (B) the app's wake-up, end, release and display time minus the neares
 update start, render start), with histograms in 0.25 ms bins and a drift table (--every S, --all, --hist all).
 Headless check of the logger: a stub libopenvr_api.so via KARTFRAME_STEAMVR_DIR (frame/perf/LANE_W.md).
 The lock design and its risks: frame/perf/LANE_W.md; next session: frame/perf/session-h19/README.md.
+
+## Lane X (the end locked to the compositor's grid, test only)
+KARTFRAME_END_PHASE=after[:us]|before[:us] (default off; in the wrapper's session.env, which also reaches
+frame/tools/vrtiming.py) times each frame's end against SteamVR's compositor instead of the wake-up: the helper polls
+every 0.1 s and publishes the newest vsync (CLOCK_MONOTONIC), the period and the update window's start p5/p50 and end
+p50/p95 as a 64-byte record (atomic rename) at KARTFRAME_PHASE_FILE (default $XDG_RUNTIME_DIR/kartframe-phase.bin);
+the pacing thread re-reads it at most every 50 ms (about 1 us a read) and ends at vsync + update end p95 + us (after,
+300) or vsync + update start p50 - us (before, 1500), bounded by the cycle's deadline, keeping lane V's order (next
+set started at the wake-up, 4 pairs). No fresh grid (missing, older than 0.5 s, period 1 % off): KARTFRAME_END_DELAY_US,
+or 4000 us. Log lines "end phase:" (mode, every switch, the achieved phase every 10 s). phase.py view C classifies
+every end against its refresh's update window (before / inside / after, SteamVR's presents per class) and view D
+prints the game's lines. Mock: mockrun.sh runs the helper against frame/tools/openvr-stub.c (STUB_UPDATE_MS,
+KF_MOCKRUN_STUB_UPDATE_MS, KF_MOCKRUN_PHASE_SECONDS) with MOCK_XR_ALIGN_US. Analysis: frame/perf/LANE_X.md; next
+session: frame/perf/session-h20/README.md.
