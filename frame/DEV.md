@@ -202,3 +202,19 @@ GalaxyFrame's tree, or -DOPENXR_INCLUDE=...), then the build under the KartFrame
 runs case N (1..6); `frame/perf/session-h13/queue.sh BINARY RECORDING` queues the six as KartFrame launches
 (KARTFRAME_EXE in a session.queue file, recorded). Headless: `PROBE_MOCK=1 PROBE_SET=replay run-probes.sh`
 (the mock runtime, detailed trace per case), then `frame/perf/session-h13/replaycheck.py DIR`.
+
+## Lane W (the compositor's phase beside the app's timeline)
+KARTFRAME_VRTIMING_FRAMES=1 (wrapper session.env) makes frame/tools/vrtiming.py also write vrframes.log in the
+session folder: one F line per SteamVR compositor frame (index, m_flSystemTimeInSeconds, presents, mispresented,
+dropped, reprojection flags, then waitgetposes / posesready / frameready / update start / update end / render
+start in ms after that frame's system time, compositor cpu and gpu ms), a P line per poll (CLOCK_MONOTONIC,
+_RAW, BOOTTIME read around IVRSystem::GetTimeSinceLastVsync, its counter, the newest frame), G lines for frames
+missed between polls (polls every 0.25 s, 128 frames kept by SteamVR: none expected). About 45 MB an hour.
+XRF lines now end in m=<wake-up, CLOCK_MONOTONIC ms> r=<release after the wake-up, ms, -1 none> t=<predicted
+display time, CLOCK_MONOTONIC ms via XR_KHR_convert_timespec_time>; the end is m + e. One "XRF clock:" line
+says how t= was converted. `python3 -I frame/tools/phase.py SESSION_DIR...` prints, per launch, (A) SteamVR's
+own app timings against its vsync reference (frame ready, poses ready, the margin to the compositor's update
+start) and (B) the app's wake-up, end, release and display time minus the nearest compositor anchor (vsync,
+update start, render start), with histograms in 0.25 ms bins and a drift table (--every S, --all, --hist all).
+Headless check of the logger: a stub libopenvr_api.so via KARTFRAME_STEAMVR_DIR (frame/perf/LANE_W.md).
+The lock design and its risks: frame/perf/LANE_W.md; next session: frame/perf/session-h19/README.md.

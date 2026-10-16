@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -1074,6 +1075,7 @@ public:
     OpenXRBeginStatus BeginCompositorCycle() {
         const auto status = runtime_->WaitFrame(active_frame_);
         wake_ = std::chrono::steady_clock::now();
+        release_at_ = {};
         ++cycle_count_;
         if (status != OpenXRFrameStatus::Ready) {
             if (status == OpenXRFrameStatus::Error) Fail(WindowsVkBeginStatusOperation(status));
@@ -1535,7 +1537,9 @@ public:
             }
         }
         const diagnostics::Stopwatch release_timer;
+        const auto release_start = std::chrono::steady_clock::now();
         bool release_ok = ReleaseAcquiredSwapchains();
+        if (frame.expects_gpu_submission) release_at_ = release_start;  // XRF r= (lane W)
         if (frame.xr_frame.should_render && frame.xr_frame.views_valid) {
             diagnostics::OnSwapchainRelease(release_timer);
         }
@@ -2054,6 +2058,10 @@ public:
     // left/right> d=<display time step from the last frame, refreshes> l=<display time minus the poses'
     // locate time, refreshes> n=<layers submitted> (lane Q) aL=/aR=<degrees between each eye's rendered pose and
     // a locate for the frame's display time, -1 when not checked> (lane R). The panel recording (KARTFRAME_RECORD=raw) lines up with it frame by frame.
+    // Lane W (absolute times, to line up with SteamVR's compositor frames in vrframes.log, frame/tools/phase.py):
+    // m=<wake-up, CLOCK_MONOTONIC ms (steady_clock is CLOCK_MONOTONIC on Linux); the end call is m + e>
+    // r=<eye images released, ms after the wake-up, -1 none released for this end> t=<the frame's predicted display
+    // time, CLOCK_MONOTONIC ms (XR_KHR_convert_timespec_time when enabled, else XrTime read as nanoseconds)>.
     void LogFrame(bool fresh, uint32_t layer_count) {
         static const bool enabled = [] {
             const char* env = std::getenv("KARTFRAME_FRAME_LOG");
@@ -2067,14 +2075,48 @@ public:
         const double step = log_last_display_ ? static_cast<double>(active_frame_.predicted_display_time - log_last_display_) / period : 0.0;
         log_last_display_ = active_frame_.predicted_display_time;
         const double located = retained_locate_time_ ? static_cast<double>(active_frame_.predicted_display_time - retained_locate_time_) / period : 0.0;
-        char line[256];
-        std::snprintf(line, sizeof(line), "XRF c=%llu w=%.3f e=%.2f f=%d p=%u i=%d/%d d=%.2f l=%.2f n=%u aL=%.3f aR=%.3f",
+        const double released = release_at_ != std::chrono::steady_clock::time_point{}
+                                    ? std::chrono::duration<double, std::milli>(release_at_ - wake_).count() : -1.0;
+        release_at_ = {};
+        char line[384];
+        std::snprintf(line, sizeof(line), "XRF c=%llu w=%.3f e=%.2f f=%d p=%u i=%d/%d d=%.2f l=%.2f n=%u aL=%.3f aR=%.3f m=%.3f r=%.3f t=%.3f",
                       static_cast<unsigned long long>(cycle_count_),
                       std::chrono::duration<double, std::milli>(wake_ - log_epoch_).count(),
                       std::chrono::duration<double, std::milli>(now - wake_).count(), fresh ? 1 : 0,
                       retained_swapchains_[0].pair_id, retained_swapchains_[0].released_index,
-                      retained_swapchains_[1].released_index, step, located, layer_count, log_angle_[0], log_angle_[1]);
+                      retained_swapchains_[1].released_index, step, located, layer_count, log_angle_[0], log_angle_[1],
+                      std::chrono::duration<double, std::milli>(wake_.time_since_epoch()).count(), released,
+                      MonotonicMs(active_frame_.predicted_display_time));
         Log(OpenXRLogLevel::Info, line);
+    }
+
+    // Lane W: an XrTime as CLOCK_MONOTONIC ms (XRF t=). XR_KHR_convert_timespec_time when the session enabled it
+    // (SteamVR on the Frame does; the mock too, with MOCK_XR_TIME_OFFSET_S), else the XrTime read as nanoseconds.
+    // The first call logs which, and XrTime minus CLOCK_MONOTONIC.
+    double MonotonicMs(XrTime time) {
+        using ToTimespec = XrResult(XRAPI_PTR*)(XrInstance, XrTime, struct timespec*);
+        if (!clock_looked_) {
+            clock_looked_ = true;
+            const auto& ext = runtime_->EnabledExtensions();
+            if (std::find(ext.begin(), ext.end(), "XR_KHR_convert_timespec_time") != ext.end()) {
+                ToTimespec fn = nullptr;
+                if (runtime_->LoadFunction("xrConvertTimeToTimespecTimeKHR", &fn)) to_timespec_ = reinterpret_cast<void*>(fn);
+            }
+        }
+        timespec spec{};
+        const auto convert = reinterpret_cast<ToTimespec>(to_timespec_);
+        const bool ok = convert != nullptr && XR_SUCCEEDED(convert(runtime_->Instance(), time, &spec));
+        const double ms = ok ? static_cast<double>(spec.tv_sec) * 1e3 + static_cast<double>(spec.tv_nsec) * 1e-6
+                             : static_cast<double>(time) * 1e-6;
+        if (!clock_logged_) {
+            clock_logged_ = true;
+            char line[192];
+            std::snprintf(line, sizeof(line), "XRF clock: t= %s; XrTime - CLOCK_MONOTONIC = %.3f ms",
+                          ok ? "from xrConvertTimeToTimespecTimeKHR" : "XrTime read as CLOCK_MONOTONIC ns (no conversion)",
+                          static_cast<double>(time) * 1e-6 - ms);
+            Log(OpenXRLogLevel::Info, line);
+        }
+        return ms;
     }
 
     bool Shutdown() {
@@ -2749,6 +2791,10 @@ private:
     std::chrono::steady_clock::time_point wake_{};
     std::chrono::steady_clock::time_point log_epoch_{};
     XrTime log_last_display_ = 0;
+    std::chrono::steady_clock::time_point release_at_{};  // XRF r=: this end's eye releases began (lane W)
+    void* to_timespec_ = nullptr;  // xrConvertTimeToTimespecTimeKHR (XRF t=, lane W)
+    bool clock_looked_ = false;
+    bool clock_logged_ = false;
     uint32_t eye_width_[kOpenXREyeCount]{};
     uint32_t eye_height_[kOpenXREyeCount]{};
     // The settings panel's layer: written like the eyes into panel_swapchain_,
