@@ -35,6 +35,10 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #if defined(MKW_ENABLE_OPENXR)
 #include "vr/openxr_backend.h"
@@ -636,6 +640,152 @@ diagnostics::ViewGeometry DiagnosticViewGeometry(const OpenXRBackendFrame& frame
     return geometry;
 }
 
+// Lane X (test only, KARTFRAME_END_PHASE): the frame's end timed against SteamVR's compositor grid instead
+// of the wake-up. frame/tools/vrtiming.py publishes the grid (64 bytes, atomic rename, format there and in
+// frame/perf/LANE_X.md); the pacing thread re-reads it at most every 50 ms and aims the end at
+//   after[:us]  -> vsync + update end p95 + us (default 300),
+//   before[:us] -> vsync + update start p50 - us (default 1500),
+// of the vsync at or before the wake-up. Without a fresh grid (missing, older than 0.5 s, period 1 % off) the
+// end falls back to KARTFRAME_END_DELAY_US, or 4000 us when that is unset. Log lines start "end phase:".
+class EndPhaseLock {
+public:
+    enum class Mode { Off, After, Before };
+    using Clock = std::chrono::steady_clock;
+
+    void Configure(long fallback_delay_us) {
+        const char* env = std::getenv("KARTFRAME_END_PHASE");
+        if (env == nullptr || *env == '\0') return;
+        const std::string v(env);
+        const std::string word = v.substr(0, v.find(':'));
+        if (word == "after") mode_ = Mode::After, offset_us_ = 300;
+        else if (word == "before") mode_ = Mode::Before, offset_us_ = 1500;
+        else {
+            RT_LOG(RT_TAG_RUNTIME) << "end phase: unknown KARTFRAME_END_PHASE=" << v << " (after or before); lock off"
+                                   << std::endl;
+            return;
+        }
+        if (const auto colon = v.find(':'); colon != std::string::npos) {
+            offset_us_ = std::clamp(std::strtol(v.c_str() + colon + 1, nullptr, 10), 0l, 4000l);
+        }
+        fallback_us_ = fallback_delay_us > 0 ? fallback_delay_us : 4000;
+        const char* path = std::getenv("KARTFRAME_PHASE_FILE");
+        const char* run = std::getenv("XDG_RUNTIME_DIR");
+        const char* home = std::getenv("HOME");
+        path_ = path != nullptr && *path != '\0' ? std::string(path)
+                : run != nullptr && *run != '\0'  ? std::string(run) + "/kartframe-phase.bin"
+                                                  : std::string(home != nullptr ? home : ".") + "/.cache/kartframe-phase.bin";
+        RT_LOG(RT_TAG_RUNTIME) << "end phase: KARTFRAME_END_PHASE=" << v << ": each frame ended at vsync + "
+                               << (mode_ == Mode::After ? "update end p95 + " : "update start p50 - ") << offset_us_
+                               << " us from the compositor grid in " << path_ << " (frame/tools/vrtiming.py); without a fresh "
+                               << "grid " << fallback_us_ << " us after the wake-up (test only)" << std::endl;
+    }
+    bool Enabled() const { return mode_ != Mode::Off; }
+
+    // When to end this cycle's frame. wake: xrWaitFrame's return; deadline: the latest end the pacing allows.
+    Clock::time_point Target(Clock::time_point wake, Clock::time_point deadline, int64_t period_ns) {
+        const Clock::time_point now = Clock::now();
+        Refresh(now);
+        const int64_t now_ns = now.time_since_epoch().count();
+        const bool fresh = have_ && now_ns - written_ns_ < 500000000 && period_ns_ > 0 &&
+                           std::llabs(period_ns_ - period_ns) * 100 <= period_ns;
+        if (fresh != locked_ || !announced_) {
+            RT_LOG(RT_TAG_RUNTIME) << "end phase: " << (fresh ? "locked to the compositor grid" : "fixed delay ")
+                                   << (fresh ? std::string() : std::to_string(fallback_us_) + " us after the wake-up (" +
+                                                               (have_ ? (now_ns - written_ns_ >= 500000000 ? "grid older than 0.5 s"
+                                                                                                          : "grid period differs from xrWaitFrame's")
+                                                                      : "no grid at " + path_) + ")")
+                                   << std::endl;
+            locked_ = fresh;
+            announced_ = true;
+        }
+        Clock::time_point target = wake + std::chrono::microseconds(fallback_us_);
+        vsync_ns_ = 0;
+        if (locked_) {
+            const int64_t wake_ns = wake.time_since_epoch().count();
+            // The vsync at or before the wake-up (SteamVR returns about 0.4 ms after it; 1 ms of slack for the
+            // published grid's error). A late wake-up keeps its vsync, so its target may already have passed.
+            const double k = std::floor(static_cast<double>(wake_ns - vsync_pub_ + 1000000) / static_cast<double>(period_ns_));
+            vsync_ns_ = vsync_pub_ + static_cast<int64_t>(k * static_cast<double>(period_ns_));
+            const int64_t at = mode_ == Mode::After ? vsync_ns_ + ue95_ + offset_us_ * 1000
+                                                    : vsync_ns_ + us50_ - offset_us_ * 1000;
+            target = Clock::time_point(Clock::duration(at));
+        }
+        return std::min(target, deadline);
+    }
+    // After "before": a set started after the end waits until the update window is over.
+    Clock::time_point WindowOver() const {
+        return Clock::time_point(Clock::duration(vsync_ns_ + ue95_ + 300000));
+    }
+    bool Locked() const { return locked_ && vsync_ns_ != 0; }
+    Mode GetMode() const { return mode_; }
+
+    // The frame's end (the call that releases both eyes and ends the frame) for the 10 s summary.
+    void NoteEnd(Clock::time_point end, Clock::time_point wake) {
+        ++frames_;
+        e_.push_back(std::chrono::duration<double, std::milli>(end - wake).count());
+        if (Locked()) {
+            const double d = static_cast<double>(end.time_since_epoch().count() - vsync_ns_) / 1e6;
+            vs_.push_back(d);
+            us_.push_back(d - us50_ / 1e6);
+            ue_.push_back(d - ue50_ / 1e6);
+        } else {
+            ++fallback_frames_;
+        }
+        if (summary_at_ == Clock::time_point{}) summary_at_ = end;
+        if (end - summary_at_ < std::chrono::seconds(10)) return;
+        summary_at_ = end;
+        auto q = [](std::vector<double>& v, double p) {
+            if (v.empty()) return std::nan("");
+            const size_t i = std::min(v.size() - 1, static_cast<size_t>(p * static_cast<double>(v.size())));
+            std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
+            return v[i];
+        };
+        char line[400];
+        std::snprintf(line, sizeof line,
+                      "end phase: 10 s, %u frames (%u on the fixed delay); end after vsync p50 %.2f p95 %.2f ms, minus "
+                      "update start p50 %+.2f p95 %+.2f, minus update end p50 %+.2f p95 %+.2f (published start %.2f end "
+                      "%.2f/%.2f p50/p95); end after wake-up p50 %.2f p95 %.2f",
+                      frames_, fallback_frames_, q(vs_, 0.5), q(vs_, 0.95), q(us_, 0.5), q(us_, 0.95), q(ue_, 0.5),
+                      q(ue_, 0.95), us50_ / 1e6, ue50_ / 1e6, ue95_ / 1e6, q(e_, 0.5), q(e_, 0.95));
+        RT_LOG(RT_TAG_RUNTIME) << line << std::endl;
+        frames_ = fallback_frames_ = 0;
+        vs_.clear(), us_.clear(), ue_.clear(), e_.clear();
+    }
+
+private:
+    void Refresh(Clock::time_point now) {
+        if (now - read_at_ < std::chrono::milliseconds(50)) return;
+        read_at_ = now;
+#if defined(__linux__)
+        unsigned char b[64];
+        const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;
+        const ssize_t n = ::pread(fd, b, sizeof b, 0);
+        ::close(fd);
+        if (n != static_cast<ssize_t>(sizeof b) || std::memcmp(b, "KFP1", 4) != 0) return;
+        auto i64 = [&](size_t o) { int64_t v; std::memcpy(&v, b + o, 8); return v; };
+        auto i32 = [&](size_t o) { int32_t v; std::memcpy(&v, b + o, 4); return static_cast<int64_t>(v); };
+        vsync_pub_ = i64(8);
+        period_ns_ = i64(16);
+        us50_ = i32(28);
+        ue50_ = i32(32);
+        ue95_ = i32(36);
+        written_ns_ = i64(40);
+        have_ = true;
+#endif
+    }
+
+    Mode mode_ = Mode::Off;
+    long offset_us_ = 0;
+    long fallback_us_ = 4000;
+    std::string path_;
+    bool have_ = false, locked_ = false, announced_ = false;
+    int64_t vsync_pub_ = 0, period_ns_ = 0, us50_ = 0, ue50_ = 0, ue95_ = 0, written_ns_ = 0, vsync_ns_ = 0;
+    Clock::time_point read_at_{}, summary_at_{};
+    uint32_t frames_ = 0, fallback_frames_ = 0;
+    std::vector<double> vs_, us_, ue_, e_;
+};
+
 class OpenXRIntegration final {
 public:
     static OpenXRIntegration& Get() {
@@ -859,7 +1009,7 @@ public:
                                            ? "; each set starts " + std::to_string(ahead_start_delay_.count()) +
                                                  " us after the wake-up (KARTFRAME_AHEAD_START_US)"
                                            : std::string())
-                                   << (ahead_ && ahead_end_delay_.count() > 0
+                                   << (ahead_ && ahead_end_delay_.count() > 0 && !end_phase_.Enabled()
                                            ? "; each frame is ended " + std::to_string(ahead_end_delay_.count()) +
                                                  " us after the wake-up (KARTFRAME_END_DELAY_US, test only)"
                                            : std::string())
@@ -1542,6 +1692,7 @@ private:
             end_delay_us = std::clamp(std::strtol(env, nullptr, 10), 0l, 8000l);
         }
         ahead_end_delay_ = std::chrono::microseconds(end_delay_us);
+        end_phase_.Configure(end_delay_us);
         // KARTFRAME_AHEAD_REFRESHES=1 (lane M): each set is located for the next refresh's display time
         // instead of two refreshes ahead: one refresh less pose prediction (about 33 ms instead of 42),
         // one refresh less for its encode and GPU work. Up to two sets stay in flight either way.
@@ -1981,7 +2132,7 @@ private:
         const bool render_tick = (!st.half_rate || st.odd_tick) &&
                                  interpolation_pacing_.ShouldRender(target, interpolation_target);
         bool started_early = false;
-        if (ahead_lead_ == 1 || ahead_end_delay_.count() > 0) {
+        if (ahead_lead_ == 1 || ahead_end_delay_.count() > 0 || end_phase_.Enabled()) {
             const XrTime gone = chosen >= 0 ? ahead_sets_[static_cast<size_t>(chosen)].set.xr_frame.predicted_display_time
                                             : ahead_shown_time_;
             size_t in_flight = 0;
@@ -1995,7 +2146,13 @@ private:
         }
         // KARTFRAME_END_DELAY_US (test only): the next set has started above (or waits for the start after the
         // end if Aurora was busy); the frame is ended this long after the wake-up, bounded by the cycle's end.
-        if (ahead_end_delay_.count() > 0) {
+        if (end_phase_.Enabled()) {
+            // Lane X (KARTFRAME_END_PHASE, test only): the end at a phase of the compositor's grid.
+            const auto wake = backend_->CycleWakeTime();
+            std::this_thread::sleep_until(
+                end_phase_.Target(wake, wake + std::chrono::nanoseconds(period) - pacing_margin_, period));
+            end_phase_.NoteEnd(std::chrono::steady_clock::now(), wake);
+        } else if (ahead_end_delay_.count() > 0) {
             std::this_thread::sleep_until(std::min(backend_->CycleWakeTime() + ahead_end_delay_,
                                                    backend_->CycleWakeTime() + std::chrono::nanoseconds(period) - pacing_margin_));
         }
@@ -2062,6 +2219,13 @@ private:
 
         // The set (KARTFRAME_AHEAD_REFRESHES=1: unless it started above).
         if (!started_early) {
+            // Lane X: with the end before the compositor's update, a set that starts after the end (Aurora was
+            // busy at the wake-up) waits until the update is over: no acquire or locate inside the window.
+            if (end_phase_.GetMode() == EndPhaseLock::Mode::Before && end_phase_.Locked()) {
+                std::this_thread::sleep_until(std::min(end_phase_.WindowOver(), backend_->CycleWakeTime() +
+                                                                                     std::chrono::nanoseconds(period) -
+                                                                                     pacing_margin_));
+            }
             bool started_now = false;
             const CycleResult started = TryStartAhead(presentation, policy, immersive, allow_start, cycle, period, target,
                                                       render_tick, ahead_sets_.size(), true, started_now);
@@ -3101,6 +3265,7 @@ private:
     bool ahead_wanted_ = false;
     std::chrono::microseconds ahead_start_delay_{0};
     std::chrono::microseconds ahead_end_delay_{0};
+    EndPhaseLock end_phase_;  // lane X: KARTFRAME_END_PHASE (test only)
     size_t ahead_lead_ = 2; // refreshes between a set's start and its display time (KARTFRAME_AHEAD_REFRESHES)
     std::vector<double> prediction_ms_;  // lane R: NotePrediction
     std::chrono::steady_clock::time_point prediction_since_{};

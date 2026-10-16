@@ -1989,10 +1989,13 @@ public:
     static uint32_t AheadPairsSetting() {
         const char* env = std::getenv("KARTFRAME_EYE_PAIRS");
         const char* lead = std::getenv("KARTFRAME_AHEAD_REFRESHES");
-        // KARTFRAME_END_DELAY_US (test only) starts the next set before the delayed end, like lead 1: 4 pairs.
+        // KARTFRAME_END_DELAY_US and KARTFRAME_END_PHASE (lane X) (test only) start the next set before the
+        // delayed end, like lead 1: 4 pairs.
         const char* end_delay = std::getenv("KARTFRAME_END_DELAY_US");
+        const char* end_phase = std::getenv("KARTFRAME_END_PHASE");
         const long fallback = (lead != nullptr && std::string_view(lead) == "1") ||
-                                      (end_delay != nullptr && std::strtol(end_delay, nullptr, 10) > 0)
+                                      (end_delay != nullptr && std::strtol(end_delay, nullptr, 10) > 0) ||
+                                      (end_phase != nullptr && *end_phase != '\0')
                                   ? 4
                                   : 3;
         const long v = env != nullptr && *env != '\0' ? std::strtol(env, nullptr, 10) : fallback;
