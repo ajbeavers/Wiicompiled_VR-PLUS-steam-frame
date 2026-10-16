@@ -17,7 +17,17 @@
 # clock to CLOCK_MONOTONIC (the game's XRF m=/t= clock): CLOCK_MONOTONIC, _RAW and BOOTTIME read around
 # IVRSystem::GetTimeSinceLastVsync, and the newest frame's m_flSystemTimeInSeconds. Format in the file's
 # header; frame/tools/phase.py reads it. KARTFRAME_STEAMVR_DIR: where libopenvr_api.so is (tests).
-import ctypes, os, signal, sys, time
+#
+# KartFrame lane X: with KARTFRAME_END_PHASE set (the game's end lock, test only) this also polls every 0.1 s and
+# publishes the compositor's grid for the game: a 64-byte record, rewritten by atomic rename, at
+# KARTFRAME_PHASE_FILE (default $XDG_RUNTIME_DIR/kartframe-phase.bin). Little-endian:
+#   0 'KFP1' | 4 u32 publish count | 8 i64 newest vsync, CLOCK_MONOTONIC ns | 16 i64 refresh period ns |
+#   24 i32 update start p5, 28 i32 update start p50, 32 i32 update end p50, 36 i32 update end p95 (ns after the
+#   vsync, over the newest 120 compositor frames with update times) | 40 i64 write time, CLOCK_MONOTONIC ns |
+#   48 u32 frames used | 52..63 zero.
+# The vsync comes from IVRSystem::GetTimeSinceLastVsync between two CLOCK_MONOTONIC reads (SteamVR's own
+# system time is CLOCK_MONOTONIC_RAW; frame/perf/LANE_X.md). The game reads it in openxr_integration.cpp.
+import ctypes, os, signal, struct, sys, time
 
 class HmdMatrix34(ctypes.Structure):
     _fields_ = [('m', ctypes.c_float * 12)]
@@ -84,16 +94,22 @@ GetCumulativeStats = ctypes.CFUNCTYPE(None, ctypes.POINTER(CumulativeStats), cty
 
 # Lane W: the per-frame log (KARTFRAME_VRTIMING_FRAMES=1).
 frames_out = None
-if os.environ.get('KARTFRAME_VRTIMING_FRAMES') == '1':
-    path = os.environ.get('KARTFRAME_VRFRAMES') or os.path.join(
-        os.path.dirname(os.path.abspath(sys.argv[2])) if out else '.', 'vrframes.log')
-    frames_out = open(path, 'w', buffering=1 << 16)
+phase_path = None
+SinceVsync = None
+CM, CR, CB = time.CLOCK_MONOTONIC, getattr(time, 'CLOCK_MONOTONIC_RAW', time.CLOCK_MONOTONIC), getattr(
+    time, 'CLOCK_BOOTTIME', time.CLOCK_MONOTONIC)
+if os.environ.get('KARTFRAME_VRTIMING_FRAMES') == '1' or os.environ.get('KARTFRAME_END_PHASE'):
     sysp = lib.VR_GetGenericInterface(b'FnTable:IVRSystem_022', ctypes.byref(err))
     # IVRSystem::GetTimeSinceLastVsync (slot 5): seconds since the last vsync and SteamVR's frame counter.
     SinceVsync = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint64))(
         (ctypes.c_void_p * 6).from_address(sysp)[5]) if sysp else None
-    CM, CR, CB = time.CLOCK_MONOTONIC, getattr(time, 'CLOCK_MONOTONIC_RAW', time.CLOCK_MONOTONIC), getattr(
-        time, 'CLOCK_BOOTTIME', time.CLOCK_MONOTONIC)
+if os.environ.get('KARTFRAME_END_PHASE'):
+    phase_path = os.environ.get('KARTFRAME_PHASE_FILE') or os.path.join(
+        os.environ.get('XDG_RUNTIME_DIR') or os.path.expanduser('~/.cache'), 'kartframe-phase.bin')
+if os.environ.get('KARTFRAME_VRTIMING_FRAMES') == '1':
+    path = os.environ.get('KARTFRAME_VRFRAMES') or os.path.join(
+        os.path.dirname(os.path.abspath(sys.argv[2])) if out else '.', 'vrframes.log')
+    frames_out = open(path, 'w', buffering=1 << 16)
     frames_out.write(
         '# vrframes v1 %s (KartFrame frame/tools/vrtiming.py, KARTFRAME_VRTIMING_FRAMES=1)\n'
         '# F idx sys_s presents mispresented dropped reproj_flags | ms after sys_s: waitgetposes posesready '
@@ -132,6 +148,46 @@ def log_frames(buf, n):
             f.m_flCompositorRenderGpuMs, f.m_flClientFrameIntervalMs, f.m_nNumVSyncsReadyForUse,
             f.m_nNumVSyncsToFirstView))
 
+# Lane X: the grid for the game's end lock (KARTFRAME_END_PHASE).
+phase_state = dict(count=0, vsync=None, period=None, periods=[])
+
+def publish_phase(buf, n):
+    if n < 8 or not SinceVsync: return
+    m0 = time.clock_gettime_ns(CM)
+    ok = SinceVsync(ctypes.byref(fv), ctypes.byref(fc))
+    m1 = time.clock_gettime_ns(CM)
+    fr = [buf[i] for i in range(max(0, n - 122), n - 2)]   # the newest two may still be filling in
+    steps = sorted(b.m_flSystemTimeInSeconds - a.m_flSystemTimeInSeconds for a, b in zip(fr, fr[1:])
+                   if b.m_nFrameIndex == a.m_nFrameIndex + 1)
+    if not ok or not steps: return
+    p0 = steps[len(steps) // 2] * 1e9
+    since = fv.value * 1e9
+    if not (0 <= since < 2 * p0) or m1 - m0 > 200000: return   # stale vsync or a slow call: keep the old record
+    vs = (m0 + m1) // 2 - int(since)
+    st = phase_state
+    if st['vsync'] is not None:
+        k = round((vs - st['vsync']) / p0)
+        if k > 0:
+            st['periods'] = (st['periods'] + [(vs - st['vsync']) / k])[-20:]
+    st['vsync'] = vs
+    per = sorted(st['periods'])[len(st['periods']) // 2] if len(st['periods']) >= 3 else p0
+    win = [f for f in fr if not (f.m_flCompositorUpdateStartMs == 0 and f.m_flCompositorUpdateEndMs == 0)
+           and 0 <= f.m_flCompositorUpdateEndMs < per / 1e6]
+    if len(win) < 30: return
+    us = sorted(f.m_flCompositorUpdateStartMs for f in win)
+    ue = sorted(f.m_flCompositorUpdateEndMs for f in win)
+    q = lambda v, p: int(v[min(len(v) - 1, int(p / 100.0 * len(v)))] * 1e6)
+    st['count'] += 1
+    rec = struct.pack('<4sIqqiiiiqI', b'KFP1', st['count'], vs, int(round(per)), q(us, 5), q(us, 50), q(ue, 50),
+                      q(ue, 95), time.clock_gettime_ns(CM), len(win))
+    rec += b'\0' * (64 - len(rec))
+    tmp = phase_path + '.tmp'
+    try:
+        with open(tmp, 'wb') as f: f.write(rec)
+        os.replace(tmp, phase_path)
+    except OSError:
+        pass
+
 def cumulative():
     c = CumulativeStats()
     GetCumulativeStats(ctypes.byref(c), ctypes.sizeof(c))
@@ -151,10 +207,11 @@ t_next = time.time() + 1.0
 pid = c0.m_nPid
 totals = dict(frames=0, reused=0, mis=0, dropped=0, cpu=0, gpu=0)
 while time.time() < t_end and not stop:
-    time.sleep(0.25)   # 128 frames are 1.07 s at 120 Hz: no frame is missed
+    time.sleep(0.1 if phase_path else 0.25)   # 128 frames are 1.07 s at 120 Hz: no frame is missed
     buf[0].m_nSize = ctypes.sizeof(FrameTiming)
     n = GetFrameTimings(buf, N)
     if frames_out: log_frames(buf, n)
+    if phase_path: publish_phase(buf, n)
     for i in range(n):
         f = buf[i]
         if f.m_nFrameIndex in seen: continue
@@ -193,4 +250,7 @@ say('# SteamVR cumulative for pid %d over the run: presents %d, dropped %d, repr
     c1.m_nNumFrameSubmits - (c0.m_nNumFrameSubmits if c0.m_nPid == c1.m_nPid else 0),
     c1.m_nNumFramesWithDepth - (c0.m_nNumFramesWithDepth if c0.m_nPid == c1.m_nPid else 0)))
 if frames_out: frames_out.close()
+if phase_path:
+    try: os.unlink(phase_path)
+    except OSError: pass
 lib.VR_ShutdownInternal()
