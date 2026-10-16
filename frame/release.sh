@@ -46,7 +46,7 @@ done
 for f in README.md LICENSE THIRD-PARTY-NOTICES.md docs/RELEASE_NOTES_0.9.0-alpha.1.md docs/CHANGELOG.md docs/TECHNICAL_NOTES.md \
          frame/setup.sh frame/kartframe.sh frame/install.sh frame/uninstall.sh frame/collect-logs.sh frame/steam-cef.py \
          frame/frame-controller-models.py frame/Config.frame.toml frame/tools/vrtiming.py frame/tools/session-report.py \
-         frame/boundary-check.sh frame/tools/privacy-check.sh; do
+         frame/boundary-check.sh frame/release-allowlist.txt frame/tools/privacy-check.sh; do
     [[ -f $repo/$f ]] || fail "missing $f"
 done
 
@@ -85,7 +85,7 @@ echo "release: packing"
     tar --no-recursion --owner=0 --group=0 --numeric-owner --mtime='2026-01-01 00:00Z' -czf "$tarball" -T -)
 
 echo "release: boundary check"
-"$here/boundary-check.sh" "$tarball"
+"$here/boundary-check.sh" "$tarball" "$here/release-allowlist.txt"
 echo "release: privacy check"
 "$repo/frame/tools/privacy-check.sh" "$tarball"
 

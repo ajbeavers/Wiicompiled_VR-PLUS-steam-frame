@@ -1,0 +1,9 @@
+# Files over 1 MB the release tarball may contain (globs, see boundary-check.sh): the kit's own
+# allowlist under kit/, the portable compiler and the translator. None of it is disc-derived.
+kit/objects/*
+kit/libs/*
+kit/sysroot/usr/lib/*
+kit/sysroot/usr/lib/gcc/*
+kit/resources/*
+toolchain/*
+translator/*

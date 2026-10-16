@@ -6,3 +6,5 @@
 ^(kit/)?workspace/runtime/src/hle/net/network_socket\.cpp$	.*
 ^frame/test-installer\.sh$	\$W/home/
 ^Launcher/prepare-portable-tools\.sh$	.*
+^toolchain/	.*
+^translator/	.*
