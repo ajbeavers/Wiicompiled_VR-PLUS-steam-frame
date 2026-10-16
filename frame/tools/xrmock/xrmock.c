@@ -64,6 +64,11 @@
 //                             at most 3; default 0.02, SteamVR's on the Frame in the third headset
 //                             session), as SteamVR's prediction is not always exactly one period
 //                             after the last; 0 turns it off
+//   MOCK_XR_ALIGN_US=<us>     (lane X) the wake-up grid starts on the absolute refresh grid of CLOCK_MONOTONIC
+//                             (k / rate s, the grid frame/tools/openvr-stub.c's fake compositor uses) plus
+//                             <us>, as SteamVR's xrWaitFrame returns about 0.4 ms after its vsync; with the
+//                             stub's timing helper (mockrun.sh, KARTFRAME_END_PHASE) the game's end lock sees
+//                             a compositor grid that matches the mock's
 //   MOCK_XR_LEAD=<refreshes>  predictedDisplayTime this many refreshes after xrWaitFrame's wake-up
 //                             (default 3: SteamVR's lead on the Frame was 25 to 27 ms at 120 Hz)
 //   MOCK_XR_FOV=<l>,<r>,<u>,<d>  the left eye's field of view in degrees (the right eye mirrors it);
@@ -1324,6 +1329,12 @@ static XrResult XRAPI_CALL mBeginSession(XrSession s, const XrSessionBeginInfo* 
     (void)s;
     (void)bi;
     gT0 = nowNs();
+    if (getenv("MOCK_XR_ALIGN_US")) {
+        const double per = (double)gPeriod > 0 ? 1e9 / (double)(int64_t)(1e9 / (double)gPeriod + 0.5) : 8333333.333;
+        const double k = ceil((double)gT0 / per) + 1.0;
+        gT0 = (int64_t)(k * per) + (int64_t)(atof(getenv("MOCK_XR_ALIGN_US")) * 1000.0);
+        trace("wake-up grid aligned to CLOCK_MONOTONIC's refresh grid + %s us", getenv("MOCK_XR_ALIGN_US"));
+    }
     const char* secs = getenv("MOCK_XR_SECONDS");
     gEndAt = gT0 + (int64_t)((secs ? atof(secs) : 20.0) * 1e9);
     pushState(XR_SESSION_STATE_SYNCHRONIZED);

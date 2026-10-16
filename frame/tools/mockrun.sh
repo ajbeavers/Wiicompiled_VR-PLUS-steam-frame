@@ -11,7 +11,11 @@
 # ~/.cache/kf-xrmock, rebuilt when its sources change), KF_MOCKRUN_VR (extra lines for the [vr]
 # section, e.g. 'frame_pacing = "pipelined"'), KF_MOCKRUN_RENDER_SCALE (render_scale, default 1.0;
 # 1.25 is the panel's native 2160 per eye), KF_MOCKRUN_INTRO=1 (the first-run welcome and controller
-# guide show instead of being seeded done). The game reads its user state from
+# guide show instead of being seeded done). Lane X: with KARTFRAME_END_PHASE set, a fake compositor grid for the
+# game's end lock: frame/tools/vrtiming.py runs against frame/tools/openvr-stub.c (update window
+# KF_MOCKRUN_STUB_UPDATE_MS, default 3.0,5.3 ms after each vsync; KF_MOCKRUN_PHASE_SECONDS stops it early to
+# exercise the fallback) and the mock's wake-ups sit MOCK_XR_ALIGN_US (400) after the same vsync grid; the
+# record is $OUT/phase.bin (KARTFRAME_PHASE_FILE, always set here so a mock run never reads a headset's grid). The game reads its user state from
 # $XDG_DATA_HOME/WiiCompiled (Config.toml, NAND, Cache), which this script points at the scratch dir
 # and seeds with a Config.toml naming the extracted game (~/Games/KartFrame/data/game or --game) and
 # the Frame's VR defaults (render_scale 1.0, VR interpolation auto, plain menu background).
@@ -106,6 +110,16 @@ if [ $FLAT = 0 ]; then
   # Scripted presses act on the Frame controller profile.
   [ -n "${MOCK_XR_PRESS:-}" ] && export MOCK_XR_PROFILE=${MOCK_XR_PROFILE:-/interaction_profiles/valve/frame_controller}
   export MOCK_XR_TRACE=${MOCK_XR_TRACE:-$OUT/logs/$(basename "$LOG" .log).trace}
+  export KARTFRAME_PHASE_FILE=$OUT/phase.bin; rm -f "$KARTFRAME_PHASE_FILE"
+  if [ -n "${KARTFRAME_END_PHASE:-}" ]; then
+    STUB=$OUT/openvr-stub; mkdir -p "$STUB"
+    cc -O1 -shared -fPIC -o "$STUB/libopenvr_api.so" "$HERE/openvr-stub.c" || die "the OpenVR stub did not build"
+    export MOCK_XR_ALIGN_US=${MOCK_XR_ALIGN_US:-400}
+    KARTFRAME_STEAMVR_DIR=$STUB STUB_UPDATE_MS=${KF_MOCKRUN_STUB_UPDATE_MS:-3.0,5.3} \
+      python3 -I "$HERE/vrtiming.py" "${KF_MOCKRUN_PHASE_SECONDS:-$((SECONDS_RUN + 30))}" "$OUT/logs/stub-vrtiming.log" > /dev/null 2>&1 &
+    PUB_PID=$!
+    trap 'kill $XVFB_PID $PUB_PID 2>/dev/null' EXIT
+  fi
 else
   unset XR_RUNTIME_JSON
 fi
@@ -129,6 +143,7 @@ HWATCH=$!
 wait $PID; RC=$?
 kill $WATCH $HWATCH 2>/dev/null
 echo "mockrun: game stopped (exit $RC; 143 is the stop signal)"
+grep -a 'end phase: ' "$LOG" | sed 's/.*\(end phase: \)/\1/' | head -20 || true
 grep -a 'xrmock: summary\|xrmock: end times\|xrmock: frames\|xrmock: queue drain\|xrmock: exact\|xrmock: stamps\|xrmock: end after wake-up\|xrmock: late-end model\|vr pacing totals' "$LOG" || true
 echo "mockrun: session states: $(grep -a 'session state -> ' "$LOG" | sed 's/.*session state -> //' | tr '\n' ' ')"
 FATAL=$(grep -a -c 'fatal dialog\|Signal 11' "$LOG")

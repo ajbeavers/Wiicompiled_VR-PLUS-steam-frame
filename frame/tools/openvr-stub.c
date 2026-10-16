@@ -2,7 +2,11 @@
 // SteamVR. Build: cc -O1 -shared -fPIC -o ~/.cache/kf-<lane>/stub/libopenvr_api.so frame/tools/openvr-stub.c
 // Run:   KARTFRAME_STEAMVR_DIR=~/.cache/kf-<lane>/stub KARTFRAME_VRTIMING_FRAMES=1 python3 -I frame/tools/vrtiming.py 5 DIR/vrtiming.log
 // A 120 Hz compositor whose system time is CLOCK_MONOTONIC - 1000 s; frame index = vsyncs since that clock's zero.
+// Lane X: STUB_UPDATE_MS=<start>,<end> sets the compositor's update window in ms after each vsync (default 5.1,5.4;
+// mockrun.sh uses 3.0,5.3, the Frame's in session 19), so vrtiming.py's KARTFRAME_END_PHASE publisher has a grid.
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 typedef struct { float m[12]; } M34; typedef struct { float v[3]; } V3;
@@ -15,10 +19,13 @@ static const double P = 1.0 / 120.0, OFF = 1000.0;
 static double mono(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static uint32_t timings(FT* f, uint32_t n) {
   double s = mono() - OFF; uint64_t cur = (uint64_t)(s / P);
+  float us = 5.1f, ue = 5.4f;
+  const char* w = getenv("STUB_UPDATE_MS");
+  if (w) sscanf(w, "%f,%f", &us, &ue);
   for (uint32_t i = 0; i < n; i++) {
     uint64_t k = cur - (n - 1 - i); FT* t = &f[i]; memset(t, 0, sizeof *t);
     t->idx = (uint32_t)k; t->sys = k * P; t->pres = 1; t->mis = (k % 97) == 0;
-    t->wgp = 0.5f; t->npr = 0.6f; t->nfr = 4.6f; t->us = 5.1f; t->ue = 5.4f; t->rs = 5.5f;
+    t->wgp = 0.5f; t->npr = 0.6f; t->nfr = 4.6f; t->us = us; t->ue = ue; t->rs = us + 0.02f;
     t->cgpu = 0.8f; t->interval = 8.333f; t->idle = 3.0f; t->vf = 2;
   }
   return n;
