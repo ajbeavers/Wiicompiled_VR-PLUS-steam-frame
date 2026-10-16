@@ -12,9 +12,12 @@ I did not write this code by hand. The port, its scripts and these notes were wr
 
 ## Status
 
-Built and checked without the headset, against a mock OpenXR runtime on the Frame (`frame/tools/xrmock`), with the unit tests and a long soak: no OpenXR errors, no eye image released before the GPU finished it, both eyes from one head locate on every refresh.
-
-Everything that needs a person in the headset is still to be confirmed: smoothness, performance, controller feel, menus, the item box. [to confirm in the headset]
+0.9.0-alpha.1, pre-release. The build has been through twenty headset sessions. Confirmed: native
+Linux Arm64 on SteamVR at 120 Hz and 1728 per eye, 119-120 sets a second in races with under 1 % late,
+the game at its full 60 fps, quad-layer menus, the HUD on the virtual screen, the Frame controls and
+models, the first run from a disc in about 6 minutes. Open: the double image (below) is removed by a
+timing mitigation, not yet by a fix of its cause; the Time Trial ghost is flat; full-view 2D effects and
+the pointer dot on the menu screen are pending. The per-session records are in `frame/perf/`.
 
 ## How it works
 
@@ -136,6 +139,34 @@ Fixes made or in progress:
 - The game stops asking for a refresh rate that the runtime does not offer. [to confirm in the headset]
 - `TU_DEBUG=sysmem` is checked against translucent overlays. [to confirm in the headset]
 - The item box (the roulette) is drawn in the wrong place; reprojected 2D draws are being clipped to their frame rectangle. [to confirm in the headset]
+
+## The double image: what twenty sessions found
+
+The symptom: in races, on head turns, the image sat on two positions alternating every refresh, worse
+in one eye, clean in the menus (a quad layer) and clean in GalaxyFrame on the same SteamVR.
+
+Eliminated, each by a direct test (the records are `frame/perf/session-h*/README.md` and `LANE_*.md`):
+pacing and late sets, retained repeats, end times, pose stamps, per-eye scene state, interpolation
+evenness, eye poses and FOV, swapchain format and usage, pair counts 2 to 8, a quad beside the projection,
+GalaxyFrame's first-write barrier, the prediction distance of the poses (fresh poses for the exact display
+time did not help), the rendered images themselves (240 consecutive sets dumped from the mock: no jump),
+the desktop window's presents, the release ordering against the GPU (a strict mock check), the size of the
+GPU work, the refresh rate, and the thread priority boost.
+
+What SteamVR itself showed: the game's own recorded race images, handed over by a minimal probe loop
+(`frame/tools/xrprobe --replay`) in six variations including the game's own order, were clean.
+
+The mechanism, from logging every compositor frame beside the game's own timeline (`tools/vrtiming.py`
+frame mode, `frame/tools/phase.py`): the compositor's update runs at about vsync + 3.0 to + 5.3 ms and
+takes each eye's newest released image when it reaches that eye; the game handed its frame over near those
+points, and whether a hand-over fell before or after an eye's pick-up changed from refresh to refresh. A
+launch whose hand-over kept one side every frame was clean; one whose compositor updates started early in
+episodes was doubled. Ending each frame at a fixed phase against the published grid (`KARTFRAME_END_PHASE`,
+lane X) keeps one side and removes the doubling. It leaves the right eye one set ahead of the left and the
+compositor reusing a frame now and then, so it is a mitigation. The probe ends its frames at the same phase
+as the doubled default and is clean, so the phase is not the cause; the remaining difference is the 4-7 ms
+of GPU work the game submits right after each hand-over on the GPU the compositor composes on. That is the
+next experiment (the probe with synthetic GPU load; lane Y, unfinished).
 
 ## Building
 

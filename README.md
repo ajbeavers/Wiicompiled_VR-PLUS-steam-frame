@@ -13,7 +13,7 @@ What it does:
 - Uses the Steam Frame controllers through SteamVR's own controller profile.
 - Builds the game on your Frame from your own disc, once, in about 6 minutes.
 
-[to confirm in the headset]
+All of that has been played on a Frame. One problem is still being worked on, the double image in races; this pre-release carries the mitigation that removes it. See [The double image](#the-double-image-known-issue).
 
 ## What this adds to Wiicompiled VR PLUS
 
@@ -26,17 +26,41 @@ Upstream runs on Windows and on the Meta Quest. On the Frame that would mean Lep
 - Pipelined frame pacing, with the older single stage mode kept as a switch.
 - The Frame controller layout in code, with no SteamVR binding file.
 - Simplified models of the Frame's controllers, converted at install from the Frame's own SteamVR files.
-- The game's 2D screen shown as a flat quad layer in front of you. [to confirm in the headset]
+- The game's 2D screen shown as a flat quad layer in front of you.
 - A first run that extracts your disc, translates the game and compiles it on the Frame with a bundled compiler, using a kit of prebuilt runtime parts.
 - A launch wrapper that sets SteamVR's per-app settings (120 Hz, no throttling, no extra prediction, motion smoothing off, 1728 resolution) at every launch and writes a session log folder.
 
 ## Status
 
-Version 1.0.0 is the first release.
+Version 0.9.0-alpha.1 is a pre-release. It plays, at 120 Hz and 1728 pixels per eye, through twenty headset sessions so far. Version numbers stay below 1.0.0 until the double image (next section) is fixed at its cause rather than worked around.
 
-[to confirm in the headset]
+Confirmed in the headset: the native build in SteamVR; 119 to 120 sets of eyes a second in races with under 1 % late; the game at its full 60 frames a second; the menus as a steady flat screen; the race HUD on the virtual screen with correct clipping; the Frame controls, hand steering and the controller models; the first run from a disc; the installer, the library entry, the launch wrapper and the session logs.
 
-The list of what is built but not yet confirmed in the headset is in [frame/UNTESTED.md](frame/UNTESTED.md).
+Known issues: the Time Trial ghost is flat; full-view 2D effects such as Blooper ink do not cover the whole view; the laser pointer's dot is not visible on the 2D menu screen (the ray is); two and four player races are heavier and not yet measured in the headset. The short list of what is built but not yet confirmed is in [frame/UNTESTED.md](frame/UNTESTED.md).
+
+## The double image (known issue)
+
+In races, turning your head could show the world twice, one copy about two refreshes of head motion ahead of the other, alternating every refresh, worse in one eye. Menus were always clean, and so was GalaxyFrame on the same SteamVR.
+
+Twenty sessions of measurement, each one eliminating something by a direct test, ended with this: SteamVR's compositor on the Frame takes each eye's most recently handed-over image at its own point inside the refresh, the right eye after the left. The game was handing frames over right where those points sit, so from one refresh to the next the two eyes did not always get the same set. A probe that showed SteamVR the game's own recorded race images was clean in every variation, and logging every compositor frame beside the game's own timeline showed the clean launches keeping one side of the pick-up every frame and the doubled ones flipping.
+
+What this build does about it: the launch wrapper runs a small helper that reads SteamVR's compositor timing and publishes its grid, and the game hands every frame over at a fixed point against that grid, just after the compositor's update (`KARTFRAME_END_PHASE=after`, the default). The doubling is gone with that. What remains, and why this is a mitigation rather than a fix: the right eye runs one set ahead of the left, which reads as the right eye being a touch more sensitive to head movement, and the compositor shows a frame twice now and then. The probe hands its frames over at the same point as the old default and is clean, so the point itself is not the cause; the remaining difference is the 4 to 7 ms of GPU work the game submits right after each hand-over on the GPU the compositor also composes on. That is the next experiment. The records of every session are in `frame/perf/`, and the mechanism is written up in the [technical notes](docs/TECHNICAL_NOTES.md).
+
+If you want the old behaviour to compare, put `KARTFRAME_END_PHASE=off` in `session.env` for one launch.
+
+## What has been done so far
+
+The work since the first headset session, in the order it mattered:
+
+- The game ran at 38 frames a second under gamescope: a window-sync call slept 10 ms every game frame. Fixed; the game runs at its full 60.
+- The 2D menus moved from projected panels to a quad layer, as upstream does on PC, which ended the flicker and the 5 to 7 ms of GPU the menus cost.
+- An sRGB sink and a cut of the native render pass: copying the eyes to the swapchain went from 2.3 ms to 0.47 ms, which is what lets races hold 120 Hz at 1728.
+- Pipelined pacing with the sets of eyes rendered two refreshes ahead, every frame handed over at the same point of the refresh, each set released only after a GPU fence, a retained repeat when a set is late, half rate never by default.
+- Turnip's sysmem mode by default: 7 to 8 % faster for this draw-bound game.
+- Thread priority through RealtimeKit and a utilisation clamp, so the game thread and the frame worker stay on the big cores.
+- The race HUD clipped to its frame on the virtual screen, the thin line beside the map removed, full-view fades only for untextured colour fades.
+- Input kept through SteamVR's short focus losses; the refresh rate requested only when SteamVR offers it.
+- The double-image work above, with the tools it needed: a mock OpenXR runtime with exact checks, a probe that replays recorded eye images, per-frame compositor timing, panel recordings and their analysis.
 
 ## Requirements
 
@@ -54,11 +78,11 @@ The list of what is built but not yet confirmed in the headset is in [frame/UNTE
    cd KartFrame
    ```
 
-2. Download `kartframe-1.0.0-linux-arm64.tar.gz` and its `.sha256` file from the [Releases](https://github.com/simplysanatori/KartFrame/releases) page. Check the download and install it:
+2. Download `kartframe-0.9.0-alpha.1-linux-arm64.tar.gz` and its `.sha256` file from the [Releases](https://github.com/simplysanatori/KartFrame/releases) page. Check the download and install it:
 
    ```sh
-   sha256sum -c kartframe-1.0.0-linux-arm64.tar.gz.sha256
-   frame/install.sh ~/Downloads/kartframe-1.0.0-linux-arm64.tar.gz
+   sha256sum -c kartframe-0.9.0-alpha.1-linux-arm64.tar.gz.sha256
+   frame/install.sh ~/Downloads/kartframe-0.9.0-alpha.1-linux-arm64.tar.gz
    ```
 
    The installer unpacks the program into `~/Games/KartFrame/app`. It adds **KartFrame** to your Steam library as a non-Steam shortcut, or updates the entry if it is there. It converts the Frame's controller models from SteamVR's own files. The script talks to Steam through its local debugging port, which SteamOS has on by default.
@@ -85,8 +109,6 @@ On the very first start the game creates its own settings file and a fresh Wii s
 
 If the game cannot find the disc files, the setup did not finish. Run `setup.sh status` to see which step is missing.
 
-[to confirm in the headset]
-
 ## Controls
 
 The game sees a Wii wheel and pad. The Frame controllers are mapped like this.
@@ -104,8 +126,6 @@ The game sees a Wii wheel and pad. The Frame controllers are mapped like this.
 | Left **View** | Back. Held for half a second, it opens the VR settings panel. Pressed while the panel is open, it closes it |
 
 Hand steering: in the first-person cockpit the grips hold the wheel, and the right bumper drifts there. Elsewhere the grips drift.
-
-[to confirm in the headset]
 
 ## Settings
 
@@ -134,21 +154,30 @@ Switches for testing go in `~/.local/share/KartFrame/session.env`, one `NAME=val
 | `KARTFRAME_REFRESH_HZ` | 90 or 120, the rate asked of SteamVR |
 | `KARTFRAME_SYSMEM` | 0 turns off the GPU's direct memory rendering mode (`TU_DEBUG=sysmem`); it is on by default |
 | `KARTFRAME_FDM_LAYER` | 0 disables Valve's foveation layer in the Vulkan chain, to compare |
+| `KARTFRAME_END_PHASE` | `after` (default), `before`, or `off`: when in the refresh each frame is handed to SteamVR, against the compositor grid the wrapper's helper publishes. `off` hands over at the wake-up, which doubles the image |
+| `KARTFRAME_END_DELAY_US` | A fixed delay after the wake-up instead of the grid, in microseconds; also the fallback when the grid is missing (4000) |
+| `KARTFRAME_VRTIMING_FRAMES` | 1 logs every compositor frame to `vrframes.log` in the session folder |
 | `KARTFRAME_HOME` | The data folder, if it is not `~/.local/share/KartFrame` |
-
-[to confirm in the headset]
 
 ## Performance
 
-[to confirm in the headset]
+Measured on my Frame, from the session logs:
 
-What the build does, so you know what the numbers will mean:
+| | |
+|---|---|
+| Display | 120 Hz, 1728 x 1728 per eye |
+| Races | 119 to 120 sets of eyes a second, 0.2 to 1 % late, 2 to 3 % retained repeats |
+| Menus | 110 to 113 sets a second (the quad layer and the intro screens) |
+| GPU per set | about 5 ms in races (about 7 with the hand-over timing of this build, since the next set starts before the hand-over), 1.5 to 2.5 ms in menus |
+| Game thread | 60 frames a second; about 8 % of race frames take 20 to 33 ms (the game's own course loading and item logic); a 144 ms hitch at race start |
+| First run | about 6 minutes from the disc: extract 1 minute, translate 50 seconds, compile 5 minutes |
 
-- At 120 Hz there are about 8.3 ms per refresh, and about 7 ms of that is the GPU's for both eyes.
-- Each refresh locates the head once and renders both eyes from that pose.
-- Pipelined pacing overlaps one refresh of CPU work with the previous refresh's GPU work, at the price of one refresh more latency. Inline mode waits for the eyes in the same refresh.
-- An eye pair is handed to SteamVR only after the GPU has finished it. If a pair is not finished in time, the previous pair is shown again and the miss is counted.
-- Every second, the game logs one `vr pacing:` line with the refresh rate, the sets rendered, interpolated, late and missed, and GPU and encode times. `report.txt` in each session folder summarises them together with SteamVR's compositor timing.
+What the build does, so you know what the numbers mean:
+
+- At 120 Hz there are about 8.3 ms per refresh, and about 7 ms of that is the GPU's for both eyes beside SteamVR's compositor.
+- Each refresh locates the head once and renders both eyes from that pose, two refreshes ahead of the refresh that shows them.
+- A set of eyes is handed to SteamVR only after the GPU has finished it, at a fixed point of the refresh against the compositor's own clock. If a set is not finished in time, the previous set is shown again and the miss is counted.
+- Every second, the game logs one `vr pacing:` line with the refresh rate, the sets rendered, interpolated, late and missed, and GPU and encode times; every 10 seconds an `end phase:` line with the achieved hand-over phase. `report.txt` in each session folder sums them up, and `tools/session-report.py` lays several sessions side by side.
 
 ## Files
 
@@ -169,8 +198,9 @@ The game does not write to `~/.local/share/WiiCompiled`.
 - **The game does not start and `launch.log` says it refuses.** Read the reason in `~/.local/share/KartFrame/sessions/latest/launch.log`. If it names a kit mismatch, run `setup.sh` again.
 - **`setup.sh` says the disc is not Mario Kart Wii RMCP01.** Only the clean PAL disc is supported.
 - **SteamVR's per-app settings were not applied.** `launch.log` lists each one and what SteamVR holds after the write. They are only set when the game is started from the Steam library.
-- **Motion is uneven, or the picture ghosts when you turn your head.** [to confirm in the headset]
-- **Menus flicker.** [to confirm in the headset]
+- **The world doubles when you turn your head in a race.** That is the known issue above. Check `launch.log` says `KARTFRAME_END_PHASE=after` and `game.log` has `end phase: locked to the compositor grid`; if it says it fell back to the fixed delay, the helper did not get SteamVR's timing (it needs SteamVR's `libopenvr_api.so`, which the wrapper finds under `/opt/steamvr`).
+- **The right eye feels more sensitive to head movement than the left.** The known issue's remainder: the right eye runs one set ahead. Not fixed yet.
+- **Motion is uneven.** `report.txt` shows late and repeated sets per second. A few percent is normal; more usually means something else is using the GPU (a recording, a stream).
 
 ## Reporting a problem
 
@@ -202,6 +232,7 @@ If you would like more Steam Frame ports, you can also [buy me a coffee](https:/
 - [nod and nodtool](https://github.com/encounter/nod) by encounter, which extracts the disc.
 - [LLVM](https://llvm.org/), the compiler bundled for the first run, and the [.NET runtime](https://github.com/dotnet/runtime), which the translator carries.
 - Valve, for the Frame controller models. They are converted on your Frame from your own SteamVR files and never redistributed.
+- [framecorder](https://github.com/simplysanatori/framecorder), my headset recorder, which recorded the panels the double-image work was measured on.
 - bigmak94's [GalaxyQuest](https://github.com/bigmak94/GalaxyQuest) and the GalaxyFrame work, for what I learned about pacing for SteamVR and for the test tools (`xrmock`, and `xrprobe`, GPLv3).
 
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) has the full list with licences.
@@ -216,8 +247,8 @@ Upstream's own README is kept as [README.upstream.md](README.upstream.md).
 
 ## How this was made
 
-I wanted Mario Kart Wii on my Frame without Lepton, so I started from Wiicompiled VR PLUS and had it built natively for SteamVR: a Linux Arm64 build, Dawn's Vulkan backend on SteamVR's own device, pacing written for how SteamVR behaves, the Frame controller layout in code, and a first run that builds the game from your disc on the Frame. It started as a project for my own headset.
+I wanted Mario Kart Wii on my Frame without Lepton, so I started from Wiicompiled VR PLUS and had it built natively for SteamVR: a Linux Arm64 build, Dawn's Vulkan backend on SteamVR's own device, pacing written for the Frame's compositor, the Frame controllers in code, and a first run that builds the game from your own disc on the Frame itself.
 
-This is vibe coded, with manual review throughout. I wrote it with Claude Code, using Anthropic's Fable 5.1, Opus 5.5 and Sonnet 5.5 models running on the Frame itself. I chose what to build, reviewed the code and the scripts as they were written, tested in the headset and reported what I saw; Claude read the logs and changed the code. The upstream author has not reviewed this port. If that is not for you, no worries. Read the code before trusting it; it is a starting point for anyone who wants a native game on the Frame.
+This is vibe coded, with manual review throughout. I wrote it with Claude Code, using Anthropic's Fable 5.1, Opus 5.5 and Sonnet 5.5 models running on the Frame itself, in parallel lanes with a mock OpenXR runtime so that almost everything could be proven without putting the headset on. The double image took twenty headset sessions of about a minute each, every one of them a test of one thing, and the records of those are in `frame/perf/`.
 
 Developer notes and what was learned about SteamVR on the Frame are in the [technical notes](docs/TECHNICAL_NOTES.md).

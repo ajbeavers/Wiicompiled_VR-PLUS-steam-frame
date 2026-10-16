@@ -1,32 +1,40 @@
 # Changelog
 
-## 1.0.0 (October 2026)
+## 0.9.0-alpha.1 (October 2026), pre-release
 
-The first release of KartFrame, Mario Kart Wii in VR running natively on the Valve Steam Frame. It is a fork of heurazy's Wiicompiled VR PLUS.
+The first public build of the native port. Everything below has been played on a Steam Frame unless marked
+otherwise. One known issue remains open, the double image in races (see the README); this build carries
+the mitigation that removes it.
 
-### The game on the Frame
+### Confirmed in the headset
 
-- A native Linux Arm64 build that runs in the Frame's SteamVR. No Lepton, APK, adb or PC.
-- The game is heurazy's static translation of Mario Kart Wii to C++, drawn by aurora on Dawn (WebGPU) and shown through OpenXR.
-- Game files, saves and settings in plain folders under `~/.local/share/KartFrame`.
+- Runs natively on the Frame in SteamVR at 120 Hz, 1728 pixels per eye, both eyes rendered on every refresh: races hold 119-120 sets a second with under 1 % late.
+- The game itself runs at its full 60 frames a second (the first session's "half speed" was a window-sync call sleeping 10 ms every game frame under gamescope; fixed).
+- Menus and the intro screens as a flat quad layer in front of you, sharp and steady; the race HUD on the virtual screen with correct clipping; the thin line beside the map removed.
+- The Frame controller layout, hand steering with the grips, the simplified Frame controller models in the hands.
+- First run from your own disc in about 6 minutes: extract, translate, compile with the bundled compiler, link against the kit.
+- The installer, the Steam library entry, the launch wrapper with SteamVR's per-app settings and the session logs.
 
-### Rendering
+### Rendering and pacing work
 
-- Dawn's Vulkan backend bound to SteamVR's own device, through upstream's Dawn patch.
-- Eye images handed to SteamVR only after the GPU has finished them.
-- Both eyes rendered on every refresh of the 120 Hz display from that refresh's head pose, at 1728 pixels per eye, with the game's own VR frame interpolation filling the display rate.
-- Pipelined frame pacing, with the single stage mode as a switch.
-- The game's 2D screen shown as a flat quad layer in front of you. [to confirm in the headset]
+- Dawn's Vulkan backend on SteamVR's own device; eye images released only after a GPU fence (timeline semaphore under Dawn's lock).
+- Pipelined pacing: each set of eyes rendered two refreshes ahead, every frame handed over at a fixed phase against SteamVR's compositor (the double-image mitigation, `KARTFRAME_END_PHASE`), released only when finished; retained repeat when late; half-rate never by default.
+- An sRGB sink and a cut of the native render pass: eyes to swapchain 2.3 ms -> 0.47 ms.
+- Turnip's sysmem mode by default (7-8 % faster for this draw-bound game).
+- Thread priority (RealtimeKit) and a utilisation clamp so the game thread and the frame worker stay on the big cores.
+- Input kept through SteamVR's short focus losses; refresh rate requested only when offered.
 
-### Controls
+### Tools (for developers)
 
-- The Frame controller layout in code, through the Frame's own interaction profile. No SteamVR binding file. [to confirm in the headset]
-- Simplified models of the Frame controllers, converted at install from the Frame's own SteamVR files and never redistributed.
-- Grips hold the wheel in the first-person cockpit.
+- A mock OpenXR runtime (`frame/tools/xrmock`) with exact checks: finished releases, pose stamps, end times, layer lists, per-eye probes, image dumps.
+- `xrprobe --replay`: SteamVR shown the game's own recorded eye images through a minimal loop.
+- Compositor timing per frame (`tools/vrtiming.py`), `frame/tools/phase.py`, panel recordings and their analysis.
 
-### Install
+### Known issues
 
-- A first run that extracts your disc, translates the game and compiles it on the Frame with a bundled compiler, from a kit of prebuilt runtime parts. About 6 minutes on my Frame.
-- An installer that unpacks the program, adds the Steam library entry and converts the controller models.
-- A launch wrapper that sets SteamVR's per-app settings (120 Hz, no throttling, no extra prediction, motion smoothing off, 1728 resolution) at every launch, and writes a session folder with the logs and a report.
-- Tools to collect logs for a bug report and to remove the program again.
+- The double image in races: see the README. This build removes it by timing the hand-over; the right eye still runs one set ahead of the left, which reads as extra sensitivity to head movement.
+- The Time Trial ghost is flat. Full-view 2D effects (Blooper ink) do not cover the whole view. The laser pointer's dot is not visible on the 2D menu screen.
+
+## 1.0.0 (planned)
+
+The items of the 1.0.0 plan that are not yet confirmed are listed in [frame/UNTESTED.md](../frame/UNTESTED.md).

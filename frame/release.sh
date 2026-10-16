@@ -19,7 +19,7 @@
 # is read here. Environment: KARTFRAME_CACHE (default ~/.cache/kartframe).
 set -euo pipefail
 
-VERSION=1.0.0
+VERSION=0.9.0-alpha.1
 NAME=kartframe-$VERSION-linux-arm64
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/.." && pwd)
@@ -43,7 +43,7 @@ done
 [[ -x $tr/Translator.Cli ]] || fail "no executable Translator.Cli in $tr (frame/publish-translator.sh)"
 [[ -x $tc/toolchain-aarch64/bin/clang || -f $tc/toolchain-aarch64.tar.xz ]] ||
     fail "no toolchain-aarch64/ or toolchain-aarch64.tar.xz in $tc (frame/toolchain.sh <dir>)"
-for f in README.md LICENSE THIRD-PARTY-NOTICES.md docs/RELEASE_NOTES_v1.0.0.md docs/CHANGELOG.md docs/TECHNICAL_NOTES.md \
+for f in README.md LICENSE THIRD-PARTY-NOTICES.md docs/RELEASE_NOTES_0.9.0-alpha.1.md docs/CHANGELOG.md docs/TECHNICAL_NOTES.md \
          frame/setup.sh frame/kartframe.sh frame/install.sh frame/uninstall.sh frame/collect-logs.sh frame/steam-cef.py \
          frame/frame-controller-models.py frame/Config.frame.toml frame/tools/vrtiming.py frame/tools/session-report.py \
          frame/boundary-check.sh frame/tools/privacy-check.sh; do
@@ -76,7 +76,7 @@ done
 install -m 0644 "$here/frame-controller-models.py" "$here/Config.frame.toml" "$stage/"
 install -m 0644 "$here/tools/vrtiming.py" "$here/tools/session-report.py" "$stage/tools/"
 install -m 0644 "$repo/README.md" "$repo/LICENSE" "$repo/THIRD-PARTY-NOTICES.md" "$stage/"
-install -m 0644 "$repo/docs/RELEASE_NOTES_v1.0.0.md" "$repo/docs/CHANGELOG.md" "$repo/docs/TECHNICAL_NOTES.md" "$stage/docs/"
+install -m 0644 "$repo/docs/RELEASE_NOTES_0.9.0-alpha.1.md" "$repo/docs/CHANGELOG.md" "$repo/docs/TECHNICAL_NOTES.md" "$stage/docs/"
 cp -a "$repo/licenses" "$stage/licenses"
 
 echo "release: packing"

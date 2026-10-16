@@ -15,6 +15,9 @@
 #   KARTFRAME_SYSMEM=0      leaves Turnip in tiled mode; default 1 sets TU_DEBUG=sysmem (measured: the
 #                           race holds 120 Hz at 1728 only with it)
 #   KARTFRAME_PACING        passed through to the game (auto | inline | pipelined)
+#   KARTFRAME_END_PHASE     when in the refresh each frame is handed to SteamVR (default "after": just
+#                           after the compositor's update, timed from the grid tools/vrtiming.py
+#                           publishes; "off" = the wake-up, which doubles the image, see README)
 #   KARTFRAME_VRTIMING=0    no compositor timing log
 #   KARTFRAME_SESSION_ENV_ONCE=1   (inside session.env) delete session.env after this launch
 #   KARTFRAME_KEEP_SESSIONS number of session folders kept (default 30)
@@ -45,6 +48,8 @@ fi
 [ "$KARTFRAME_FDM_LAYER" = 0 ] && { export DISABLE_VULKAN_FDM_INJECTION_LAYER=1; log "A/B: Valve FDM layer disabled"; }
 [ "${KARTFRAME_SYSMEM:-1}" = 1 ] && { export TU_DEBUG=sysmem; log "TU_DEBUG=sysmem (KARTFRAME_SYSMEM=0 turns it off)"; }
 [ -n "$KARTFRAME_PACING" ] && { export KARTFRAME_PACING; log "KARTFRAME_PACING=$KARTFRAME_PACING"; }
+EP=${KARTFRAME_END_PHASE:-after}
+if [ "$EP" = off ] || [ "$EP" = 0 ]; then unset KARTFRAME_END_PHASE; log "KARTFRAME_END_PHASE=off: frames handed over at the wake-up"; else export KARTFRAME_END_PHASE=$EP; log "KARTFRAME_END_PHASE=$EP"; fi
 
 # The game: Steam's %command% (the binary the shortcut names), else the installed one.
 EXE=${KARTFRAME_EXE:-${1:-$KFHOME/bin/kartframe}}
