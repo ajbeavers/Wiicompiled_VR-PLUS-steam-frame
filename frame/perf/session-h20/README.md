@@ -81,3 +81,30 @@ window at vsync + 3.0 to + 5.3, mock wake-up at vsync + 0.4)
 
 mockrun ok in all (KF_MOCKRUN_END_GATE=100: every end is later than 1 ms by design), ctest 32/32. Cost: one open +
 pread + close of the 64-byte record at most every 50 ms (1.2 us each here), nothing per frame beyond arithmetic.
+
+## Headset results (2026-10-16, orchestrator's reading)
+
+Owner: launch 1 (end phase after) "pretty good, no doubling; the right eye towards the end wasn't as good,
+and a little jitter"; launch 2 (before) "terrible all the way through, the left eye clear for a bit then
+both really bad"; launch 3 (4000 us control) "very good in the left eye, right eye bad with doubling; in
+the water the left eye jittered as well".
+
+Logs. Launch 1: locked to the grid nearly throughout (brief fallbacks to the fixed delay in the first
+seconds: "grid period differs from xrWaitFrame's", 15 switch pairs, 176 of the first 1185 frames on the
+fixed delay, then 0-5 per 10 s); end at vsync + 5.85 ms p50, +0.54 ms after the published update end (p95
++0.7); compositor app frames reused 238 (3.2 %), mispresented 405 (the frame misses its refresh's update
+and goes out one refresh later: the jitter); the last 10 s had an early-start episode (published update
+start 0.57 ms): the right eye's bad stretch. Launch 2: the "before" target (update start p50 - 1.5 ms) was
+not reachable: ends at vsync + 2.3 ms p50 but p95 4.8 ms (the set started before the end pushes it), i.e.
+inside the window often: 4.0 % late sets, bad. Launch 3 (control): inside 75 % / after 25 %, class changes
+29.7 %, end minus update end -0.35 p50: doubled in the right eye as in session 18.
+
+THE FACT THAT CHANGES THE MODEL: the clean probe of session 13 ended its frames 0.31 ms after its wake-up
+(SteamVR's poses->frame ready column), the same phase as the doubled default game (0.33 ms); GalaxyFrame
+ends at about 1.2 ms (max 2-3) and is clean. So the end's phase alone does not decide: at phase 0.3 the
+probe is clean and the game doubles. The phase lock treats a symptom (it makes the per-eye pick-up order
+consistent). What the game has at that phase and the probe lacks: 4-7 ms of GPU work per set submitted
+right after the end on the same GPU the compositor composes on (GalaxyFrame: ~1-3 ms, clean), and the
+multi-threaded CPU load. The compositor's own per-frame GPU fields (m_flCompositorRenderGpuMs,
+m_flPreSubmitGpuMs, m_flPostSubmitGpuMs, m_flTotalRenderGpuMs) are in vrframes.log and have not been
+compared between clean and doubled launches yet. Next: lane Y.
