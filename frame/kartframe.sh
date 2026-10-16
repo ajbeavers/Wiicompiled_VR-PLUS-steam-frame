@@ -148,24 +148,71 @@ GAME_PID=$!
 echo "kartframe $GAME_PID" > "$HEADSET_MARK" 2> /dev/null
 # KARTFRAME_RECORD=raw records both panels as scanned out (framecorder; about 1.6 ms of GPU a frame)
 # into the session folder, for questions the logs cannot settle (per-eye ghosting, flicker).
+# The recorder starts 8 s in and only if the game is still there then (it once started after a game
+# that had died at 3 s and recorded the headset for hours). It runs in its own session (setsid), so
+# stopping it can reach everything it started (the framecorder-grab helper too). .rec-started marks
+# that it really began.
 REC_PID=
 # Steam starts games with a short PATH (no ~/.local/bin), so look for the recorder by its full path too.
 FRAMECORDER=$(command -v framecorder 2> /dev/null || ls "$HOME/.local/bin/framecorder" 2> /dev/null)
 if [ -n "$KARTFRAME_RECORD" ] && [ -z "$FRAMECORDER" ]; then log "RECORDING NOT POSSIBLE: framecorder not found"; fi
 if [ -n "$KARTFRAME_RECORD" ] && [ -n "$FRAMECORDER" ]; then
-    ( sleep 8; exec "$FRAMECORDER" --view "${KARTFRAME_RECORD}" --fps "${KARTFRAME_RECORD_FPS:-120}" --qp 18 "$SESSION/panels.mkv" ) \
+    rm -f "$SESSION/.rec-started"
+    setsid bash -c 'for ((i = 0; i < 80; i++)); do kill -0 "$1" 2> /dev/null || exit 0; sleep 0.1; done
+        touch "$2/.rec-started"; shift 2; exec "$@"' _ "$GAME_PID" "$SESSION" \
+        "$FRAMECORDER" --view "${KARTFRAME_RECORD}" --fps "${KARTFRAME_RECORD_FPS:-120}" --qp 18 "$SESSION/panels.mkv" \
         > "$SESSION/framecorder.log" 2>&1 &
     REC_PID=$!
     log "recording the panels (framecorder --view $KARTFRAME_RECORD) into panels.mkv"
 fi
-trap 'kill -TERM "$GAME_PID" 2> /dev/null' TERM INT HUP
+# Anything of the recorder still alive (a finished process that nobody has waited for does not count).
+rec_alive() {
+    ps -o stat= --sid "$REC_PGID" 2> /dev/null | grep -q '^[^Z]' ||
+        pgrep -f "framecorder .* $SESSION/panels.mkv" > /dev/null
+}
+# Stops the recorder in every case: not started yet (the waiting subshell is killed and never starts it),
+# running (SIGINT to finish the file, then a bounded wait, then TERM and KILL). Runs once.
+stop_recorder() {
+    [ -n "$REC_PID" ] || return 0
+    REC_PGID=$REC_PID; REC_PID=
+    local n how=stopped
+    if [ -f "$SESSION/.rec-started" ]; then
+        kill -INT "$REC_PGID" 2> /dev/null
+        for ((n = 0; n < 300; n++)); do rec_alive || break; sleep 0.1; done   # up to 30 s to finish the file
+        if rec_alive; then
+            how="stopped after TERM (SIGINT did not finish it)"
+            kill -TERM -- "-$REC_PGID" 2> /dev/null; pkill -TERM -s "$REC_PGID" 2> /dev/null
+            pkill -TERM -f "framecorder .* $SESSION/panels.mkv" 2> /dev/null
+            for ((n = 0; n < 50; n++)); do rec_alive || break; sleep 0.1; done
+        fi
+        if rec_alive; then
+            how="killed (SIGINT and TERM did not stop it)"
+            kill -KILL -- "-$REC_PGID" 2> /dev/null; pkill -KILL -s "$REC_PGID" 2> /dev/null
+            pkill -KILL -f "framecorder .* $SESSION/panels.mkv" 2> /dev/null
+            sleep 0.5
+        fi
+        wait "$REC_PGID" 2> /dev/null
+        rec_alive && log "WARNING: a recorder process is still alive for $SESSION/panels.mkv"
+        log "recorder $how"
+    else
+        kill -TERM "$REC_PGID" 2> /dev/null; kill -TERM -- "-$REC_PGID" 2> /dev/null
+        pkill -TERM -s "$REC_PGID" 2> /dev/null
+        wait "$REC_PGID" 2> /dev/null
+        log "recorder was never started (the game was gone before the 8 s were up)"
+    fi
+    # A leftover part file is the owner's to judge: logged, never deleted.
+    if [ -f "$SESSION/panels.mkv.part" ] && ! rec_alive; then
+        log "panels.mkv.part left in the session folder, $(stat -c %s "$SESSION/panels.mkv.part") bytes, no recorder alive"
+    fi
+}
+trap 'kill -TERM "$GAME_PID" 2> /dev/null; stop_recorder' TERM INT HUP
 rc=0
 while kill -0 "$GAME_PID" 2> /dev/null; do
     wait "$GAME_PID"; rc=$?
 done
 trap - TERM INT HUP
 rm -f "$HEADSET_MARK"
-[ -n "$REC_PID" ] && { pkill -INT -P "$REC_PID" framecorder 2> /dev/null; kill -INT "$REC_PID" 2> /dev/null; sleep 3; }
+stop_recorder
 log "game exited with status $rc"
 [ -n "$VRT_PID" ] && { kill "$VRT_PID" 2> /dev/null; wait "$VRT_PID" 2> /dev/null; }
 

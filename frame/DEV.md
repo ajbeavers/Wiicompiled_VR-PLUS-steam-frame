@@ -232,3 +232,11 @@ every end against its refresh's update window (before / inside / after, SteamVR'
 prints the game's lines. Mock: mockrun.sh runs the helper against frame/tools/openvr-stub.c (STUB_UPDATE_MS,
 KF_MOCKRUN_STUB_UPDATE_MS, KF_MOCKRUN_PHASE_SECONDS) with MOCK_XR_ALIGN_US. Analysis: frame/perf/LANE_X.md; next
 session: frame/perf/session-h20/README.md.
+
+## Wrapper recorder (KARTFRAME_RECORD)
+The recorder starts 8 s after the game and only if the game is still alive then; it runs in its own
+session (setsid) and the wrapper stops it on every exit path (game exit, Steam's TERM/INT/HUP): SIGINT
+and up to 30 s for the file, then TERM, then KILL, then a pkill on anything writing into the session's
+panels.mkv. The log says "recorder stopped" or "recorder was never started"; a leftover
+panels.mkv.part is logged with its size and left for the owner. frame/test-wrapper-recorder.sh checks
+the four paths with a fake game and a fake framecorder (about 45 s).
