@@ -40,3 +40,32 @@ launch's end piled near an anchor or its margin near 0, and the clean one well c
 option 1); if it differs, the helper publishes the compositor's phase (option 2). If no number differs between
 the clean and the doubled launch, the eye pick-up is not tied to what GetFrameTimings reports: line the panel
 recording up with vrframes.log next.
+
+## Headset results (2026-10-16, orchestrator's reading)
+
+Owner: launch 1 (session 012613) "bad, doubled in the right eye, very subtle in the left and only in
+water"; launch 2 (012746) "very very good, no doubling, but the right eye much more sensitive to movement,
+the left dead on". Same setting (end 4000 us after the wake-up, compositor frames logged). phase.py:
+
+| ms | doubled 012613 | clean 012746 |
+| --- | --- | --- |
+| wake-up vs vsync | +0.34 p50 | +0.42 p50 |
+| end vs vsync (signed, nearest) | -3.66 p50, i.e. vsync + 4.67 | -3.61, i.e. vsync + 4.72 |
+| compositor update start after vsync | p5 +0.22, p50 +2.83, p95 +3.17 | p5 +0.62, p50 +3.03, p95 +3.20 |
+| compositor update end after vsync | p5 +3.37, p50 +5.25 | p5 +4.74, p50 +5.32 |
+| end minus nearest update start | p5 -3.07, p50 +1.87, p95 +3.28 | p5 +1.17, p50 +1.74, p95 +3.09 |
+| release minus nearest update start | p5 -3.03, p50 +1.76 | p5 +1.21, p50 +1.69 |
+| app frames presented 0x / 2x+ / mispresented | 140 / 129 / 301 | 42 / 45 / 90 |
+| display time vs vsync | +2.59 | +2.59 |
+
+Reading: in both launches our release and end land INSIDE the compositor's update window (update start
+about vsync + 3.0, end about vsync + 5.3; our release at vsync + 4.6). In the clean launch that relation
+held every frame (end 1.2-3.1 ms after the update start, never before it). In the doubled launch the
+compositor's update started early (near vsync + 0.2) in at least 5 % of frames, so our release then fell
+3 ms BEFORE the update instead of inside it: the eye-by-eye pick-up order flipped between refreshes.
+A consistent relation gives the owner's "right eye more sensitive to movement" (one eye consistently takes
+the newer image: the compositor takes each eye's latest released image when it reaches that eye in its
+update, and our release of the next set lands between the two eyes); an inconsistent one gives the
+doubling. Fix direction: never release inside the update window, and release at a phase that is the same
+every frame against the compositor's clock (published by the timing helper), e.g. right after the update
+end or safely before the update start; both eyes then always show the same set.
