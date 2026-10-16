@@ -19,6 +19,11 @@
 # All "minus the nearest anchor" values are signed, -period/2 .. +period/2: an end that lands close to an
 # anchor shows up as a pile near 0; histograms in 0.25 ms bins. --every S: drift table every S seconds
 # (circular mean of each phase, so a phase wrapping at +-period/2 averages correctly).
+#  C (lane X). SteamVR's clock again: each app end against the compositor update window (start, end) of the
+#     refresh it lands in, classified before / inside / after, with SteamVR's presents per class, the class
+#     changes between consecutive refreshes, end minus update end, and the early-update-start episodes.
+#  D (lane X). The game's KARTFRAME_END_PHASE lines: the lock's mode, fallbacks and achieved phase against
+#     the grid the timing helper published.
 import bisect, math, os, re, sys
 
 BIN = 0.25
@@ -51,8 +56,8 @@ def read_vrframes(path):
                                     wgp=float(t[7]), pr=float(t[8]), fr=float(t[9]), us=float(t[10]),
                                     ue=float(t[11]), rs=float(t[12]))
             elif t[0] == 'P' and len(t) >= 9:
-                P.append(dict(mono=float(t[1]), since=float(t[4]), counter=int(t[5]), newest=int(t[7]),
-                              newest_sys=float(t[8])))
+                P.append(dict(mono=float(t[1]), raw=float(t[2]), since=float(t[4]), counter=int(t[5]),
+                              newest=int(t[7]), newest_sys=float(t[8])))
             elif t[0] == 'G':
                 gaps += int(t[2]) - int(t[1]) + 1
     return F, P, gaps
@@ -75,7 +80,17 @@ def read_game(path):
     return rows, any_race
 
 def clock_offset(F, P, period):
-    """CLOCK_MONOTONIC (s) minus SteamVR's m_flSystemTimeInSeconds; how it was found."""
+    """CLOCK_MONOTONIC (s) minus SteamVR's m_flSystemTimeInSeconds at each poll; how it was found.
+    Lane X: SteamVR's system time runs on CLOCK_MONOTONIC_RAW (vsync_raw minus the frame's system time is
+    constant to +-10 us, while CLOCK_MONOTONIC drifts 14-33 ppm against _RAW, about 1 ms a minute), so the
+    offset is (mono - raw) at each poll plus one constant: the vsync in _RAW minus the frame's system time,
+    folded to one refresh."""
+    raw = [p for p in P if p['since'] >= 0 and p.get('raw', 0) > 0]
+    if len(raw) >= 3:
+        k = [(p['mono'] - p['since']) - (p['mono'] - p['raw']) - p['newest_sys'] for p in raw]
+        c = median(k)
+        k = median([x - round((x - c) / period) * period for x in k])
+        return [(p['mono'], p['mono'] - p['raw'] + k) for p in raw], 'system time = CLOCK_MONOTONIC_RAW (vsync folded)'
     direct, folded = [], []
     for p in P:
         if p['since'] < 0: continue
@@ -113,6 +128,63 @@ def hist(name, vals, period):
 def stats(name, v):
     if v: print('  %-44s p5 %+6.2f  p50 %+6.2f  p95 %+6.2f  (n %d)' % (name, pct(v, 5), pct(v, 50), pct(v, 95), len(v)))
     else: print('  %-44s -' % name)
+
+def window_view(F, cidx, period):
+    """Lane X: per app frame (SteamVR's own clock, no matching), its end against the compositor update window of
+    the refresh it lands in: frame ready of compositor frame k is relative to k's vsync, so its end lies at
+    fr(k) + (sys(k) - sys(k-1)) after vsync k-1, and k-1's update start/end are the window it falls in.
+    Frames whose compositor logged no update times (start = end = 0) are left out."""
+    rows = []
+    for k in cidx:
+        a = F.get(k - 1)
+        if a is None or F[k]['fr'] == 0 or (a['us'] == 0 and a['ue'] == 0) or a['ue'] > period: continue
+        e = F[k]['fr'] + (F[k]['sys'] - a['sys']) * 1e3
+        c = 'before' if e < a['us'] else ('inside' if e <= a['ue'] else 'after')
+        rows.append((k, e, a['us'], a['ue'], c, F[k]['pres'], F[k]['mis']))
+    if not rows: return
+    print(' C. the app\'s end against the update window of the refresh it lands in (%d frames):' % len(rows))
+    print('    class    frames         presented 0x  2x+  mispresented  end-update start p50  end-update end p50')
+    for c in ('before', 'inside', 'after'):
+        r = [x for x in rows if x[4] == c]
+        if not r: print('    %-7s       0' % c); continue
+        print('    %-7s %6d (%4.1f%%)  %6d %5d %8d %18s %19s' % (
+            c, len(r), 100.0 * len(r) / len(rows), sum(1 for x in r if x[5] == 0), sum(1 for x in r if x[5] > 1),
+            sum(x[6] for x in r), '%+.2f' % median([x[1] - x[2] for x in r]), '%+.2f' % median([x[1] - x[3] for x in r])))
+    sw = sum(1 for a, b in zip(rows, rows[1:]) if b[0] == a[0] + 1 and a[4] != b[4])
+    print('    class changes between consecutive refreshes: %d (%.1f%%); the edge that matters is the update END' % (
+        sw, 100.0 * sw / len(rows)))
+    stats('end after vsync (ms)', [x[1] for x in rows])
+    stats('end minus update end', [x[1] - x[3] for x in rows])
+    # Re-phase episodes: the compositor's update starting within 1.5 ms of the vsync (it does so for 0.3-3 s
+    # after a discontinuity, then creeps back to about +3.0).
+    run, eps = [], []
+    for k in cidx:
+        f = F[k]
+        if f['us'] == 0 and f['ue'] == 0: continue
+        if f['us'] < 1.5: run.append(k)
+        else:
+            if len(run) >= 3: eps.append(run)
+            run = []
+    if len(run) >= 3: eps.append(run)
+    s0 = F[cidx[0]]['sys']
+    print('    early update starts (< vsync + 1.5 ms): %d frames in %d episodes%s' % (
+        sum(len(r) for r in eps), len(eps), ': ' + ', '.join('t %.1f s for %.2f s' % (
+            F[r[0]]['sys'] - s0, F[r[-1]]['sys'] - F[r[0]]['sys']) for r in eps[:12]) if eps else ''))
+    hist('C: end minus the update end of its refresh', [x[1] - x[3] for x in rows], period)
+
+PHASE = re.compile(r'end phase: (.*)')
+
+def end_phase_lines(path):
+    """The game's KARTFRAME_END_PHASE log lines (mode, fallbacks, achieved phase every 10 s)."""
+    out = []
+    with open(path, errors='replace') as f:
+        for line in f:
+            m = PHASE.search(line)
+            if m: out.append(m.group(1).strip())
+    if out:
+        print(' D. the game\'s end lock (KARTFRAME_END_PHASE), %d lines:' % len(out))
+        for l in out[:40]: print('    ' + l)
+        if len(out) > 40: print('    ... %d more' % (len(out) - 40))
 
 def launch(d, opts):
     print('=== %s' % d)
@@ -160,6 +232,8 @@ def launch(d, opts):
         sum(F[k]['drop'] for k in cidx)))
     hist('A: frame ready, ms after the vsync reference', [F[k]['fr'] for k in cidx if F[k]['fr'] != 0], period)
     hist('A: update start minus frame ready', margin, period)
+    window_view(F, cidx, period)
+    if os.path.exists(gl): end_phase_lines(gl)
 
     if not sel or not ov:
         print(' B. no XRF m=/r=/t= lines (build without lane W, or KARTFRAME_FRAME_LOG unset): app-clock view skipped')
@@ -171,7 +245,7 @@ def launch(d, opts):
         for k in cidx:
             base = (F[k]['sys'] + offset_at(offs, F[k]['sys'] + ov[0])) * 1e3
             if key is None: a.append(base)
-            elif key != 'fr' or F[k]['fr'] > 0: a.append(base + F[k][key])
+            elif key != 'fr' or F[k]['fr'] != 0: a.append(base + F[k][key])
         anchors[name] = sorted(a)
 
     def near(t, name):
